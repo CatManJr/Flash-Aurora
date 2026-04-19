@@ -1,0 +1,6 @@
+graph(%self.1 : __torch__._Swin3DBlockTraceWrapper,
+      %x.1 : Float(1, 8192, 256, strides=[2097152, 256, 1], requires_grad=0, device=cpu),
+      %c : Float(1, 256, strides=[256, 1], requires_grad=0, device=cpu)):
+  %block : __torch__.aurora.model.swin3d.Swin3DTransformerBlock = prim::GetAttr[name="block"](%self.1)
+  %672 : Tensor = prim::CallMethod[name="forward"](%block, %x.1, %c)
+  return (%672)

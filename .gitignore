@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+tutorials_python/
+.env
+.pytest_cache
+aurora/.pytest_cache
+aurora/.github
+cuda-keyring_1.1-1_all.deb

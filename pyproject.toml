@@ -1,0 +1,26 @@
+[project]
+name = "triton-dev"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12, <3.14"
+dependencies = [
+    "azure-storage-blob>=12.28.0",
+    "einops>=0.8.2",
+    "huggingface-hub>=1.8.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "pandas>=3.0.1",
+    "pydantic>=2.12.5",
+    "pytest>=9.0.2",
+    "requests>=2.33.0",
+    "scipy>=1.17.1",
+    "timm>=1.0.26",
+    "torch>=2.10.0",
+    "triton>=3.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
