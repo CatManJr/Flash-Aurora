@@ -1,9 +1,6 @@
-"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
 
-This file includes modifications and original contributions by Catman Jr.;
-those portions are licensed under the MIT License (see LICENSE).
-
-Triton kernels for Swin3D **window layout only**: fused cyclic shift + zero-pad +
+Triton kernels for Swin3D window layout only: fused cyclic shift + zero-pad +
 3D window partition, and the inverse (crop / inverse shift / merge).
 
 Does **not** implement attention or the full Swin block — those live in

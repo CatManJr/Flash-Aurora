@@ -1,5 +1,8 @@
 """Copyright (c) Microsoft Corporation. Licensed under the MIT license.
 
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+
 Basic blocks for the Perceiver architecture.
 
 The code borrows elements from the following files:
@@ -71,12 +74,29 @@ try:
     flash_attn_func = _flash_attn_func
     flash_attn_varlen_func = _flash_attn_varlen_func
 except ImportError:
-    try:
-        from flash_attn import flash_attn_func as _flash_attn_legacy
+        try:
+            from flash_attn import flash_attn_func as _flash_attn_legacy
 
-        flash_attn_func = _flash_attn_legacy
-    except ImportError:
-        pass
+            flash_attn_func = _flash_attn_legacy
+        except ImportError:
+            pass
+
+_TRITON_LN_RESIDUAL_AVAILABLE = False
+layernorm_affine_forward = None
+layernorm_affine_add_residual_forward = None
+try:
+    import triton  # noqa: F401
+
+    from aurora.ops.triton_perceiver_ln import (
+        layernorm_affine_add_residual_forward as _ln_add,
+        layernorm_affine_forward as _ln_only,
+    )
+
+    layernorm_affine_forward = _ln_only
+    layernorm_affine_add_residual_forward = _ln_add
+    _TRITON_LN_RESIDUAL_AVAILABLE = True
+except Exception:
+    pass
 
 __all__ = ["MLP", "PerceiverResampler"]
 
@@ -202,6 +222,7 @@ class PerceiverResampler(nn.Module):
         ln_eps: float = 1e-5,
         ln_k_q: bool = False,
         use_flash_attn: bool = True,
+        use_triton_ln_residual_fusion: bool = False,
     ) -> None:
         """Initialise.
 
@@ -222,10 +243,13 @@ class PerceiverResampler(nn.Module):
                 resampling layer. Defaults to `False`.
             use_flash_attn (bool, optional): Use FlashAttention-2 for cross-attention on CUDA.
                 Defaults to `False`.
+            use_triton_ln_residual_fusion (bool, optional): Fuse ``LayerNorm + residual`` on CUDA
+                with Triton (same math as PyTorch). Requires Triton. Defaults to ``False``.
         """
         super().__init__()
 
         self.residual_latent = residual_latent
+        self.use_triton_ln_residual_fusion = use_triton_ln_residual_fusion
         self.layers = nn.ModuleList([])
         mlp_hidden_dim = int(latent_dim * mlp_ratio)
         for i in range(depth):
@@ -257,15 +281,45 @@ class PerceiverResampler(nn.Module):
         Returns:
             torch.Tensor: Latent features of shape `(B, L1, D1)`.
         """
+        use_ln_fuse = (
+            self.use_triton_ln_residual_fusion
+            and _TRITON_LN_RESIDUAL_AVAILABLE
+            and latents.is_cuda
+            and latents.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        )
+
         for attn, ff, ln1, ln2 in self.layers:
             # We use post-res-norm like in Swin v2 and most Transformer architectures these days.
             # This empirically works better than the pre-norm used in the original Perceiver.
-            attn_out = ln1(attn(latents, x))
-            # HuggingFace suggests using non-residual attention in Perceiver might work better when
-            # the semantics of the query and the output are different:
-            #
-            #   https://github.com/huggingface/transformers/blob/v4.35.2/src/transformers/models/perceiver/modeling_perceiver.py#L398
-            #
-            latents = attn_out + latents if self.residual_latent else attn_out
-            latents = ln2(ff(latents)) + latents
+            if use_ln_fuse:
+                attn_raw = attn(latents, x)
+                eps1 = float(ln1.eps)
+                if self.residual_latent:
+                    latents = layernorm_affine_add_residual_forward(
+                        attn_raw,
+                        latents,
+                        ln1.weight,
+                        ln1.bias,
+                        eps1,
+                    )
+                else:
+                    latents = layernorm_affine_forward(attn_raw, ln1.weight, ln1.bias, eps1)
+                shortcut = latents
+                h = ff(latents)
+                latents = layernorm_affine_add_residual_forward(
+                    h,
+                    shortcut,
+                    ln2.weight,
+                    ln2.bias,
+                    float(ln2.eps),
+                )
+            else:
+                attn_out = ln1(attn(latents, x))
+                # HuggingFace suggests using non-residual attention in Perceiver might work better when
+                # the semantics of the query and the output are different:
+                #
+                #   https://github.com/huggingface/transformers/blob/v4.35.2/src/transformers/models/perceiver/modeling_perceiver.py#L398
+                #
+                latents = attn_out + latents if self.residual_latent else attn_out
+                latents = ln2(ff(latents)) + latents
         return latents

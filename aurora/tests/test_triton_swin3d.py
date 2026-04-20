@@ -28,11 +28,6 @@ from aurora.ops.triton_adaln import (
     adaptive_layernorm_film_add_residual_forward,
     adaptive_layernorm_film_forward,
 )
-from aurora.ops.flash_window_attn3d import (
-    HEAD_CHUNK_DIM,
-    flash_window_attn_3d_forward,
-    torch_window_attention_3d_reference,
-)
 from aurora.ops.triton_gelu import gelu_forward_triton
 from aurora.ops.triton_swin3d_layout import (
     crop_roll_unmerge_windows_triton,
@@ -368,66 +363,3 @@ def test_swin3d_lora_merged_inference_cache_reuse() -> None:
     assert second_cache == first_cache
 
 
-@requires_cuda
-def test_flash_window_attn3d_matches_torch_no_mask() -> None:
-    torch.manual_seed(9)
-    bwin, h, n, dh = 8, 4, 144, 64
-    q = torch.randn(bwin, h, n, dh, device="cuda", dtype=torch.float32)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    with torch.no_grad():
-        ref = torch_window_attention_3d_reference(q, k, v, None)
-        out = flash_window_attn_3d_forward(q, k, v, None)
-    torch.testing.assert_close(out, ref, rtol=2e-4, atol=2e-4)
-
-
-@requires_cuda
-def test_flash_window_attn3d_matches_torch_masked() -> None:
-    torch.manual_seed(10)
-    bwin, h, n, dh = 6, 4, 144, 64
-    q = torch.randn(bwin, h, n, dh, device="cuda", dtype=torch.float32)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    # Shift-window style additive mask broadcasted over batch and heads.
-    mask = torch.zeros(1, 1, n, n, device="cuda", dtype=torch.float32)
-    mask[..., n // 2 :, : n // 2] = -1000.0
-    with torch.no_grad():
-        ref = torch_window_attention_3d_reference(q, k, v, mask)
-        out = flash_window_attn_3d_forward(q, k, v, mask)
-    torch.testing.assert_close(out, ref, rtol=2e-4, atol=2e-4)
-
-
-@requires_cuda
-@pytest.mark.parametrize("n", [48, 96, 144])
-def test_flash_window_attn3d_shapes_match_torch(n: int) -> None:
-    torch.manual_seed(11 + n)
-    bwin, h, dh = 4, 4, 64
-    q = torch.randn(bwin, h, n, dh, device="cuda", dtype=torch.float32)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    with torch.no_grad():
-        ref = torch_window_attention_3d_reference(q, k, v, None)
-        out = flash_window_attn_3d_forward(q, k, v, None)
-    torch.testing.assert_close(out, ref, rtol=2e-4, atol=2e-4)
-
-
-@requires_cuda
-def test_flash_window_attn3d_invalid_head_dim_raises() -> None:
-    torch.manual_seed(12)
-    bwin, h, n, dh = 2, 4, 144, HEAD_CHUNK_DIM - 1
-    q = torch.randn(bwin, h, n, dh, device="cuda", dtype=torch.float32)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    with pytest.raises(ValueError, match="head_dim"):
-        _ = flash_window_attn_3d_forward(q, k, v, None, allow_torch_fallback=False)
-
-
-@requires_cuda
-def test_flash_window_attn3d_inference_only() -> None:
-    torch.manual_seed(13)
-    bwin, h, n, dh = 2, 4, 144, 64
-    q = torch.randn(bwin, h, n, dh, device="cuda", dtype=torch.float32, requires_grad=True)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    with pytest.raises(NotImplementedError, match="inference-only"):
-        _ = flash_window_attn_3d_forward(q, k, v, None)

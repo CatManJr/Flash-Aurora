@@ -105,6 +105,7 @@ class WindowAttention(nn.Module):
         lora_mode: LoRAMode = "single",
         use_lora: bool = False,
         use_lora_merged_inference: bool = False,
+        use_cute_window_attn: bool = False,
     ) -> None:
         """Initialise.
 
@@ -128,6 +129,10 @@ class WindowAttention(nn.Module):
             use_lora (bool, optional): Enable LoRA. By default, LoRA is disabled.
             use_lora_merged_inference (bool, optional): Merge LoRA into base linear weights during
                 inference to reduce extra GEMM/IO. Defaults to `False`.
+            use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
+                core on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel (BF16 I/O,
+                FP32 accumulators); float32 tensors delegate to torch SDPA with TF32 enabled.
+                Requires ``attn_drop=0``. Defaults to ``False``.
         """
         super().__init__()
 
@@ -136,6 +141,7 @@ class WindowAttention(nn.Module):
         self.num_heads = num_heads
         assert dim % num_heads == 0, f"dim ({dim}) should be divisible by num_heads ({num_heads})."
         self.head_dim = dim // num_heads
+        self.use_cute_window_attn = use_cute_window_attn
 
         self.attn_drop = attn_drop
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -248,7 +254,31 @@ class WindowAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn_dropout = self.attn_drop if self.training else 0.0
 
-        if mask is not None:
+        use_cute = (
+            self.use_cute_window_attn
+            and (not self.training)
+            and attn_dropout == 0.0
+            and q.is_cuda
+            and q.dtype in (torch.float32, torch.bfloat16)
+            and (not torch.is_grad_enabled())
+        )
+        if use_cute:
+            from aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+
+            precision = (
+                WinAttnPrecision.BF16_MIXED
+                if q.dtype == torch.bfloat16
+                else WinAttnPrecision.TF32_ACC_FP32
+            )
+            # Bias kept as float32: the CuTeDSL kernel explicitly takes FP32 bias,
+            # and the SDPA fallback path also works with FP32 attn_mask for FP32 Q.
+            bias = None if mask is None else mask.to(dtype=torch.float32, device=q.device)
+            if bias is not None and not bias.is_contiguous():
+                bias = bias.contiguous()
+            if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+                q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+            x = window_attn_fwd_cute(q, k, v, bias=bias, precision=precision)
+        elif mask is not None:
             mask = mask.unsqueeze(1).unsqueeze(0)  # (1, nW, 1, ws, ws)
             # Repeat the mask for every batch size and merge `B` and `nW` into one
             # dimension.
@@ -487,6 +517,7 @@ class Swin3DTransformerBlock(nn.Module):
         use_triton_adaln: bool = False,
         use_triton_mlp: bool = False,
         use_lora_merged_inference: bool = False,
+        use_cute_window_attn: bool = False,
     ) -> None:
         """Initialise.
 
@@ -521,6 +552,9 @@ class Swin3DTransformerBlock(nn.Module):
                 ``drop=0`` CUDA float32 path. Defaults to `False`.
             use_lora_merged_inference (bool, optional): Merge LoRA with base linear in
                 attention inference path to reduce extra GEMM/IO. Defaults to `False`.
+            use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
+                core on CUDA inference paths (BF16 → CuTeDSL kernel; float32 → torch SDPA).
+                Defaults to ``False``.
         """
         super().__init__()
         self.dim = dim
@@ -544,6 +578,7 @@ class Swin3DTransformerBlock(nn.Module):
             use_lora=use_lora,
             lora_mode=lora_mode,
             use_lora_merged_inference=use_lora_merged_inference,
+            use_cute_window_attn=use_cute_window_attn,
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -807,6 +842,7 @@ class BasicLayer3D(nn.Module):
         use_triton_adaln: bool = False,
         use_triton_mlp: bool = False,
         use_lora_merged_inference: bool = False,
+        use_cute_window_attn: bool = False,
     ) -> None:
         """Initialise.
 
@@ -839,6 +875,9 @@ class BasicLayer3D(nn.Module):
                 ``drop=0`` CUDA float32 path. Defaults to `False`.
             use_lora_merged_inference (bool, optional): Merge LoRA with base linear in
                 attention inference path to reduce extra GEMM/IO. Defaults to `False`.
+            use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
+                core on CUDA inference paths (BF16 → CuTeDSL kernel; float32 → torch SDPA).
+                Defaults to ``False``.
         """
         super().__init__()
 
@@ -871,6 +910,7 @@ class BasicLayer3D(nn.Module):
                     use_triton_adaln=use_triton_adaln,
                     use_triton_mlp=use_triton_mlp,
                     use_lora_merged_inference=use_lora_merged_inference,
+                    use_cute_window_attn=use_cute_window_attn,
                 )
                 for i in range(depth)
             ]
@@ -955,6 +995,7 @@ class Swin3DTransformerBackbone(nn.Module):
         use_triton_adaln: bool = False,
         use_triton_mlp: bool = False,
         use_lora_merged_inference: bool = False,
+        use_cute_window_attn: bool = False,
         workspace_pool: Optional[InferenceWorkspacePool] = None,
     ) -> None:
         """Initialise.
@@ -989,6 +1030,10 @@ class Swin3DTransformerBackbone(nn.Module):
                 ``drop=0`` CUDA float32 path. Defaults to `False`.
             use_lora_merged_inference (bool, optional): Merge LoRA with base linear in
                 attention inference path to reduce extra GEMM/IO. Defaults to `False`.
+            use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
+                core on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel (BF16 I/O,
+                FP32 accumulators); float32 tensors delegate to torch SDPA with TF32 enabled.
+                Requires ``attn_drop_rate=0``. Defaults to ``False``.
             workspace_pool (InferenceWorkspacePool, optional): Optional scratch buffer pool
                 for inference (e.g. last decoder ``cat``). If ``None``, tensors are allocated
                 each forward. Defaults to ``None``.
@@ -1036,6 +1081,7 @@ class Swin3DTransformerBackbone(nn.Module):
                 use_triton_adaln=use_triton_adaln,
                 use_triton_mlp=use_triton_mlp,
                 use_lora_merged_inference=use_lora_merged_inference,
+                use_cute_window_attn=use_cute_window_attn,
             )
             self.encoder_layers.append(layer)
 
@@ -1062,6 +1108,7 @@ class Swin3DTransformerBackbone(nn.Module):
                 use_triton_adaln=use_triton_adaln,
                 use_triton_mlp=use_triton_mlp,
                 use_lora_merged_inference=use_lora_merged_inference,
+                use_cute_window_attn=use_cute_window_attn,
             )
             self.decoder_layers.append(layer)
 

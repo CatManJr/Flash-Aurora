@@ -1,4 +1,8 @@
-"""Copyright (c) Microsoft Corporation. Licensed under the MIT license."""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+"""
 
 from datetime import timedelta
 from typing import Optional
@@ -52,6 +56,7 @@ class Perceiver3DEncoder(nn.Module):
         atmos_static_vars: bool = False,
         simulate_indexing_bug: bool = False,
         use_flash_attn: bool = True,
+        use_triton_perceiver_ln_fusion: bool = False,
     ) -> None:
         """Initialise.
 
@@ -90,6 +95,8 @@ class Perceiver3DEncoder(nn.Module):
                 to the original implementation. Defaults to `False`.
             use_flash_attn (bool, optional): Use FA-4 / FlashAttention in ``level_agg``
                 (:class:`~aurora.model.perceiver.PerceiverResampler`). Defaults to ``True``.
+            use_triton_perceiver_ln_fusion (bool, optional): Fuse Perceiver LayerNorm + residual on
+                CUDA with Triton in ``level_agg``. Defaults to ``False``.
         """
         super().__init__()
 
@@ -160,6 +167,7 @@ class Perceiver3DEncoder(nn.Module):
             ln_eps=perceiver_ln_eps,
             ln_k_q=stabilise_level_agg,
             use_flash_attn=use_flash_attn,
+            use_triton_ln_residual_fusion=use_triton_perceiver_ln_fusion,
         )
 
         # Drop patches after encoding.

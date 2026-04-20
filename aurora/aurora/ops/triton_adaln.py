@@ -1,4 +1,4 @@
-"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
 
 This file includes modifications and original contributions by Catman Jr.;
 those portions are licensed under the MIT License (see LICENSE).

@@ -89,6 +89,7 @@ class Aurora(torch.nn.Module):
         use_triton_layout: bool = False,
         use_triton_adaln: bool = False,
         use_triton_mlp: bool = False,
+        use_cute_window_attn: bool = False,
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         autocast: bool = False,
         bf16_mode: bool = False,
@@ -102,6 +103,7 @@ class Aurora(torch.nn.Module):
         clamp_at_first_step: bool = False,
         simulate_indexing_bug: bool = False,
         use_perceiver_flash_attn: bool = True,
+        use_triton_perceiver_ln_fusion: bool = False,
         compile_backbone: bool = False,
         compile_backbone_mode: Optional[str] = None,
         compile_backbone_dynamic: bool = True,
@@ -164,6 +166,10 @@ class Aurora(torch.nn.Module):
                 Defaults to ``False``.
             use_triton_mlp (bool, optional): Swin backbone — Triton GELU in MLP for inference FP32.
                 Defaults to ``False``.
+            use_cute_window_attn (bool, optional): Swin backbone — use :mod:`aurora.ops.cute` for
+                window attention on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel
+                (BF16 I/O, FP32 accumulators); float32 tensors delegate to torch SDPA with TF32.
+                Requires ``attn_drop=0``. Defaults to ``False``.
             surf_stats (dict[str, tuple[float, float]], optional): For these surface-level
                 variables, adjust the normalisation to the given tuple consisting of a new location
                 and scale.
@@ -199,6 +205,8 @@ class Aurora(torch.nn.Module):
                 to the original implementation. Defaults to `False`.
             use_perceiver_flash_attn (bool, optional): Use FlashAttention (FA-4 :mod:`flash_attn.cute`
                 when available) in encoder/decoder Perceiver resamplers. Defaults to ``True``.
+            use_triton_perceiver_ln_fusion (bool, optional): Fuse Perceiver LayerNorm + residual with
+                Triton (CUDA). Defaults to ``False``.
             compile_backbone (bool, optional): If ``True``, wrap :class:`Swin3DTransformerBackbone` with
                 :func:`torch.compile` (Inductor). Use ``dynamic=True`` so varying ``patch_res`` /
                 batch sizes recompile less often. First runs can be slow while the compiler warms
@@ -254,6 +262,7 @@ class Aurora(torch.nn.Module):
             atmos_static_vars=atmos_static_vars,
             simulate_indexing_bug=simulate_indexing_bug,
             use_flash_attn=use_perceiver_flash_attn,
+            use_triton_perceiver_ln_fusion=use_triton_perceiver_ln_fusion,
         )
 
         self.backbone = Swin3DTransformerBackbone(
@@ -274,6 +283,7 @@ class Aurora(torch.nn.Module):
             use_triton_layout=use_triton_layout,
             use_triton_adaln=use_triton_adaln,
             use_triton_mlp=use_triton_mlp,
+            use_cute_window_attn=use_cute_window_attn,
             workspace_pool=workspace_pool,
         )
 
@@ -302,6 +312,7 @@ class Aurora(torch.nn.Module):
             separate_perceiver=separate_perceiver,
             modulation_heads=modulation_heads,
             use_flash_attn=use_perceiver_flash_attn,
+            use_triton_perceiver_ln_fusion=use_triton_perceiver_ln_fusion,
         )
 
         if bf16_mode and not autocast:

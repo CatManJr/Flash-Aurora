@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Benchmark Aurora **Perceiver** stacks: FA-4 (``flash_attn.cute``) vs PyTorch SDPA.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Benchmark Aurora **Perceiver** stacks: FA-4 (``flash_attn.cute``) vs PyTorch SDPA.
 
 The encoder / decoder paths exercised here:
 

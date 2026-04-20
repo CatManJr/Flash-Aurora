@@ -1,0 +1,477 @@
+"""Pytest coverage for aurora.ops.cute window attention.
+
+Test matrix
+-----------
+TF32_ACC_FP32  – CuTeDSL TF32 kernel output is numerically close to strict
+                 FP32 reference (TF32 truncates mantissa, ≤1e-3 relative error).
+BF16_MIXED     – CuTeDSL BF16 kernel output is numerically close to FP32 reference.
+window_attn_dispatch – auto-routing: BF16→CuTe BF16, FP32-tf32→CuTe TF32,
+                       FP32-strict→SDPA, CPU→SDPA.
+
+Shape coverage
+--------------
+N = 144  aurora-pretrain-small (window 2×6×12)
+N = 288  2×6×24 or 4×6×12  (double spatial resolution)
+N = 576  2×12×24            (quadruple spatial resolution)
+Dh = 64  uniform across all Aurora encoder heads
+
+CUDA is required for all CuTeDSL tests (marked ``requires_cute``).
+Plain CUDA is required for dispatch / fallback tests (marked ``requires_cuda``).
+"""
+from __future__ import annotations
+
+import math
+from typing import Optional
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from aurora.ops.cute.window_attn_fwd import (
+    _CUTE_AVAILABLE,
+    _expand_bias_for_sdpa,
+    _choose_tile_n,
+    _choose_tile_n_tf32,
+    _get_smem_budget_bytes,
+    WinAttnPrecision,
+    window_attn_dispatch,
+    window_attn_fwd_cute,
+)
+
+# ---------------------------------------------------------------------------
+# Markers
+# ---------------------------------------------------------------------------
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA not available",
+)
+requires_cute = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _CUTE_AVAILABLE,
+    reason="CUDA + CuTeDSL / flash-attn stack required",
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_qkv(
+    Bwin: int,
+    H: int,
+    N: int,
+    Dh: int,
+    dtype: torch.dtype,
+    device: str,
+    seed: int = 42,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create (q, k, v) with small values to avoid softmax saturation."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    kwargs = dict(dtype=dtype, device=device, generator=g)
+    scale = 0.1
+    q = torch.randn(Bwin, H, N, Dh, **kwargs) * scale
+    k = torch.randn(Bwin, H, N, Dh, **kwargs) * scale
+    v = torch.randn(Bwin, H, N, Dh, **kwargs) * scale
+    return q, k, v
+
+
+def _make_bias(nW: int, N: int, device: str, seed: int = 7) -> torch.Tensor:
+    """(nW, N, N) float32 bias simulating a shifted-window mask."""
+    bias = torch.zeros(nW, N, N, dtype=torch.float32, device=device)
+    bias[:, N // 2 :, : N // 2] = -1000.0
+    return bias
+
+
+def _fp32_sdpa_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    scale: float,
+    allow_tf32: bool = False,
+) -> torch.Tensor:
+    """Strict-FP32 or TF32 SDPA reference (inputs cast to float32)."""
+    qf, kf, vf = q.float(), k.float(), v.float()
+    Bwin, H, N, _ = qf.shape
+    attn_mask = _expand_bias_for_sdpa(bias, Bwin, H, N) if bias is not None else None
+
+    old = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    try:
+        out = F.scaled_dot_product_attention(qf, kf, vf, attn_mask=attn_mask, scale=scale)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Aurora-relevant parametrised shapes
+# ---------------------------------------------------------------------------
+
+# (Bwin, H, N, Dh, nW)
+#
+# N=144 : aurora-pretrain-small (window_size 2×6×12)
+# N=288 : 2×6×24 or 4×6×12  — single-pass for BF16 on 99 KB SMEM
+# N=576 : 2×12×24            — 2-pass streaming for BF16 on 99 KB SMEM
+AURORA_SHAPES = [
+    (16,  8, 144, 64, 4),   # encoder stage H=8,  N=144 (small model default)
+    ( 8, 16, 144, 64, 4),   # encoder stage H=16, N=144
+    ( 4, 32, 144, 64, 4),   # encoder stage H=32, N=144
+    ( 8,  8, 288, 64, 4),   # 2× spatial res, H=8  — tests larger-N single-pass (BF16)
+    ( 4, 16, 288, 64, 4),   # 2× spatial res, H=16
+    ( 2, 32, 576, 64, 4),   # 4× spatial res, H=32 — tests streaming (2 KV passes)
+]
+
+EXTRA_SHAPES = [
+    ( 4,  8,  64, 64, 2),   # smaller N (sub-tile)
+    ( 6,  4,  96, 64, 3),   # non-power-of-2 N
+    ( 4,  8, 256, 64, 2),   # N=256 — 2×8×16 window
+    ( 2,  8, 400, 64, 2),   # N=400 — 2×10×20 window (streaming for TF32, single-pass BF16)
+]
+
+
+# ===========================================================================
+# TF32_ACC_FP32 path  (CuTeDSL TF32 kernel)
+# ===========================================================================
+
+@requires_cute
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_tf32_acc_fp32_close_to_strict_reference(has_bias: bool) -> None:
+    """TF32_ACC_FP32 output must be numerically close to strict-FP32 reference.
+
+    TF32 truncates the mantissa to 10 bits during multiply, so results differ
+    from exact FP32 by up to ~1e-3 relative error.
+    """
+    Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    bias = _make_bias(nW, N, "cuda") if has_bias else None
+    scale = 1.0 / math.sqrt(Dh)
+
+    with torch.no_grad():
+        ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=False)
+        out = window_attn_fwd_cute(
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
+        )
+
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+@requires_cute
+@pytest.mark.parametrize("Bwin,H,N,Dh,nW", AURORA_SHAPES)
+def test_tf32_aurora_shapes(Bwin: int, H: int, N: int, Dh: int, nW: int) -> None:
+    """TF32 CuTe kernel works for all Aurora stage shapes."""
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    bias = _make_bias(nW, N, "cuda")
+    scale = 1.0 / math.sqrt(Dh)
+    with torch.no_grad():
+        ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=False)
+        out = window_attn_fwd_cute(
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
+        )
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+@requires_cute
+def test_tf32_output_shape_dtype() -> None:
+    Bwin, H, N, Dh = 4, 8, 64, 64
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    with torch.no_grad():
+        out = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32)
+    assert out.shape == (Bwin, H, N, Dh)
+    assert out.dtype == torch.float32
+
+
+@requires_cute
+def test_tf32_is_deterministic() -> None:
+    Bwin, H, N, Dh = 4, 8, 64, 64
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    with torch.no_grad():
+        out1 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32)
+        out2 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32)
+    torch.testing.assert_close(out1, out2, rtol=0, atol=0)
+
+
+# ===========================================================================
+# BF16_MIXED path  (CuTeDSL kernel)
+# ===========================================================================
+
+@requires_cute
+@pytest.mark.parametrize("Bwin,H,N,Dh,nW", AURORA_SHAPES + EXTRA_SHAPES)
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_bf16_mixed_close_to_fp32_reference(
+    Bwin: int, H: int, N: int, Dh: int, nW: int, has_bias: bool
+) -> None:
+    """BF16_MIXED output must be numerically close to the FP32 ground truth.
+
+    BF16 has ~0.4 % relative precision; we allow 2 % rtol / 2e-2 atol to
+    account for accumulated rounding across the attention softmax.
+    """
+    q_f, k_f, v_f = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    bias = _make_bias(nW, N, "cuda") if has_bias else None
+    scale = 1.0 / math.sqrt(Dh)
+
+    q = q_f.bfloat16()
+    k = k_f.bfloat16()
+    v = v_f.bfloat16()
+
+    with torch.no_grad():
+        ref = _fp32_sdpa_reference(q_f, k_f, v_f, bias, scale, allow_tf32=False)
+        out = window_attn_fwd_cute(
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.BF16_MIXED
+        )
+
+    torch.testing.assert_close(
+        out.float(), ref,
+        rtol=2e-2, atol=2e-2,
+        msg=f"shape=({Bwin},{H},{N},{Dh}) has_bias={has_bias}",
+    )
+
+
+@requires_cute
+def test_bf16_mixed_output_dtype_and_shape() -> None:
+    Bwin, H, N, Dh = 4, 8, 144, 64
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.bfloat16, "cuda")
+    with torch.no_grad():
+        out = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.BF16_MIXED)
+    assert out.dtype == torch.bfloat16
+    assert out.shape == (Bwin, H, N, Dh)
+
+
+@requires_cute
+def test_bf16_mixed_is_deterministic() -> None:
+    Bwin, H, N, Dh = 4, 8, 144, 64
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.bfloat16, "cuda")
+    with torch.no_grad():
+        out1 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.BF16_MIXED)
+        out2 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.BF16_MIXED)
+    torch.testing.assert_close(out1, out2, rtol=0, atol=0)
+
+
+# ===========================================================================
+# window_attn_dispatch — routing tests
+# ===========================================================================
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_dispatch_output_shape_and_dtype(dtype: torch.dtype) -> None:
+    Bwin, H, N, Dh = 4, 8, 64, 64
+    q, k, v = _make_qkv(Bwin, H, N, Dh, dtype, "cuda")
+    with torch.no_grad():
+        out = window_attn_dispatch(q, k, v)
+    assert out.shape == (Bwin, H, N, Dh)
+    assert out.dtype == dtype
+
+
+@requires_cuda
+def test_dispatch_fp32_tf32_vs_strict_numerically_close() -> None:
+    """TF32 CuTe kernel and strict-FP32 SDPA produce results within tolerance.
+
+    fp32_precision="tf32"   → CuTeDSL TF32 kernel (or SDPA if CuTe unavailable)
+    fp32_precision="strict" → torch SDPA with TF32 disabled (Aurora's native path)
+    """
+    Bwin, H, N, Dh = 4, 8, 64, 64
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    with torch.no_grad():
+        tf32_out   = window_attn_dispatch(q, k, v, fp32_precision="tf32")
+        strict_out = window_attn_dispatch(q, k, v, fp32_precision="strict")
+    # TF32 truncates mantissa to 10 bits; differences should be small but non-zero
+    torch.testing.assert_close(tf32_out, strict_out, rtol=1e-3, atol=1e-3)
+
+
+@requires_cuda
+def test_dispatch_strict_fp32_matches_sdpa() -> None:
+    """fp32_precision='strict' must exactly match torch SDPA (TF32 disabled)."""
+    Bwin, H, N, Dh = 4, 8, 64, 64
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    scale = 1.0 / math.sqrt(Dh)
+    with torch.no_grad():
+        strict_out = window_attn_dispatch(
+            q, k, v, scale_qk=scale, fp32_precision="strict"
+        )
+        ref = _fp32_sdpa_reference(q, k, v, None, scale, allow_tf32=False)
+    torch.testing.assert_close(strict_out, ref, rtol=1e-5, atol=1e-5)
+
+
+@requires_cuda
+def test_dispatch_bias_broadcast_correctness() -> None:
+    """(nW, N, N) bias must produce same result as manually expanded (Bwin,1,N,N).
+
+    Uses the strict-FP32 SDPA path for bit-exact comparison.
+    """
+    Bwin, H, N, Dh, nW = 8, 4, 64, 64, 4
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    bias_nW = _make_bias(nW, N, "cuda")           # (nW, N, N)
+
+    win_ids = torch.arange(Bwin, device="cuda") % nW
+    bias_full = bias_nW[win_ids].unsqueeze(1)     # (Bwin, 1, N, N)
+    scale = 1.0 / math.sqrt(Dh)
+
+    with torch.no_grad():
+        out = window_attn_dispatch(
+            q, k, v, bias=bias_nW, scale_qk=scale, fp32_precision="strict"
+        )
+        ref = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=bias_full, scale=scale
+        )
+
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+
+@requires_cuda
+def test_dispatch_no_cute_fallback_to_sdpa() -> None:
+    """use_cute=False must give the same result as plain SDPA."""
+    Bwin, H, N, Dh = 4, 8, 64, 64
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
+    scale = 1.0 / math.sqrt(Dh)
+    with torch.no_grad():
+        no_cute = window_attn_dispatch(q, k, v, scale_qk=scale, use_cute=False)
+        sdpa    = F.scaled_dot_product_attention(q, k, v, scale=scale)
+    torch.testing.assert_close(no_cute, sdpa, rtol=1e-6, atol=1e-6)
+
+
+# ===========================================================================
+# Bias expand helper
+# ===========================================================================
+
+@requires_cuda
+def test_expand_bias_for_sdpa_Bwin_multiple_of_nW() -> None:
+    """When Bwin % nW == 0, expand uses a zero-copy repeat."""
+    nW, N, Bwin, H = 4, 64, 8, 4
+    bias = _make_bias(nW, N, "cuda")
+    expanded = _expand_bias_for_sdpa(bias, Bwin, H, N)
+    assert expanded.shape == (Bwin, 1, N, N)
+    for b in range(Bwin):
+        torch.testing.assert_close(expanded[b, 0], bias[b % nW])
+
+
+@requires_cuda
+def test_expand_bias_for_sdpa_general_Bwin() -> None:
+    """General (Bwin not multiple of nW) path uses index-gather."""
+    nW, N, Bwin, H = 3, 64, 7, 4   # 7 % 3 != 0
+    bias = _make_bias(nW, N, "cuda")
+    expanded = _expand_bias_for_sdpa(bias, Bwin, H, N)
+    assert expanded.shape == (Bwin, 1, N, N)
+    for b in range(Bwin):
+        torch.testing.assert_close(expanded[b, 0], bias[b % nW])
+
+
+# ===========================================================================
+# Error / guard tests (CPU-compatible)
+# ===========================================================================
+
+def test_tf32_dtype_guard() -> None:
+    """TF32_ACC_FP32 must reject non-float32 tensors."""
+    q, k, v = (torch.randn(2, 4, 16, 16) for _ in range(3))
+    with pytest.raises(AssertionError, match="float32"):
+        window_attn_fwd_cute(
+            q.bfloat16(), k.bfloat16(), v.bfloat16(),
+            precision=WinAttnPrecision.TF32_ACC_FP32,
+        )
+
+
+def test_bf16_mixed_dtype_guard() -> None:
+    """BF16_MIXED must reject non-bfloat16 tensors."""
+    q, k, v = (torch.randn(2, 4, 16, 16) for _ in range(3))
+    with pytest.raises(AssertionError, match="bfloat16"):
+        window_attn_fwd_cute(
+            q, k, v,
+            precision=WinAttnPrecision.BF16_MIXED,
+        )
+
+
+def test_dispatch_cpu_fallback_returns_correct_shape() -> None:
+    """CPU tensors must fall through to plain SDPA without error."""
+    Bwin, H, N, Dh = 2, 4, 16, 16
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cpu")
+    out = window_attn_dispatch(q, k, v)
+    assert out.shape == (Bwin, H, N, Dh)
+
+
+# ===========================================================================
+# Tile-selection unit tests (CPU-compatible, no CUDA required)
+# ===========================================================================
+
+class TestChooseTileN:
+    """Validate SMEM-budget-aware tile selection logic.
+
+    We pass an explicit ``smem_budget_bytes`` to avoid dependency on the
+    host GPU, making these tests runnable without CUDA.
+    """
+
+    # ----- BF16 _choose_tile_n -----
+
+    def test_bf16_small_N_fits_in_one_pass_48kb(self) -> None:
+        """N=144 must select tile_n=144 (single-pass) even on 48 KB devices."""
+        tile_n = _choose_tile_n(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
+        # sQ=8KB, sK+sV=2×144×64×2B=36KB → 44KB < 48KB
+        assert tile_n == 144
+
+    def test_bf16_n288_single_pass_99kb(self) -> None:
+        """N=288 must select tile_n=288 (single-pass) on a 99 KB device."""
+        tile_n = _choose_tile_n(288, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+        # sQ=8KB, sK+sV=2×288×64×2B=72KB → 80KB < 99KB
+        assert tile_n == 288
+
+    def test_bf16_n288_streaming_on_48kb(self) -> None:
+        """N=288 must stream (tile_n < 288) on a 48 KB device."""
+        tile_n = _choose_tile_n(288, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
+        assert tile_n < 288
+        # Verify the chosen tile actually fits
+        smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2
+        assert smem <= 48 * 1024
+
+    def test_bf16_n576_streaming_99kb(self) -> None:
+        """N=576 must stream even on 99 KB (total would be 152 KB)."""
+        tile_n = _choose_tile_n(576, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+        assert tile_n < 576
+        smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2
+        assert smem <= 99 * 1024
+
+    def test_bf16_tile_n_aligned_to_8(self) -> None:
+        """tile_n must be a multiple of 8 (MMA-N dimension)."""
+        for N in (100, 150, 200, 300, 500):
+            tile_n = _choose_tile_n(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+            assert tile_n % 8 == 0, f"tile_n={tile_n} not aligned for N={N}"
+
+    def test_bf16_tile_n_never_exceeds_seq_len(self) -> None:
+        """tile_n must never be larger than seq_len."""
+        for N in (8, 32, 64, 144, 288, 576):
+            tile_n = _choose_tile_n(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+            assert tile_n <= N
+
+    # ----- TF32 _choose_tile_n_tf32 -----
+
+    def test_tf32_n144_single_pass_99kb(self) -> None:
+        """N=144 must select tile_n=144 (single-pass) on 99 KB device."""
+        tile_n = _choose_tile_n_tf32(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+        # sQ=16KB, sK+sV=2×144×64×4B=72KB → 88KB < 99KB
+        assert tile_n == 144
+
+    def test_tf32_n144_streaming_on_48kb(self) -> None:
+        """N=144 must stream on a 48 KB device (88 KB needed > 48 KB budget)."""
+        tile_n = _choose_tile_n_tf32(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
+        assert tile_n < 144
+        smem = 64 * 64 * 4 + 2 * tile_n * 64 * 4
+        assert smem <= 48 * 1024
+
+    def test_tf32_tile_n_aligned_to_8(self) -> None:
+        for N in (100, 144, 200, 288):
+            tile_n = _choose_tile_n_tf32(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+            assert tile_n % 8 == 0
+
+    def test_tf32_tile_n_never_exceeds_seq_len(self) -> None:
+        for N in (8, 32, 64, 144, 288):
+            tile_n = _choose_tile_n_tf32(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+            assert tile_n <= N
+
+    # ----- _get_smem_budget_bytes -----
+
+    def test_smem_budget_is_positive(self) -> None:
+        budget = _get_smem_budget_bytes()
+        assert budget > 0
+        assert budget % 1024 == 0  # should be an integral number of KB
+
+    @requires_cuda
+    def test_smem_budget_ge_48kb_on_cuda(self) -> None:
+        """Any CUDA device should have at least 48 KB available."""
+        budget = _get_smem_budget_bytes()
+        assert budget >= 48 * 1024
