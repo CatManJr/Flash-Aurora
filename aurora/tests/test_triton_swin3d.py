@@ -34,7 +34,7 @@ from aurora.ops.flash_window_attn3d import (
     torch_window_attention_3d_reference,
 )
 from aurora.ops.triton_gelu import gelu_forward_triton
-from aurora.ops.triton_swin3d import (
+from aurora.ops.triton_swin3d_layout import (
     crop_roll_unmerge_windows_triton,
     roll_pad_partition_windows_triton,
 )

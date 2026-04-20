@@ -3,7 +3,11 @@
 This file includes modifications and original contributions by Catman Jr.;
 those portions are licensed under the MIT License (see LICENSE).
 
-Triton kernels for Swin3D window layout: fused roll + pad + partition and inverse.
+Triton kernels for Swin3D **window layout only**: fused cyclic shift + zero-pad +
+3D window partition, and the inverse (crop / inverse shift / merge).
+
+Does **not** implement attention or the full Swin block — those live in
+:mod:`aurora.model.swin3d` (and optionally other ``ops`` modules).
 
 Inference-only; numerically matches :mod:`aurora.model.swin3d` for the same ``ws``, ``ss``, and ``res``.
 """

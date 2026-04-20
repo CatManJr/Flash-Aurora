@@ -42,6 +42,7 @@ class Perceiver3DDecoder(nn.Module):
         level_condition: Optional[tuple[int | float, ...]] = None,
         separate_perceiver: tuple[str, ...] = (),
         modulation_heads: tuple[str, ...] = (),
+        use_flash_attn: bool = True,
     ) -> None:
         """Initialise.
 
@@ -72,6 +73,8 @@ class Perceiver3DDecoder(nn.Module):
             modulation_heads (tuple[str, ...], optional): Names of every variable for which to
                 enable an additional head, the so-called modulation head, that can be used to
                 predict the difference.
+            use_flash_attn (bool, optional): Use FlashAttention in :class:`~aurora.model.perceiver.PerceiverResampler`.
+                Defaults to ``True``.
         """
         super().__init__()
 
@@ -100,6 +103,7 @@ class Perceiver3DDecoder(nn.Module):
             drop=drop_rate,
             residual_latent=True,
             ln_eps=perceiver_ln_eps,
+            use_flash_attn=use_flash_attn,
         )
         if self.separate_perceiver:
             self.level_decoder_alternate = PerceiverResampler(
@@ -112,6 +116,7 @@ class Perceiver3DDecoder(nn.Module):
                 drop=drop_rate,
                 residual_latent=True,
                 ln_eps=perceiver_ln_eps,
+                use_flash_attn=use_flash_attn,
             )
 
         self.surf_heads = nn.ParameterDict(

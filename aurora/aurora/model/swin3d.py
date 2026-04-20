@@ -602,7 +602,7 @@ class Swin3DTransformerBlock(nn.Module):
             and x_5d.dtype == torch.float32
         )
         if use_triton:
-            from aurora.ops.triton_swin3d import (
+            from aurora.ops.triton_swin3d_layout import (
                 crop_roll_unmerge_windows_triton,
                 roll_pad_partition_windows_triton,
             )

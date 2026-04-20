@@ -1,5 +1,5 @@
 [project]
-name = "triton-dev"
+name = "flash-aurora"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -7,6 +7,9 @@ requires-python = ">=3.12, <3.14"
 dependencies = [
     "azure-storage-blob>=12.28.0",
     "einops>=0.8.2",
+    # Matches vendored CuTeDSL/requirements-cu13.txt and FA4’s CUTLASS runtime pins.
+    "nvidia-cutlass-dsl[cu13]==4.4.2",
+    "flash-attn-4[cu13]",
     "huggingface-hub>=1.8.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.2",
@@ -24,3 +27,14 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+
+# Default package index only (override via env / global uv.toml if needed).
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+# Use vendored FA4 under flash-attention/… so `uv sync` / `uv run` do not resolve
+# flash-attn-4 from PyPI (stable 0.0.1 was yanked; registry-only resolves fail).
+[tool.uv.sources]
+flash-attn-4 = { path = "flash-attention/flash_attn/cute", editable = true }

@@ -101,6 +101,7 @@ class Aurora(torch.nn.Module):
         positive_atmos_vars: tuple[str, ...] = (),
         clamp_at_first_step: bool = False,
         simulate_indexing_bug: bool = False,
+        use_perceiver_flash_attn: bool = True,
         compile_backbone: bool = False,
         compile_backbone_mode: Optional[str] = None,
         compile_backbone_dynamic: bool = True,
@@ -196,6 +197,8 @@ class Aurora(torch.nn.Module):
             simulate_indexing_bug (bool, optional): Simulate an indexing bug that's present for the
                 air pollution version of Aurora. This is necessary to obtain numerical equivalence
                 to the original implementation. Defaults to `False`.
+            use_perceiver_flash_attn (bool, optional): Use FlashAttention (FA-4 :mod:`flash_attn.cute`
+                when available) in encoder/decoder Perceiver resamplers. Defaults to ``True``.
             compile_backbone (bool, optional): If ``True``, wrap :class:`Swin3DTransformerBackbone` with
                 :func:`torch.compile` (Inductor). Use ``dynamic=True`` so varying ``patch_res`` /
                 batch sizes recompile less often. First runs can be slow while the compiler warms
@@ -250,6 +253,7 @@ class Aurora(torch.nn.Module):
             dynamic_vars=dynamic_vars,
             atmos_static_vars=atmos_static_vars,
             simulate_indexing_bug=simulate_indexing_bug,
+            use_flash_attn=use_perceiver_flash_attn,
         )
 
         self.backbone = Swin3DTransformerBackbone(
@@ -297,6 +301,7 @@ class Aurora(torch.nn.Module):
             level_condition=level_condition,
             separate_perceiver=separate_perceiver,
             modulation_heads=modulation_heads,
+            use_flash_attn=use_perceiver_flash_attn,
         )
 
         if bf16_mode and not autocast:

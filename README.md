@@ -1,10 +1,25 @@
 # Design and Implement High-Performance Computing Framework for GFMS: MS Aurora as an example
 
+## Install CuTe DSL & Flash Attention
+git clone
+source .venv/bin/activate
+chmod +x cutlass/python/CuTeDSL/setup.sh   # 仅当没有执行权限时
+# For CUDA Toolkit 12.9:
+./cutlass/python/CuTeDSL/setup.sh --cu12
+# For CUDA Toolkit 13.1:
+./cutlass/python/CuTeDSL/setup.sh --cu13
+
+cd flash-attention
+pip install -e "flash_attn/cute[dev]"       # CUDA 12.x
+pip install -e "flash_attn/cute[dev,cu13]"  # CUDA 13.x (e.g. B200)
+pytest tests/cute/
+
+
 ## Notes (this repo)
 
 The [`aurora/`](aurora/) tree is the [Microsoft Aurora](https://github.com/microsoft/aurora) model code with local changes for inference-oriented performance experiments.
 
-- **Triton ops** (CUDA float32 inference paths): window layout / AdaLN / GELU helpers under [`aurora/aurora/ops/`](aurora/aurora/ops/).
+- **Triton ops** (CUDA float32 inference paths) under [`aurora/aurora/ops/`](aurora/aurora/ops/): e.g. window **layout** only in [`triton_swin3d_layout.py`](aurora/aurora/ops/triton_swin3d_layout.py) (roll/pad/partition + inverse), **AdaLN** in `triton_adaln.py`, **GELU** in `triton_gelu.py` (not a full Swin block in one file).
 - **D2 (fused AdaLN + residual)**: used from `AdaptiveLayerNorm` and `Swin3DTransformerBlock` when enabled; see tests in [`aurora/tests/test_triton_swin3d.py`](aurora/tests/test_triton_swin3d.py).
 - **D3 (inference workspace pool)**: [`InferenceWorkspacePool`](aurora/aurora/model/workspace_pool.py) reuses a scratch buffer for the backbone’s final decoder `concat` (`torch.cat(..., out=buf)`), optional on [`Swin3DTransformerBackbone`](aurora/aurora/model/swin3d.py) / [`Aurora`](aurora/aurora/model/aurora.py). Tests: [`aurora/tests/test_inference_workspace_pool.py`](aurora/tests/test_inference_workspace_pool.py).
 - **Profiling write-ups** (local): [`profiling/`](profiling/). Backbone **D2 vs D2+D3** (from repo root, CUDA): default `--compare-d2d3` is **light** (batch=1, repeat=4). **`--preset stress`** uses `L=2048`, batch=4 (8192 tokens/step, `warmup`/`repeat` raised). **`--preset stress-heavy`** is batch=8, `L=8192` (very large VRAM). Example:  

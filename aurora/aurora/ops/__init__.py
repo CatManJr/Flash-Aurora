@@ -11,7 +11,7 @@ from aurora.ops.triton_adaln import (
     adaptive_layernorm_film_forward,
 )
 from aurora.ops.flash_window_attn3d import flash_window_attn_3d_forward as flash_window_attn_forward
-from aurora.ops.triton_swin3d import (
+from aurora.ops.triton_swin3d_layout import (
     crop_roll_unmerge_windows_triton,
     roll_pad_partition_windows_triton,
 )
