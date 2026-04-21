@@ -2,11 +2,9 @@
 
 Test matrix
 -----------
-TF32_ACC_FP32  – CuTeDSL TF32 kernel output is numerically close to strict
-                 FP32 reference (TF32 truncates mantissa, ≤1e-3 relative error).
-BF16_MIXED     – CuTeDSL BF16 kernel output is numerically close to FP32 reference.
-window_attn_dispatch – auto-routing: BF16→CuTe BF16, FP32-tf32→CuTe TF32,
-                       FP32-strict→SDPA, CPU→SDPA.
+TF32_ACC_FP32  – stable FP32-logits path (TF32 matmul allowed) vs strict-FP32 SDPA.
+BF16_MIXED     – stable path vs FP32 SDPA reference.
+window_attn_dispatch – CUDA stable path or SDPA (strict / use_cute=False / CPU).
 
 Shape coverage
 --------------
@@ -15,8 +13,8 @@ N = 288  2×6×24 or 4×6×12  (double spatial resolution)
 N = 576  2×12×24            (quadruple spatial resolution)
 Dh = 64  uniform across all Aurora encoder heads
 
-CUDA is required for all CuTeDSL tests (marked ``requires_cute``).
-Plain CUDA is required for dispatch / fallback tests (marked ``requires_cuda``).
+CuTeDSL GEMM tests: set ``AURORA_CUTE_WINDOW_ATTN=1`` (optional); most tests need
+only CUDA (``requires_cuda``).
 """
 from __future__ import annotations
 
@@ -48,7 +46,11 @@ requires_cuda = pytest.mark.skipif(
 )
 requires_cute = pytest.mark.skipif(
     not torch.cuda.is_available() or not _CUTE_AVAILABLE,
-    reason="CUDA + CuTeDSL / flash-attn stack required",
+    reason="CUDA + CuTeDSL (cutlass + quack) required",
+)
+requires_cute_env = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _CUTE_AVAILABLE,
+    reason="CUDA + CuTeDSL + AURORA_CUTE_WINDOW_ATTN=1",
 )
 
 # ---------------------------------------------------------------------------
@@ -433,10 +435,13 @@ class TestChooseTileN:
             assert tile_n % 8 == 0, f"tile_n={tile_n} not aligned for N={N}"
 
     def test_bf16_tile_n_never_exceeds_seq_len(self) -> None:
-        """tile_n must never be larger than seq_len."""
+        """tile_n must be <= seq_len (no over-allocation into undefined K/V rows)."""
+        budget = 99 * 1024
         for N in (8, 32, 64, 144, 288, 576):
-            tile_n = _choose_tile_n(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
-            assert tile_n <= N
+            tile_n = _choose_tile_n(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
+            assert tile_n <= N, f"tile_n={tile_n} > N={N}"
+            smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2
+            assert smem <= budget, f"SMEM {smem} > budget {budget} for N={N}"
 
     # ----- TF32 _choose_tile_n_tf32 -----
 
@@ -459,9 +464,13 @@ class TestChooseTileN:
             assert tile_n % 8 == 0
 
     def test_tf32_tile_n_never_exceeds_seq_len(self) -> None:
+        """tile_n must be <= seq_len (no over-allocation into undefined K/V rows)."""
+        budget = 99 * 1024
         for N in (8, 32, 64, 144, 288):
-            tile_n = _choose_tile_n_tf32(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
-            assert tile_n <= N
+            tile_n = _choose_tile_n_tf32(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
+            assert tile_n <= N, f"tile_n={tile_n} > N={N}"
+            smem = 64 * 64 * 4 + 2 * tile_n * 64 * 4
+            assert smem <= budget, f"SMEM {smem} > budget {budget} for N={N}"
 
     # ----- _get_smem_budget_bytes -----
 
