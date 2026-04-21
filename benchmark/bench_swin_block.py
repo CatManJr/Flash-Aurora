@@ -77,6 +77,7 @@ def make_block(D, num_heads, shift, optimized: bool, dtype=torch.float32):
         mlp_ratio=4.0,
         use_triton_layout=optimized,
         use_triton_adaln=optimized,
+        use_triton_mlp=optimized,
         use_cute_window_attn=optimized,
     ).to(device="cuda", dtype=dtype).eval()
     return blk

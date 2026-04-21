@@ -70,7 +70,7 @@ class MLP(nn.Module):
             and (not self.training)
             and self.drop.p == 0.0
             and x.is_cuda
-            and x.dtype == torch.float32
+            and x.dtype in (torch.float32, torch.bfloat16)
         ):
             from aurora.ops.triton_gelu import gelu_forward_triton
 
