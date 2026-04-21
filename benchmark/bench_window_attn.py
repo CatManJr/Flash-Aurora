@@ -58,6 +58,23 @@ SHAPES = [
     ( 2,  32, 576, 64, "N=576 (2×12×24) H=32  4× spatial  streaming"),
 ]
 
+# Realistic Aurora inference shapes (ERA5 0.25°, batch=1)
+# patch_res = (latent_levels=4, 720//4, 1440//4) = (4, 180, 360)
+# PatchMerging halves H and W each stage (C stays 4).
+# nW = (4/window_C) * (H/window_H) * (W/window_W) with window=(2,6,12)
+#   Stage 1: (4, 180, 360) → nW = 2×30×30 = 1800
+#   Stage 2: (4,  90, 180) → nW = 2×15×15 =  450
+#   Stage 3: (4,  45,  90) → pad→(4,48,96) → nW = 2×8×8 = 128
+SHAPES_REALISTIC = [
+    # (Bwin,    H,   N,  Dh,  label)
+    (1800,  8, 144, 64, "ERA5 Stage1 enc  Bwin=1800 H=8"),
+    ( 450, 16, 144, 64, "ERA5 Stage2 enc  Bwin=450  H=16"),
+    ( 128, 32, 144, 64, "ERA5 Stage3 enc  Bwin=128  H=32"),
+    ( 128, 32, 144, 64, "ERA5 Stage1 dec  Bwin=128  H=32"),
+    ( 450, 16, 144, 64, "ERA5 Stage2 dec  Bwin=450  H=16"),
+    (1800,  8, 144, 64, "ERA5 Stage3 dec  Bwin=1800 H=8"),
+]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -291,6 +308,65 @@ def main():
 
     print()
     trim_pct = int(TRIM_FRAC * 100)
+    print(f"Note: latency = trimmed mean ± 95% CI  "
+          f"(top/bottom {trim_pct}% of {MEASURED} samples discarded).")
+    print(f"      cv% = std/mean×100;  TFLOPS = 4·Bwin·H·N²·Dh / mean_latency.")
+
+    # -----------------------------------------------------------------------
+    # Realistic Aurora ERA5 shapes
+    # -----------------------------------------------------------------------
+    print()
+    print("=" * 60)
+    print("Realistic Aurora inference shapes  (ERA5 0.25°, batch=1)")
+    print("=" * 60)
+    print(hdr)
+    print("-" * len(hdr))
+
+    with torch.no_grad():
+        for Bwin, H, N, Dh, label in SHAPES_REALISTIC:
+            q_bf, k_bf, v_bf = make_qkv(Bwin, H, N, Dh, torch.bfloat16)
+            flop = attention_flops(Bwin, H, N, Dh)
+
+            tile_n   = _choose_tile_n(N, head_dim=Dh)
+            n_passes = math.ceil(N / tile_n)
+            pass_str = "1" if n_passes == 1 else str(n_passes)
+
+            def run_cute():
+                window_attn_fwd_cute(
+                    q_bf, k_bf, v_bf,
+                    precision=WinAttnPrecision.BF16_MIXED,
+                    scale_qk=scale,
+                )
+
+            r_cute  = bench(run_cute)
+            tf_cute = tflops(flop, r_cute.mean)
+
+            def run_sdpa():
+                F.scaled_dot_product_attention(q_bf, k_bf, v_bf, scale=scale)
+
+            r_sdpa  = bench(run_sdpa)
+            tf_sdpa = tflops(flop, r_sdpa.mean)
+
+            speedup = r_sdpa.mean / r_cute.mean
+
+            cute_str = f"{r_cute.mean:.3f}±{r_cute.ci95:.3f}"
+            sdpa_str = f"{r_sdpa.mean:.3f}±{r_sdpa.ci95:.3f}"
+
+            print(
+                f"{label:<{col_label}}"
+                f"{N:>{col_n}}"
+                f"{tile_n:>{col_tile}}"
+                f"{pass_str:>{col_pass}}"
+                f"{cute_str:>{col_ms+4}}"
+                f"{r_cute.cv:>{col_cv}.1f}"
+                f"{tf_cute:>{col_tflops}.2f}"
+                f"{sdpa_str:>{col_ms+4}}"
+                f"{r_sdpa.cv:>{col_cv}.1f}"
+                f"{tf_sdpa:>{col_tflops}.2f}"
+                f"{speedup:>8.2f}x"
+            )
+
+    print()
     print(f"Note: latency = trimmed mean ± 95% CI  "
           f"(top/bottom {trim_pct}% of {MEASURED} samples discarded).")
     print(f"      cv% = std/mean×100;  TFLOPS = 4·Bwin·H·N²·Dh / mean_latency.")
