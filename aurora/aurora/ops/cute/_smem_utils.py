@@ -51,32 +51,48 @@ def _choose_tile_n(
     tile_m: int = 64,
     smem_budget_bytes: Optional[int] = None,
 ) -> int:
-    """Choose the largest tile_n that fits in SMEM for BF16 (2-byte elements).
-
-    Aims for single-pass attention (tile_n ≥ seq_len) when SMEM allows.
-    Falls back to a streaming multi-pass tile when N is too large.
+    """Choose tile_n for BF16 (2-byte elements).
 
     SMEM layout (num_stages=1)::
 
         sQ : tile_m  × head_dim × 2B
         sK : tile_n  × head_dim × 2B
         sV : tile_n  × head_dim × 2B
-        ──────────────────────────────
-        budget = sQ + sK + sV
 
-    Rounded down to a multiple of 16 (MMA-K for m16n8k16 / TF32 m16n8k8).
+    Strategy
+    --------
+    Single-pass (seq_len fits in one tile)
+        Fill the full SMEM budget — there is only one pass so high occupancy
+        is not critical, and a larger tile means fewer MMA fragments overall.
+
+    Multi-pass (streaming)
+        Cap SMEM at half the budget so that *two* CTAs fit per SM.  The
+        doubled occupancy hides memory latency and cuts wave-quantization
+        overhead far more than a wider tile would help.
+
+    Rounded down to a multiple of 16 (MMA-K for m16n8k16).
     """
     if smem_budget_bytes is None:
         smem_budget_bytes = _get_smem_budget_bytes()
 
     sQ_bytes     = tile_m * head_dim * 2
     kv_row_bytes = head_dim * 2
-    max_tile_n   = (smem_budget_bytes - sQ_bytes) // (2 * kv_row_bytes)
-    max_tile_n   = max((max_tile_n // 16) * 16, 16)
-    capped = min(seq_len, max_tile_n)
-    if capped >= 16:
-        return max(16, (capped // 16) * 16)
-    return max(capped, 8)
+
+    # Largest tile_n that fits in the full budget.
+    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // (2 * kv_row_bytes)
+    max_tile_n_full = max((max_tile_n_full // 16) * 16, 16)
+
+    if seq_len <= max_tile_n_full:
+        # Single-pass: fill SMEM.
+        capped = min(seq_len, max_tile_n_full)
+        return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
+
+    # Multi-pass: use half the budget to allow ≥2 CTAs per SM.
+    half_budget    = smem_budget_bytes // 2
+    max_tile_n_half = max((half_budget - sQ_bytes) // (2 * kv_row_bytes), 0)
+    max_tile_n_half = max((max_tile_n_half // 16) * 16, 16)
+    capped = min(seq_len, max_tile_n_half)
+    return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
 
 
 def _choose_tile_n_tf32(
@@ -85,19 +101,27 @@ def _choose_tile_n_tf32(
     tile_m: int = 64,
     smem_budget_bytes: Optional[int] = None,
 ) -> int:
-    """Choose the largest tile_n that fits in SMEM for TF32/FP32 (4-byte elements).
+    """Choose tile_n for TF32/FP32 (4-byte elements).
 
-    Same logic as :func:`_choose_tile_n` but with 4-byte elements.
-    Rounded down to a multiple of 16.
+    Same single-pass / multi-pass strategy as :func:`_choose_tile_n` but
+    with 4-byte elements.  Rounded down to a multiple of 16.
     """
     if smem_budget_bytes is None:
         smem_budget_bytes = _get_smem_budget_bytes()
 
     sQ_bytes     = tile_m * head_dim * 4
     kv_row_bytes = head_dim * 4
-    max_tile_n   = (smem_budget_bytes - sQ_bytes) // (2 * kv_row_bytes)
-    max_tile_n   = max((max_tile_n // 16) * 16, 16)
-    capped = min(seq_len, max_tile_n)
-    if capped >= 16:
-        return max(16, (capped // 16) * 16)
-    return max(capped, 8)
+
+    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // (2 * kv_row_bytes)
+    max_tile_n_full = max((max_tile_n_full // 16) * 16, 16)
+
+    if seq_len <= max_tile_n_full:
+        capped = min(seq_len, max_tile_n_full)
+        return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
+
+    # Multi-pass: cap at half budget for ≥2 CTAs per SM.
+    half_budget     = smem_budget_bytes // 2
+    max_tile_n_half = max((half_budget - sQ_bytes) // (2 * kv_row_bytes), 0)
+    max_tile_n_half = max((max_tile_n_half // 16) * 16, 16)
+    capped = min(seq_len, max_tile_n_half)
+    return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)

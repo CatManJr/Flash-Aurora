@@ -1,16 +1,13 @@
 """Benchmark: CuTe BF16 window attention vs torch SDPA (flash attention).
 
-Measures forward-pass latency and TFLOPS for representative window shapes:
+Measures forward-pass latency and TFLOPS for Aurora encoder window shapes.
 
-  Aurora encoder (window_size = 2×6×12):
-    N=144  all encoder/decoder stages at standard resolution
-    N=288  2× spatial resolution
-    N=576  4× spatial resolution — streaming (multi-pass) on 99 KB SMEM
+Aurora uses window_size=(2, 6, 12) for all encoder and decoder stages.
+The actual N = Wc×Wh×Ww depends on the spatial resolution of the input:
 
-  Swin3D (window_size = 2×7×7 / 4×7×7 / 7×7×7):
-    N=98   partial-tile (not a multiple of 16) — exercises predicated loads
-    N=196  two full tiles — clean multi-pass
-    N=343  streaming — large window, comparable to N=576 enc case
+    N=144  (2×6×12)   standard resolution          — single-pass
+    N=288  (2×6×24)   2× spatial resolution        — single-pass
+    N=576  (2×12×24)  4× spatial resolution        — streaming (multi-pass)
 
 Also performs a numerical accuracy check (CuTe vs FP32 SDPA) for every shape.
 
@@ -44,37 +41,18 @@ MEASURED = 100  # iterations timed
 USE_CUTE_KERNEL = os.environ.get("AURORA_CUTE_WINDOW_ATTN", "") == "1"
 
 # ---------------------------------------------------------------------------
-# Shapes: (Bwin, H, N, Dh, label)
-#
-#  N = Wc × Wh × Ww
-#
-#  Aurora encoder  (window_size = 2×6×12, all stages use the same window)
-#   144 = 2×6×12   standard resolution
-#   288 = 2×6×24   2× spatial resolution
-#   576 = 2×12×24  4× spatial resolution — streaming on 99 KB SMEM
-#
-#  Swin3D  (common standalone backbone configurations)
-#    98 = 2×7×7    partial-tile: N not a multiple of 16 → predicated loads
-#   196 = 4×7×7    two full tiles: clean two-pass path
-#   343 = 7×7×7    large window, streaming (comparable to enc N=576)
+# Shapes: (Bwin, H, N, Dh, label)   —   N = Wc × Wh × Ww
 # ---------------------------------------------------------------------------
 
 SHAPES = [
     # (Bwin,  H,   N,  Dh,  label)
-    # ── Aurora encoder ──────────────────────────────────────────────────────
-    (16,   8, 144, 64, "aurora  H=8  N=144 (2×6×12)"),
-    ( 8,  16, 144, 64, "aurora  H=16 N=144 (2×6×12)"),
-    ( 4,  32, 144, 64, "aurora  H=32 N=144 (2×6×12)"),
-    ( 8,   8, 288, 64, "aurora  H=8  N=288 (2×6×24) 2× spatial"),
-    ( 4,  16, 288, 64, "aurora  H=16 N=288 (2×6×24) 2× spatial"),
-    ( 2,  32, 576, 64, "aurora  H=32 N=576 (2×12×24) streaming"),
-    # ── Swin3D ──────────────────────────────────────────────────────────────
-    (16,   8,  98, 64, "swin3d  H=8  N=98  (2×7×7)  partial-tile"),
-    ( 8,  16,  98, 64, "swin3d  H=16 N=98  (2×7×7)  partial-tile"),
-    ( 4,  32,  98, 64, "swin3d  H=32 N=98  (2×7×7)  partial-tile"),
-    ( 8,   8, 196, 64, "swin3d  H=8  N=196 (4×7×7)  two-pass"),
-    ( 4,  16, 196, 64, "swin3d  H=16 N=196 (4×7×7)  two-pass"),
-    ( 2,  32, 343, 64, "swin3d  H=32 N=343 (7×7×7)  streaming"),
+    # Bwin = num_windows × batch_size (typical inference values)
+    (16,   8, 144, 64, "N=144 (2×6×12)  H=8"),
+    ( 8,  16, 144, 64, "N=144 (2×6×12)  H=16"),
+    ( 4,  32, 144, 64, "N=144 (2×6×12)  H=32"),
+    ( 8,   8, 288, 64, "N=288 (2×6×24)  H=8   2× spatial"),
+    ( 4,  16, 288, 64, "N=288 (2×6×24)  H=16  2× spatial"),
+    ( 2,  32, 576, 64, "N=576 (2×12×24) H=32  4× spatial  streaming"),
 ]
 
 
