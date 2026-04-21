@@ -283,7 +283,7 @@ def window_attn_dispatch(
             q, k, v, bias,
             scale_qk=scale_qk,
             precision=precision,
-            tile_m=tile_m,
+            tile_m= 128 if q.dtype == torch.bfloat16 else 64, # manully tuned on Pro 6000 Blackwell GPU
             tile_n=tile_n,
         )
 

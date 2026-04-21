@@ -17,7 +17,9 @@ Run:
 
 import math
 import os
+import statistics
 import sys
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -35,8 +37,9 @@ from aurora.ops.cute.window_attn_fwd import (
 # Config
 # ---------------------------------------------------------------------------
 
-WARMUP   = 20   # iterations discarded
-MEASURED = 100  # iterations timed
+WARMUP      = 20    # iterations discarded
+MEASURED    = 1000  # iterations timed
+TRIM_FRAC   = 0.05  # fraction trimmed from each tail before computing stats
 
 USE_CUTE_KERNEL = os.environ.get("AURORA_CUTE_WINDOW_ATTN", "") == "1"
 
@@ -69,8 +72,30 @@ def tflops(flop: int, elapsed_ms: float) -> float:
     return flop / elapsed_ms / 1e9  # ms → s · 1e3, flop → TFLOP · 1e12 → net /1e9
 
 
-def bench(fn, warmup: int = WARMUP, measured: int = MEASURED) -> float:
-    """Return median latency in ms over `measured` iterations."""
+@dataclass
+class BenchStats:
+    mean:   float   # trimmed mean (ms)
+    std:    float   # sample std-dev of trimmed data (ms)
+    ci95:   float   # 95 % CI half-width: 1.96 · std / √n  (ms)
+    cv:     float   # coefficient of variation: std / mean × 100  (%)
+    median: float   # raw median (ms)
+    p5:     float   # 5th percentile (ms)
+    p95:    float   # 95th percentile (ms)
+
+
+def bench(fn, warmup: int = WARMUP, measured: int = MEASURED) -> BenchStats:
+    """Benchmark fn with rigorous statistics.
+
+    Protocol
+    --------
+    1. `warmup` un-timed iterations to reach thermal/clock steady-state.
+    2. `measured` CUDA-event-timed iterations, one sync per iteration
+       (avoids batching multiple kernels into one timing window).
+    3. Sort all samples; trim top and bottom ``TRIM_FRAC`` fraction to remove
+       scheduler spikes and cache-warm artefacts.
+    4. Compute trimmed mean, sample std-dev, and 95 % CI via normal
+       approximation (valid here because n ≫ 30 after trimming).
+    """
     start = torch.cuda.Event(enable_timing=True)
     end   = torch.cuda.Event(enable_timing=True)
 
@@ -87,7 +112,22 @@ def bench(fn, warmup: int = WARMUP, measured: int = MEASURED) -> float:
         times.append(start.elapsed_time(end))
 
     times.sort()
-    return times[len(times) // 2]  # median
+    n = len(times)
+
+    median = times[n // 2]
+    p5     = times[int(n * 0.05)]
+    p95    = times[int(n * 0.95)]
+
+    trim = max(1, int(n * TRIM_FRAC))
+    core = times[trim : n - trim]
+
+    tmean = statistics.mean(core)
+    tstd  = statistics.stdev(core) if len(core) > 1 else 0.0
+    ci95  = 1.96 * tstd / math.sqrt(len(core))
+    cv    = tstd / tmean * 100 if tmean > 0 else 0.0
+
+    return BenchStats(mean=tmean, std=tstd, ci95=ci95, cv=cv,
+                      median=median, p5=p5, p95=p95)
 
 
 def make_qkv(Bwin, H, N, Dh, dtype, device="cuda"):
@@ -176,21 +216,27 @@ def main():
     print("Overall:", "ALL PASS" if all_passed else "SOME FAILED")
     print()
 
-    # Header
-    col_label   = 36
-    col_n       = 5
-    col_tile    = 9
-    col_ms      = 9
-    col_tflops  = 9
+    # -----------------------------------------------------------------------
+    # Table header
+    # -----------------------------------------------------------------------
+    col_label  = 36
+    col_n      = 5
+    col_tile   = 7
+    col_pass   = 5
+    col_ms     = 11   # "mean±ci" e.g. "0.024±0.000"
+    col_cv     = 5    # cv%
+    col_tflops = 8
 
     hdr = (
         f"{'Shape':<{col_label}}"
         f"{'N':>{col_n}}"
         f"{'tile_n':>{col_tile}}"
-        f"{'pass':>6}"
-        f"{'CuTe ms':>{col_ms}}"
+        f"{'pass':>{col_pass}}"
+        f"{'CuTe mean±ci':>{col_ms+4}}"
+        f"{'cv%':>{col_cv}}"
         f"{'TFLOPS':>{col_tflops}}"
-        f"{'SDPA ms':>{col_ms}}"
+        f"{'SDPA mean±ci':>{col_ms+4}}"
+        f"{'cv%':>{col_cv}}"
         f"{'TFLOPS':>{col_tflops}}"
         f"{'speedup':>8}"
     )
@@ -202,9 +248,9 @@ def main():
             q_bf, k_bf, v_bf = make_qkv(Bwin, H, N, Dh, torch.bfloat16)
             flop = attention_flops(Bwin, H, N, Dh)
 
-            tile_n    = _choose_tile_n(N, head_dim=Dh)
-            n_passes  = math.ceil(N / tile_n)
-            pass_str  = "1" if n_passes == 1 else str(n_passes)
+            tile_n   = _choose_tile_n(N, head_dim=Dh)
+            n_passes = math.ceil(N / tile_n)
+            pass_str = "1" if n_passes == 1 else str(n_passes)
 
             # --- CuTe BF16 kernel ---
             def run_cute():
@@ -214,32 +260,40 @@ def main():
                     scale_qk=scale,
                 )
 
-            ms_cute   = bench(run_cute)
-            tf_cute   = tflops(flop, ms_cute)
+            r_cute  = bench(run_cute)
+            tf_cute = tflops(flop, r_cute.mean)
 
             # --- torch SDPA (flash attention backend) ---
             def run_sdpa():
                 F.scaled_dot_product_attention(q_bf, k_bf, v_bf, scale=scale)
 
-            ms_sdpa   = bench(run_sdpa)
-            tf_sdpa   = tflops(flop, ms_sdpa)
+            r_sdpa  = bench(run_sdpa)
+            tf_sdpa = tflops(flop, r_sdpa.mean)
 
-            speedup   = ms_sdpa / ms_cute
+            speedup = r_sdpa.mean / r_cute.mean
+
+            cute_str = f"{r_cute.mean:.3f}±{r_cute.ci95:.3f}"
+            sdpa_str = f"{r_sdpa.mean:.3f}±{r_sdpa.ci95:.3f}"
 
             print(
                 f"{label:<{col_label}}"
                 f"{N:>{col_n}}"
                 f"{tile_n:>{col_tile}}"
-                f"{pass_str:>6}"
-                f"{ms_cute:>{col_ms}.3f}"
+                f"{pass_str:>{col_pass}}"
+                f"{cute_str:>{col_ms+4}}"
+                f"{r_cute.cv:>{col_cv}.1f}"
                 f"{tf_cute:>{col_tflops}.2f}"
-                f"{ms_sdpa:>{col_ms}.3f}"
+                f"{sdpa_str:>{col_ms+4}}"
+                f"{r_sdpa.cv:>{col_cv}.1f}"
                 f"{tf_sdpa:>{col_tflops}.2f}"
                 f"{speedup:>8.2f}x"
             )
 
     print()
-    print("Note: TFLOPS = 4·Bwin·H·N²·Dh / latency  (forward pass FLOPs only).")
+    trim_pct = int(TRIM_FRAC * 100)
+    print(f"Note: latency = trimmed mean ± 95% CI  "
+          f"(top/bottom {trim_pct}% of {MEASURED} samples discarded).")
+    print(f"      cv% = std/mean×100;  TFLOPS = 4·Bwin·H·N²·Dh / mean_latency.")
 
 
 if __name__ == "__main__":
