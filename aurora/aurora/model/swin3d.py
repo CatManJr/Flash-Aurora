@@ -563,6 +563,7 @@ class Swin3DTransformerBlock(nn.Module):
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
         self.use_triton_layout = use_triton_layout
+        self._layout_pool: Optional["InferenceWorkspacePool"] = None
 
         self.norm1 = AdaptiveLayerNorm(
             dim, time_dim, scale_bias=scale_bias, use_triton=use_triton_adaln
@@ -634,7 +635,7 @@ class Swin3DTransformerBlock(nn.Module):
         use_triton = (
             self.use_triton_layout
             and x_5d.is_cuda
-            and x_5d.dtype == torch.float32
+            and x_5d.dtype in (torch.float32, torch.bfloat16)
         )
         if use_triton:
             from aurora.ops.triton_swin3d_layout import (
@@ -643,11 +644,11 @@ class Swin3DTransformerBlock(nn.Module):
             )
 
             x_windows = roll_pad_partition_windows_triton(
-                x_5d, res, self.window_size, self.shift_size
+                x_5d, res, self.window_size, self.shift_size, pool=self._layout_pool
             )
             attn_windows = self.attn(x_windows, mask=attn_mask, rollout_step=rollout_step)
             x = crop_roll_unmerge_windows_triton(
-                attn_windows, res, self.window_size, self.shift_size
+                attn_windows, res, self.window_size, self.shift_size, pool=self._layout_pool
             )
             x = x.reshape(B, C * H * W, D)
         else:
@@ -690,7 +691,7 @@ class Swin3DTransformerBlock(nn.Module):
             self.norm1.use_triton
             and not self.training
             and shortcut.is_cuda
-            and shortcut.dtype == torch.float32
+            and shortcut.dtype in (torch.float32, torch.bfloat16)
             and isinstance(self.drop_path, nn.Identity)
         )
         if use_d2_adaln_residual:
@@ -703,7 +704,7 @@ class Swin3DTransformerBlock(nn.Module):
             self.norm2.use_triton
             and not self.training
             and x.is_cuda
-            and x.dtype == torch.float32
+            and x.dtype in (torch.float32, torch.bfloat16)
             and isinstance(self.drop_path, nn.Identity)
         )
         if use_d2_norm2:

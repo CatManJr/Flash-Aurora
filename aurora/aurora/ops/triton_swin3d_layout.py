@@ -11,11 +11,14 @@ Inference-only; numerically matches :mod:`aurora.model.swin3d` for the same ``ws
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from aurora.model.util import maybe_adjust_windows
+from aurora.model.workspace_pool import InferenceWorkspacePool
 
 
 def _get_two_sided_padding(H_padding: int, W_padding: int) -> tuple[int, int, int, int]:
@@ -54,10 +57,21 @@ def roll_pad_partition_windows_triton(
     res: tuple[int, int, int],
     window_size: tuple[int, int, int],
     shift_size: tuple[int, int, int],
+    pool: Optional[InferenceWorkspacePool] = None,
 ) -> torch.Tensor:
-    """Fused cyclic shift, zero-pad, and 3D window partition."""
-    if x.device.type != "cuda" or x.dtype != torch.float32:
-        raise ValueError("roll_pad_partition_windows_triton requires CUDA float32 input.")
+    """Fused cyclic shift, zero-pad, and 3D window partition.
+
+    Args:
+        x: Input tensor of shape ``(B, C, H, W, D)``.
+        res: Spatial resolution ``(C, H, W)`` before ``maybe_adjust_windows``.
+        window_size: 3D window size.
+        shift_size: 3D shift size (cyclic shift for SW-MSA).
+        pool: Optional :class:`InferenceWorkspacePool` for reusing the output
+            buffer across calls with identical shapes, avoiding repeated GPU
+            memory allocations on hot inference paths.
+    """
+    if x.device.type != "cuda" or x.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("roll_pad_partition_windows_triton requires CUDA float32/bfloat16 input.")
     B, C, H, W, D = x.shape
     ws, ss = maybe_adjust_windows(window_size, shift_size, res)
     pad_size = ((-C) % ws[0], (-H) % ws[1], (-W) % ws[2])
@@ -68,7 +82,11 @@ def roll_pad_partition_windows_triton(
     C1, H1, W1 = Cp // ws[0], Hp // ws[1], Wp // ws[2]
     nW = C1 * H1 * W1
     N = ws[0] * ws[1] * ws[2]
-    out = torch.empty((B * nW, N, D), device=x.device, dtype=x.dtype)
+    out_shape = (B * nW, N, D)
+    if pool is not None:
+        out = pool.get("partition", out_shape, device=x.device, dtype=x.dtype)
+    else:
+        out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
     total = B * nW * N * D
     BLOCK = 256
     grid = (triton.cdiv(total, BLOCK),)
@@ -105,10 +123,20 @@ def crop_roll_unmerge_windows_triton(
     res: tuple[int, int, int],
     window_size: tuple[int, int, int],
     shift_size: tuple[int, int, int],
+    pool: Optional[InferenceWorkspacePool] = None,
 ) -> torch.Tensor:
-    """Inverse of :func:`roll_pad_partition_windows_triton`."""
-    if windows.device.type != "cuda" or windows.dtype != torch.float32:
-        raise ValueError("crop_roll_unmerge_windows_triton requires CUDA float32 input.")
+    """Inverse of :func:`roll_pad_partition_windows_triton`.
+
+    Args:
+        windows: Partitioned windows of shape ``(B*nW, N, D)``.
+        res: Original spatial resolution ``(C, H, W)``.
+        window_size: 3D window size.
+        shift_size: 3D shift size used during partitioning.
+        pool: Optional :class:`InferenceWorkspacePool` for reusing the output
+            buffer across calls with identical shapes.
+    """
+    if windows.device.type != "cuda" or windows.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("crop_roll_unmerge_windows_triton requires CUDA float32/bfloat16 input.")
     B_times_nW, N, D = windows.shape
     C, H, W = res
     ws, ss = maybe_adjust_windows(window_size, shift_size, res)
@@ -122,7 +150,11 @@ def crop_roll_unmerge_windows_triton(
     assert B_times_nW % nW == 0
     B = B_times_nW // nW
     assert N == ws[0] * ws[1] * ws[2]
-    out = torch.empty((B, C, H, W, D), device=windows.device, dtype=windows.dtype)
+    out_shape = (B, C, H, W, D)
+    if pool is not None:
+        out = pool.get("unmerge", out_shape, device=windows.device, dtype=windows.dtype)
+    else:
+        out = torch.empty(out_shape, device=windows.device, dtype=windows.dtype)
     total = B * C * H * W * D
     BLOCK = 256
     grid = (triton.cdiv(total, BLOCK),)

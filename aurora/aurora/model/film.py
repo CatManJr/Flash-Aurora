@@ -58,7 +58,7 @@ class AdaptiveLayerNorm(nn.Module):
             torch.Tensor: Output tensor of shape `(B, L, D)`.
         """
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
-        if self.use_triton and x.is_cuda and x.dtype == torch.float32:
+        if self.use_triton and x.is_cuda and x.dtype in (torch.float32, torch.bfloat16):
             from aurora.ops.triton_adaln import adaptive_layernorm_film_forward
 
             return adaptive_layernorm_film_forward(
@@ -83,7 +83,7 @@ class AdaptiveLayerNorm(nn.Module):
             Tensor of shape ``(B, L, D)``.
         """
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
-        if self.use_triton and x.is_cuda and x.dtype == torch.float32:
+        if self.use_triton and x.is_cuda and x.dtype in (torch.float32, torch.bfloat16):
             from aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
             return adaptive_layernorm_film_add_residual_forward(

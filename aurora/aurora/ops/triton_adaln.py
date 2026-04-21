@@ -17,6 +17,13 @@ _MAX_D = 2048
 _BLOCK_D = 128
 
 
+_SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
+_TRITON_DTYPE = {
+    torch.float32: tl.float32,
+    torch.bfloat16: tl.bfloat16,
+}
+
+
 def adaptive_layernorm_film_forward(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -27,16 +34,16 @@ def adaptive_layernorm_film_forward(
     """Match ``AdaptiveLayerNorm.forward`` when ``ln`` has ``elementwise_affine=False``.
 
     Args:
-        x: ``(B, L, D)`` float32 CUDA.
-        scale, shift: ``(B, 1, D)`` float32 CUDA (broadcast over ``L``).
+        x: ``(B, L, D)`` float32 or bfloat16 CUDA.
+        scale, shift: ``(B, 1, D)`` same dtype CUDA (broadcast over ``L``).
         scale_bias: Added to ``scale`` before multiply (same as module).
         eps: LayerNorm epsilon.
 
     Returns:
         ``(B, L, D)`` tensor.
     """
-    if x.device.type != "cuda" or x.dtype != torch.float32:
-        raise ValueError("adaptive_layernorm_film_forward requires CUDA float32 x.")
+    if x.device.type != "cuda" or x.dtype not in _SUPPORTED_DTYPES:
+        raise ValueError("adaptive_layernorm_film_forward requires CUDA float32/bfloat16 x.")
     B, L, D = x.shape
     if D > _MAX_D:
         raise ValueError(f"adaptive_layernorm_film_forward supports D <= {_MAX_D} for now.")
@@ -55,6 +62,7 @@ def adaptive_layernorm_film_forward(
         scale_bias=float(scale_bias),
         eps=float(eps),
         WITH_RESIDUAL=False,
+        DTYPE=_TRITON_DTYPE[x.dtype],
     )
     return out
 
@@ -72,9 +80,9 @@ def adaptive_layernorm_film_add_residual_forward(
     Avoids materializing the intermediate AdaLN output before the residual add.
 
     Args:
-        residual: ``(B, L, D)`` float32 CUDA (must not alias ``x``).
-        x: ``(B, L, D)`` float32 CUDA, input to LayerNorm + FiLM.
-        scale, shift: ``(B, 1, D)`` float32 CUDA.
+        residual: ``(B, L, D)`` float32 or bfloat16 CUDA (must not alias ``x``).
+        x: ``(B, L, D)`` same dtype CUDA, input to LayerNorm + FiLM.
+        scale, shift: ``(B, 1, D)`` same dtype CUDA.
         scale_bias: Added to ``scale`` before multiply.
         eps: LayerNorm epsilon.
 
@@ -83,8 +91,10 @@ def adaptive_layernorm_film_add_residual_forward(
     """
     if residual.device.type != "cuda" or x.device.type != "cuda":
         raise ValueError("adaptive_layernorm_film_add_residual_forward requires CUDA tensors.")
-    if residual.dtype != torch.float32 or x.dtype != torch.float32:
-        raise ValueError("adaptive_layernorm_film_add_residual_forward requires float32.")
+    if residual.dtype not in _SUPPORTED_DTYPES or x.dtype not in _SUPPORTED_DTYPES:
+        raise ValueError("adaptive_layernorm_film_add_residual_forward requires float32/bfloat16.")
+    if residual.dtype != x.dtype:
+        raise ValueError("residual and x must have the same dtype.")
     if residual.shape != x.shape:
         raise ValueError("residual and x must have the same shape.")
     B, L, D = x.shape
@@ -105,6 +115,7 @@ def adaptive_layernorm_film_add_residual_forward(
         scale_bias=float(scale_bias),
         eps=float(eps),
         WITH_RESIDUAL=True,
+        DTYPE=_TRITON_DTYPE[x.dtype],
     )
     return out
 
@@ -122,8 +133,13 @@ def _adaln_film_blocked_kernel(
     scale_bias: tl.constexpr,
     eps: tl.constexpr,
     WITH_RESIDUAL: tl.constexpr,
+    DTYPE: tl.constexpr,
 ):
-    """Per (B,L) row: LN + FiLM; optionally add residual from ``residual_ptr``."""
+    """Per (B,L) row: LN + FiLM; optionally add residual from ``residual_ptr``.
+
+    Loads and stores in ``DTYPE`` (float32 or bfloat16); all reductions and
+    arithmetic are performed in float32 for numerical stability.
+    """
     row = tl.program_id(0)
     b = row // L
     inv_d = 1.0 / D
@@ -133,7 +149,7 @@ def _adaln_film_blocked_kernel(
     for d0 in range(0, D, BLOCK_D):
         offs = d0 + tl.arange(0, BLOCK_D)
         mask = offs < D
-        xv = tl.load(x_ptr + row * D + offs, mask=mask, other=0.0)
+        xv = tl.load(x_ptr + row * D + offs, mask=mask, other=0.0).to(tl.float32)
         sum_x += tl.sum(xv)
         sum_x2 += tl.sum(xv * xv)
 
@@ -144,12 +160,12 @@ def _adaln_film_blocked_kernel(
     for d0 in range(0, D, BLOCK_D):
         offs = d0 + tl.arange(0, BLOCK_D)
         mask = offs < D
-        xv = tl.load(x_ptr + row * D + offs, mask=mask, other=0.0)
-        sh = tl.load(shift_ptr + b * D + offs, mask=mask, other=0.0)
-        sc = tl.load(scale_ptr + b * D + offs, mask=mask, other=0.0)
+        xv = tl.load(x_ptr + row * D + offs, mask=mask, other=0.0).to(tl.float32)
+        sh = tl.load(shift_ptr + b * D + offs, mask=mask, other=0.0).to(tl.float32)
+        sc = tl.load(scale_ptr + b * D + offs, mask=mask, other=0.0).to(tl.float32)
         yn = (xv - mean) * inv_std
         y = yn * (scale_bias + sc) + sh
         if WITH_RESIDUAL:
-            rv = tl.load(residual_ptr + row * D + offs, mask=mask, other=0.0)
+            rv = tl.load(residual_ptr + row * D + offs, mask=mask, other=0.0).to(tl.float32)
             y = y + rv
-        tl.store(out_ptr + row * D + offs, y, mask=mask)
+        tl.store(out_ptr + row * D + offs, y.to(DTYPE), mask=mask)
