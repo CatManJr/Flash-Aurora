@@ -60,11 +60,14 @@ class WindowAttnFwdBf16:
         self.head_dim = head_dim
         self.seq_len = seq_len
         self.has_bias = has_bias
-        self.num_stages = num_stages
         self.num_threads = self._NUM_THREADS
         self.tile_m = min(tile_m, seq_len)
         self.tile_n = min(tile_n, seq_len)
         self.single_kv_tile = self.tile_n >= seq_len
+        # Single-pass: 1 stage (full SMEM, no double-buffer overhead).
+        # Multi-pass: 2-stage K+V double-buffer — prefetch K[n+1]+V[n+1] behind compute,
+        # eliminating 2 of the 3 sync_threads() per N-tile iteration.
+        self.num_stages = 1 if self.single_kv_tile else 2
 
         hdim_align = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_align) * hdim_align)
@@ -298,6 +301,14 @@ class WindowAttnFwdBf16:
             seqlen=seqlen,
             need_predicates=True,
         )
+        # Multi-pass: preload V[0] together with K[0] in the same commit group so
+        # both are ready after a single cp_async_wait_group(0), avoiding a separate
+        # V-load wait later.
+        if cutlass.const_expr(not self.single_kv_tile):
+            self._load_V(
+                gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV,
+                n_block=0, seqlen=seqlen, smem_stage=0,
+            )
         cute.arch.cp_async_commit_group()
 
         cute.arch.cp_async_wait_group(1)
@@ -341,10 +352,16 @@ class WindowAttnFwdBf16:
                 t0KcK,
                 tKpK,
                 n_block=1,
-                smem_stage=0,
+                smem_stage=1 if cutlass.const_expr(not self.single_kv_tile) else 0,
                 seqlen=seqlen,
                 need_predicates=False,
             )
+            # Multi-pass: also prefetch V[1] so the next iteration has both K+V ready.
+            if cutlass.const_expr(not self.single_kv_tile):
+                self._load_V(
+                    gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV,
+                    n_block=1, seqlen=seqlen, smem_stage=1,
+                )
             cute.arch.cp_async_commit_group()
 
         # Apply OOB masking for n >= seqlen (partial last tile) and/or bias.
@@ -368,12 +385,16 @@ class WindowAttnFwdBf16:
 
         row_scale = softmax.online_softmax(acc_S, is_first=True, check_inf=True)
 
-        self._load_V(
-            gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, n_block=0, seqlen=seqlen
-        )
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+        # Single-pass: load V[0] now (no preload happened in init).
+        # Multi-pass: V[0] was already preloaded alongside K[0]; skip load+wait.
+        if cutlass.const_expr(self.single_kv_tile):
+            self._load_V(
+                gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV,
+                n_block=0, seqlen=seqlen, smem_stage=0,
+            )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
 
         acc_S_bf16 = cute.make_fragment_like(acc_S, BFloat16)
         acc_S_bf16.store(acc_S.load().to(BFloat16))
@@ -387,14 +408,21 @@ class WindowAttnFwdBf16:
             tOsVt[None, None, None, 0],
             smem_thr_cp_V,
         )
-        cute.arch.sync_threads()
+        # Single-pass: sync to protect sV before epilogue SMEM reuse.
+        # Multi-pass: no sync needed — loop uses stage_nxt (different buffer).
+        if cutlass.const_expr(self.single_kv_tile):
+            cute.arch.sync_threads()
 
         if cutlass.const_expr(not self.single_kv_tile):
             for n_tile in cutlass.range(n_block_max - 1, unroll=1):
                 n_block = n_tile + 1
+                # Block n is always in stage (n % 2): established at prefetch time.
+                stage_cur = n_block % 2
+                stage_nxt = (n_block + 1) % 2
 
+                # K[n]+V[n] were prefetched into stage_cur; wait for both.
                 cute.arch.cp_async_wait_group(0)
-                cute.arch.sync_threads()
+                cute.arch.sync_threads()  # 1 sync/pass (was 3)
 
                 acc_S = cute.make_fragment(
                     thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
@@ -407,11 +435,12 @@ class WindowAttnFwdBf16:
                     tSrQ,
                     tSrK,
                     tSsQ,
-                    tSsK[None, None, None, 0],
+                    tSsK[None, None, None, stage_cur],
                     smem_thr_cp_Q,
                     smem_thr_cp_K,
                 )
 
+                # Prefetch K[n+1]+V[n+1] into stage_nxt — overlaps with QK GEMM+softmax.
                 if n_block < n_block_max - 1:
                     self._load_K(
                         gmem_tiled_copy_K,
@@ -421,9 +450,13 @@ class WindowAttnFwdBf16:
                         t0KcK,
                         tKpK,
                         n_block=n_block + 1,
-                        smem_stage=0,
+                        smem_stage=stage_nxt,
                         seqlen=seqlen,
                         need_predicates=False,
+                    )
+                    self._load_V(
+                        gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV,
+                        n_block=n_block + 1, seqlen=seqlen, smem_stage=stage_nxt,
                     )
                     cute.arch.cp_async_commit_group()
 
@@ -448,20 +481,7 @@ class WindowAttnFwdBf16:
                 row_scale = softmax.online_softmax(acc_S, is_first=False, check_inf=True)
                 softmax.rescale_O(acc_O, row_scale)
 
-                self._load_V(
-                    gmem_tiled_copy_V,
-                    tVgV,
-                    tVsV,
-                    tVcV,
-                    t0VcV,
-                    tVpV,
-                    n_block=n_block,
-                    seqlen=seqlen,
-                )
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.sync_threads()
-
+                # PV GEMM with V[n] in stage_cur (already in SMEM; no extra wait).
                 acc_S_bf16 = cute.make_fragment_like(acc_S, BFloat16)
                 acc_S_bf16.store(acc_S.load().to(BFloat16))
                 tOrP = layout_utils.reshape_acc_to_frgA(acc_S_bf16)
@@ -471,10 +491,10 @@ class WindowAttnFwdBf16:
                     acc_O,
                     tOrP,
                     tOrVt,
-                    tOsVt[None, None, None, 0],
+                    tOsVt[None, None, None, stage_cur],
                     smem_thr_cp_V,
                 )
-                cute.arch.sync_threads()
+                # No sync_threads(): stage_cur and stage_nxt are different SMEM buffers.
 
         final_row_scale = softmax.finalize()
         softmax.rescale_O(acc_O, final_row_scale)
@@ -558,6 +578,7 @@ class WindowAttnFwdBf16:
         tVpV: cute.Tensor,
         n_block: Int32,
         seqlen: Int32,
+        smem_stage: Int32,
     ):
         is_even_n = cutlass.const_expr(self.tile_n % gmem_tiled_copy_V.tiler_mn[0].shape == 0)
         # Fast path only when tile_n divides seq_len exactly; otherwise the last tile
@@ -567,7 +588,7 @@ class WindowAttnFwdBf16:
             cute.copy(
                 gmem_tiled_copy_V,
                 tVgV[None, None, None, n_block],
-                tVsV[None, None, None, 0],
+                tVsV[None, None, None, smem_stage],
             )
         else:
             seqlen_limit = seqlen - n_block * self.tile_n - tVcV[0][0]
@@ -576,7 +597,7 @@ class WindowAttnFwdBf16:
                     cute.copy(
                         gmem_tiled_copy_V,
                         tVgV[None, n, None, n_block],
-                        tVsV[None, n, None, 0],
+                        tVsV[None, n, None, smem_stage],
                         pred=tVpV[None, n, None]
                         if cutlass.const_expr(self.check_hdim_oob) else None,
                     )

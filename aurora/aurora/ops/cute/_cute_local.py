@@ -1,6 +1,7 @@
-# Copyright (c) 2025, Tri Dao.  (gemm helpers — same as upstream flash-attn ampere_helpers.)
+# Adoped from flash-attention Copyright (c) 2025, Tri Dao.  
+# (gemm helpers — same as upstream flash-attn ampere_helpers.)
 # SPDX-License-Identifier: MIT
-"""Minimal CuTeDSL helpers for window attention (no flash_attn dependency).
+"""Minimal CuTeDSL helpers for window attention (outside flash_attn dependency).
 
 Torch ↔ CuTe bridge, SMEM swizzle atom, and SMEM GEMM loops (Ampere-style MMA).
 """

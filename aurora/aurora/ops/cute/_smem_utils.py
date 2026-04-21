@@ -1,6 +1,4 @@
 """Shared-memory budget helpers for window attention CuTeDSL kernels.
-
-No CuTe / MLIR dependency — importable on CPU-only machines.
 """
 from typing import Optional
 
@@ -16,7 +14,7 @@ def _get_smem_budget_bytes() -> int:
     SM80 / SM86 (A100, RTX 3090)          : 100 KB
     SM89 (L40, RTX 4090)                  :  99 KB
     SM90 (H100)                           : 164 KB (practical limit)
-    SM100 (B100/B200, sm_100)             : 164 KB (safe tile sizing)
+    SM100 (B100/B200, sm_100)             : 256 KB (safe tile sizing)
     SM120 (Blackwell GeForce, sm_120)     :  99 KB
 
     ``major * 10 + minor`` from PyTorch: 10.0 → 100, 12.0 → 120.  SM120 must use
@@ -32,7 +30,7 @@ def _get_smem_budget_bytes() -> int:
         if sm >= 120:
             return 99 * 1024   # Blackwell GeForce (sm_120)
         elif sm >= 100:
-            return 164 * 1024  # Datacenter Blackwell (sm_100, B200)
+            return 256 * 1024  # Datacenter Blackwell (sm_100, B200)
         elif sm >= 90:
             return 164 * 1024  # H100
         elif sm >= 80:
@@ -87,9 +85,11 @@ def _choose_tile_n(
         capped = min(seq_len, max_tile_n_full)
         return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
 
-    # Multi-pass: use half the budget to allow ≥2 CTAs per SM.
+    # Multi-pass: use half the budget, with 2-stage K+V double-buffer.
+    # sQ(1) + sK(2 stages) + sV(2 stages) ≤ budget/2  →  4×kv_row per tile_n element.
+    # Keeps ≥2 CTAs/SM while allowing K[n+1]+V[n+1] to be prefetched behind compute.
     half_budget    = smem_budget_bytes // 2
-    max_tile_n_half = max((half_budget - sQ_bytes) // (2 * kv_row_bytes), 0)
+    max_tile_n_half = max((half_budget - sQ_bytes) // (4 * kv_row_bytes), 0)
     max_tile_n_half = max((max_tile_n_half // 16) * 16, 16)
     capped = min(seq_len, max_tile_n_half)
     return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
