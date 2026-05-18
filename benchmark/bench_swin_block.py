@@ -193,7 +193,8 @@ def verify_accuracy():
 
                 if _CUTE_AVAILABLE:
                     op_tf32._layout_pool = pool
-                    out_tf32_opt = op_tf32(x32, c32, res, rollout_step=0)
+                    with _matmul_tf32_ctx(True):
+                        out_tf32_opt = op_tf32(x32, c32, res, rollout_step=0)
                     row(
                         out_tf32_opt, out_fp32_strict, lbl,
                         "TF32 OPT  (BL: FP32 strict SDPA)",
@@ -224,9 +225,9 @@ def run_bench():
     hdr = (
         f"{'Shape':<{col_l}}"
         f"{'FP32-str':>{col_t}}"
-        f"{'SDPA-TF32':>{col_t}}"
+        f"{'FP32-TF32*':>{col_t}}"
         f"{'TF32-OPT':>{col_t}}"
-        f"{'T/T32':>{col_s}}"
+        f"{'T/TF32*':>{col_s}}"
         f"{'T/str':>{col_s}}"
         f"{'BF16-BL':>{col_t}}"
         f"{'BF16-OPT':>{col_t}}"
@@ -265,12 +266,12 @@ def run_bench():
             if _CUTE_AVAILABLE:
                 blk_tf32 = make_block(D, nh, shift, optimized=True, dtype=torch.float32)
                 blk_tf32.load_state_dict(blk_fp32.state_dict())
-                fwd(blk_tf32, x32, c32, res, pool)
+                fwd(blk_tf32, x32, c32, res, pool, matmul_tf32=True)
                 t_tf32_opt = bench(
-                    lambda b=blk_tf32, p=pool: fwd(b, x32, c32, res, p)
+                    lambda b=blk_tf32, p=pool: fwd(b, x32, c32, res, p, matmul_tf32=True)
                 )
                 m_tf32 = peak_mem(
-                    lambda b=blk_tf32, p=pool: fwd(b, x32, c32, res, p)
+                    lambda b=blk_tf32, p=pool: fwd(b, x32, c32, res, p, matmul_tf32=True)
                 )
                 spd_tf32 = t_sdpa_tf32 / t_tf32_opt
                 spd_strict = t_fp32_strict / t_tf32_opt
@@ -318,9 +319,13 @@ def run_bench():
             )
 
     print()
-    print("Time in µs. FP32-str = PyTorch BL, TF32 off. SDPA-TF32 = PyTorch BL, TF32 on (1×TF32).")
-    print("TF32-OPT = CuTe TF32_ACC_FP32 + Triton.  T/T32 = OPT speedup vs SDPA-TF32 (fair).")
-    print("T/str = OPT vs strict (quality ref, not same numerics).  Mem = peak extra alloc.")
+    print("Time in µs. FP32-str = PyTorch BL, TF32 off. FP32-TF32* = PyTorch BL, allow_tf32=True.")
+    print("* Note: allow_tf32 speeds up linear projections (Triton/cuBLAS) but has NO effect on")
+    print("  FP32 SDPA itself — PyTorch selects mem-efficient/math backend which ignores the flag.")
+    print("  TF32-OPT uses CuTe TF32 attention kernel, which IS faster than FP32 SDPA.")
+    print("TF32-OPT = CuTe TF32_ACC_FP32 + Triton (allow_tf32=True for projections).")
+    print("T/TF32* = OPT speedup vs FP32-TF32* (projections at same speed; attn kernel differs).")
+    print("T/str = OPT vs strict FP32 (quality ref).  Mem = peak extra alloc.")
 
 
 # ---------------------------------------------------------------------------

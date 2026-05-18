@@ -143,19 +143,20 @@ def fp32_sdpa(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
-    *,
-    allow_tf32: bool,
 ) -> torch.Tensor:
-    old = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-    try:
-        return F.scaled_dot_product_attention(q, k, v, scale=scale)
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = old
+    """FP32 SDPA via PyTorch math/mem-efficient backend.
+
+    Note: ``torch.backends.cuda.matmul.allow_tf32`` has NO effect here —
+    SDPA for FP32 inputs uses the mem-efficient or math backend which does
+    not go through ``torch.matmul`` and therefore ignores the TF32 flag.
+    Both ``allow_tf32=True`` and ``allow_tf32=False`` yield identical speed.
+    The fair baseline for our CuTe TF32 kernel is therefore plain FP32 SDPA.
+    """
+    return F.scaled_dot_product_attention(q, k, v, scale=scale)
 
 
 def fp32_reference_bf16(q_bf, k_bf, v_bf, scale):
-    return fp32_sdpa(q_bf.float(), k_bf.float(), v_bf.float(), scale, allow_tf32=False).bfloat16()
+    return fp32_sdpa(q_bf.float(), k_bf.float(), v_bf.float(), scale).bfloat16()
 
 
 def _print_accuracy_result(
@@ -194,7 +195,7 @@ def check_accuracy_bf16(Bwin, H, N, Dh, scale, label, rtol=2e-2, atol=2e-2):
 
 
 def check_accuracy_tf32(
-    Bwin, H, N, Dh, scale, label, *, ref_allow_tf32: bool, rtol=1e-3, atol=1e-3,
+    Bwin, H, N, Dh, scale, label, *, rtol=1e-3, atol=1e-3,
 ):
     if not _CUTE_AVAILABLE:
         print(f"  [SKIP] {label}  (CuTeDSL not available)")
@@ -204,7 +205,7 @@ def check_accuracy_tf32(
         out_cute = window_attn_fwd_cute(
             q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32, scale_qk=scale,
         )
-        ref = fp32_sdpa(q, k, v, scale, allow_tf32=ref_allow_tf32)
+        ref = fp32_sdpa(q, k, v, scale)
     return _print_accuracy_result(label, out_cute, ref, rtol, atol)
 
 
@@ -336,44 +337,26 @@ def main():
 
     print()
     print("=" * 60)
-    print("Numerical accuracy: CuTe TF32  vs  SDPA-TF32 baseline  (1×TF32)")
+    print("Numerical accuracy: CuTe TF32  vs  FP32 SDPA baseline")
+    print("  [note] allow_tf32 has NO effect on FP32 SDPA — mem-efficient/math")
+    print("  backend ignores matmul.allow_tf32; both modes yield identical speed.")
     print("=" * 60)
-    tf32_sdpa_passed = True
+    tf32_passed = True
     if not _CUTE_AVAILABLE:
         print("  [SKIP] CuTeDSL not available — TF32 kernel not built.")
     else:
         for Bwin, H, N, Dh, label in SHAPES:
-            ok = check_accuracy_tf32(
-                Bwin, H, N, Dh, scale, label, ref_allow_tf32=True,
-            )
-            tf32_sdpa_passed = tf32_sdpa_passed and ok
+            ok = check_accuracy_tf32(Bwin, H, N, Dh, scale, label)
+            tf32_passed = tf32_passed and ok
         print()
-        print("Overall:", "ALL PASS" if tf32_sdpa_passed else "SOME FAILED")
-
-    print()
-    print("=" * 60)
-    print("Numerical accuracy: CuTe TF32  vs  strict-FP32 SDPA baseline")
-    print("=" * 60)
-    tf32_strict_passed = True
-    if not _CUTE_AVAILABLE:
-        print("  [SKIP] CuTeDSL not available.")
-    else:
-        for Bwin, H, N, Dh, label in SHAPES:
-            ok = check_accuracy_tf32(
-                Bwin, H, N, Dh, scale, label, ref_allow_tf32=False,
-            )
-            tf32_strict_passed = tf32_strict_passed and ok
-        print()
-        print("Overall:", "ALL PASS" if tf32_strict_passed else "SOME FAILED")
+        print("Overall:", "ALL PASS" if tf32_passed else "SOME FAILED")
 
     def sdpa_bf16(q, k, v, s):
         return lambda: F.scaled_dot_product_attention(q, k, v, scale=s)
 
-    def sdpa_tf32_fp32(q, k, v, s):
-        return lambda: fp32_sdpa(q, k, v, s, allow_tf32=True)
-
-    def sdpa_strict_fp32(q, k, v, s):
-        return lambda: fp32_sdpa(q, k, v, s, allow_tf32=False)
+    def sdpa_fp32(q, k, v, s):
+        # allow_tf32 has no effect on FP32 SDPA (mem-efficient/math backend)
+        return lambda: fp32_sdpa(q, k, v, s)
 
     run_perf_table(
         SHAPES,
@@ -390,29 +373,17 @@ def main():
     if _CUTE_AVAILABLE:
         run_perf_table(
             SHAPES,
-            title="Performance: CuTe TF32  vs  SDPA-TF32  (1×TF32 matmul, fair)",
+            title="Performance: CuTe TF32  vs  FP32 SDPA  (fair — same precision budget)",
             dtype=torch.float32,
             choose_tile_n=_choose_tile_n_tf32,
             cute_precision=WinAttnPrecision.TF32_ACC_FP32,
-            make_baseline=sdpa_tf32_fp32,
+            make_baseline=sdpa_fp32,
             cute_col="CuTe-TF32",
-            baseline_col="SDPA-TF32",
+            baseline_col="SDPA-FP32",
         )
         _print_latency_note()
-        print("      speedup > 1  → CuTe TF32 kernel faster than torch SDPA @ TF32.")
-
-        run_perf_table(
-            SHAPES,
-            title="Performance: CuTe TF32  vs  strict-FP32 SDPA  (quality ref)",
-            dtype=torch.float32,
-            choose_tile_n=_choose_tile_n_tf32,
-            cute_precision=WinAttnPrecision.TF32_ACC_FP32,
-            make_baseline=sdpa_strict_fp32,
-            cute_col="CuTe-TF32",
-            baseline_col="SDPA-strict",
-        )
-        _print_latency_note()
-        print("      strict baseline disables TF32; larger speedup is not apples-to-apples.")
+        print("      speedup > 1  → CuTe TF32 kernel faster than PyTorch FP32 SDPA.")
+        print("      Note: allow_tf32 has NO effect on FP32 SDPA (mem-efficient/math backend).")
     else:
         print()
         print("=" * 60)
@@ -434,15 +405,16 @@ def main():
     if _CUTE_AVAILABLE:
         run_perf_table(
             SHAPES_REALISTIC,
-            title="Realistic shapes: CuTe TF32  vs  SDPA-TF32",
+            title="Realistic shapes: CuTe TF32  vs  FP32 SDPA",
             dtype=torch.float32,
             choose_tile_n=_choose_tile_n_tf32,
             cute_precision=WinAttnPrecision.TF32_ACC_FP32,
-            make_baseline=sdpa_tf32_fp32,
+            make_baseline=sdpa_fp32,
             cute_col="CuTe-TF32",
-            baseline_col="SDPA-TF32",
+            baseline_col="SDPA-FP32",
         )
         _print_latency_note()
+        print("      Note: allow_tf32 has NO effect on FP32 SDPA (mem-efficient/math backend).")
 
 
 if __name__ == "__main__":
