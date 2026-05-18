@@ -18,7 +18,7 @@ from quack import layout_utils
 
 @cute.jit
 def _fmax_reduce_row(x: cute.TensorSSA, init_val: float | Float32 | None = None) -> Float32:
-    res = cute.make_fragment(x.shape, Float32)
+    res = cute.make_rmem_tensor(x.shape, Float32)
     res.store(x)
     v0, v1, v2, v3 = res[0], res[1], res[2], res[3]
     for i in cutlass.range_constexpr(4, cute.size(res), 4):
@@ -68,7 +68,7 @@ class WindowOnlineSoftmax:
         check_inf: cutlass.Constexpr[bool] = True,
     ) -> cute.Tensor:
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
-        row_scale = cute.make_fragment_like(self.row_max, Float32)
+        row_scale = cute.make_rmem_tensor_like(self.row_max, Float32)
         row_max, row_sum = self.row_max, self.row_sum
         scale_log2 = self.scale_log2
 
@@ -115,7 +115,7 @@ class WindowOnlineSoftmax:
         row_sum, row_max = self.row_sum, self.row_max
         scale_log2 = self.scale_log2
         rs = row_sum.load()
-        res = cute.make_fragment(rs.shape, Float32)
+        res = cute.make_rmem_tensor(rs.shape, Float32)
         res.store(rs)
         for i in cutlass.range_constexpr(cute.size(res.shape)):
             v = res[i]
@@ -123,7 +123,7 @@ class WindowOnlineSoftmax:
             v = v + cute.arch.shuffle_sync_bfly(v, offset=2)
             res[i] = v
         row_sum.store(res.load())
-        row_scale = cute.make_fragment_like(row_max, Float32)
+        row_scale = cute.make_rmem_tensor_like(row_max, Float32)
         LN2 = math.log(2.0)
 
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):

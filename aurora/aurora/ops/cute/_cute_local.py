@@ -11,6 +11,7 @@ from typing import Callable, Optional, Type
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import TFloat32
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -100,8 +101,24 @@ def get_smem_store_atom(
 
 
 @cute.jit
+def predicate_d(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
+    """Predicate head-dim OOB for identity tiles shaped (Dh, N)."""
+    tApA = cute.make_rmem_tensor(
+        cute.make_layout(
+            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+            stride=(cute.size(tAcA, mode=[2]), 0, 1),
+        ),
+        cutlass.Boolean,
+    )
+    for rest_v in cutlass.range_constexpr(tApA.shape[0]):
+        for rest_k in cutlass.range_constexpr(tApA.shape[2]):
+            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][0], limit)
+    return tApA
+
+
+@cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
-    tApA = cute.make_fragment(
+    tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
@@ -186,3 +203,30 @@ def gemm_rs(
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
         if cutlass.const_expr(k == 0 and hook_fn is not None):
             hook_fn()
+
+
+@cute.jit
+def gemm_rs_tf32(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tOrP: cute.Tensor,
+    tCrB_i32: cute.Tensor,
+    tCsB: cute.Tensor,
+    smem_thr_copy_B: cute.TiledCopy,
+    hook_fn: Optional[Callable] = None,
+) -> None:
+    """PV: frgA tf32 from softmax; V via 8x8x16b transpose ldsm (i32) + recast for tf32 MMA."""
+    tCrB_copy_view = smem_thr_copy_B.retile(tCrB_i32)
+    tCrB_tf32 = cute.make_rmem_tensor_like(tCrB_i32, TFloat32)
+    cute.copy(smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
+    tCrB_tf32.store(cute.recast_tensor(tCrB_i32, dtype=TFloat32).load())
+    for k in cutlass.range_constexpr(cute.size(tOrP.shape[2])):
+        if cutlass.const_expr(k < cute.size(tOrP.shape[2]) - 1):
+            cute.copy(
+                smem_thr_copy_B, tCsB[None, None, k + 1], tCrB_copy_view[None, None, k + 1]
+            )
+            tCrB_tf32.store(cute.recast_tensor(tCrB_i32, dtype=TFloat32).load())
+        cute.gemm(tiled_mma, acc, tOrP[None, None, k], tCrB_tf32[None, None, k], acc)
+        if cutlass.const_expr(k == 0 and hook_fn is not None):
+            hook_fn()
+

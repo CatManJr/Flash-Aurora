@@ -240,7 +240,7 @@ class WindowAttnFwdBf16:
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
 
-        acc_O = cute.make_fragment(
+        acc_O = cute.make_rmem_tensor(
             thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdim)), Float32
         )
         acc_O.fill(0.0)
@@ -327,7 +327,7 @@ class WindowAttnFwdBf16:
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        acc_S = cute.make_fragment(
+        acc_S = cute.make_rmem_tensor(
             thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
         )
         acc_S.fill(0.0)
@@ -368,7 +368,7 @@ class WindowAttnFwdBf16:
         # For the first tile n_block=0, n_start=0.
         if cutlass.const_expr(self.seq_len % self.tile_n != 0 or mBias is not None):
             m_start = m_block * self.tile_m
-            for i in cutlass.range_constexpr(cute.size(acc_S)):
+            for i in cutlass.range(cute.size(acc_S), unroll_full=True):
                 n_idx = tScS[i][1]
                 # Mask out-of-bounds key positions so softmax assigns them weight 0.
                 if cutlass.const_expr(self.seq_len % self.tile_n != 0):
@@ -396,7 +396,7 @@ class WindowAttnFwdBf16:
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
-        acc_S_bf16 = cute.make_fragment_like(acc_S, BFloat16)
+        acc_S_bf16 = cute.make_rmem_tensor_like(acc_S, BFloat16)
         acc_S_bf16.store(acc_S.load().to(BFloat16))
         tOrP = layout_utils.reshape_acc_to_frgA(acc_S_bf16)
 
@@ -424,7 +424,7 @@ class WindowAttnFwdBf16:
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()  # 1 sync/pass (was 3)
 
-                acc_S = cute.make_fragment(
+                acc_S = cute.make_rmem_tensor(
                     thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
                 )
                 acc_S.fill(0.0)
@@ -464,7 +464,7 @@ class WindowAttnFwdBf16:
                 if cutlass.const_expr(self.seq_len % self.tile_n != 0 or mBias is not None):
                     m_start = m_block * self.tile_m
                     n_start = n_block * self.tile_n
-                    for i in cutlass.range_constexpr(cute.size(acc_S)):
+                    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
                         n_idx = n_start + tScS[i][1]
                         if cutlass.const_expr(self.seq_len % self.tile_n != 0):
                             if n_idx >= seqlen:
@@ -482,7 +482,7 @@ class WindowAttnFwdBf16:
                 softmax.rescale_O(acc_O, row_scale)
 
                 # PV GEMM with V[n] in stage_cur (already in SMEM; no extra wait).
-                acc_S_bf16 = cute.make_fragment_like(acc_S, BFloat16)
+                acc_S_bf16 = cute.make_rmem_tensor_like(acc_S, BFloat16)
                 acc_S_bf16.store(acc_S.load().to(BFloat16))
                 tOrP = layout_utils.reshape_acc_to_frgA(acc_S_bf16)
 
@@ -499,7 +499,7 @@ class WindowAttnFwdBf16:
         final_row_scale = softmax.finalize()
         softmax.rescale_O(acc_O, final_row_scale)
 
-        rO = cute.make_fragment_like(acc_O, BFloat16)
+        rO = cute.make_rmem_tensor_like(acc_O, BFloat16)
         rO.store(acc_O.load().to(BFloat16))
 
         arch_v = self.arch.major * 10 + self.arch.minor
@@ -514,7 +514,7 @@ class WindowAttnFwdBf16:
         gO = cute.local_tile(mO_cur, blkQ, (m_block, 0))
         gmem_thr_cp_O = gmem_tiled_copy_O.get_slice(tidx)
         tOsO = gmem_thr_cp_O.partition_S(sO)
-        tOrO = cute.make_fragment_like(tOsO, BFloat16)
+        tOrO = cute.make_rmem_tensor_like(tOsO, BFloat16)
         cute.autovec_copy(tOsO, tOrO)
         tOgO = gmem_thr_cp_O.partition_D(gO)
         cO = cute.make_identity_tensor(blkQ)

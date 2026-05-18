@@ -195,12 +195,15 @@ def window_attn_fwd_cute(
     scale_log2 = Float32(math.log2(math.e) * scale_qk)
     has_bias = bias is not None
 
+    v_run = v
     if precision == WinAttnPrecision.TF32_ACC_FP32:
         _tile_n = tile_n if tile_n is not None else _choose_tile_n_tf32(N, head_dim=Dh, tile_m=tile_m)
+        # PV smem uses BF16 + 8x8x16b transpose (same as BF16 FA); cast V at gmem load.
+        v_run = v.to(torch.bfloat16)
         fn = _get_or_compile_tf32(
             head_dim=Dh, seq_len=N, has_bias=has_bias,
             tile_m=tile_m, tile_n=_tile_n,
-            q=q, k=k, v=v, o=out, bias_or_none=bias,
+            q=q, k=k, v=v_run, o=out, bias_or_none=bias,
         )
     else:
         _tile_n = tile_n if tile_n is not None else _choose_tile_n(N, head_dim=Dh, tile_m=tile_m)
@@ -210,7 +213,7 @@ def window_attn_fwd_cute(
             q=q, k=k, v=v, o=out, bias_or_none=bias,
         )
 
-    fn(q, k, v, out, bias, scale_log2)
+    fn(q, k, v_run, out, bias, scale_log2)
     return out
 
 

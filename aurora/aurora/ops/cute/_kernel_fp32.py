@@ -14,14 +14,14 @@ try:
 
     import cutlass
     import cutlass.cute as cute
-    from cutlass import Constexpr, Float32, TFloat32, Int32
+    from cutlass import BFloat16, Constexpr, Float32, TFloat32, Int32
     from cutlass.cute.nvgpu import cpasync, warp
     from cutlass.cutlass_dsl import BaseDSL
 
     import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
     from cutlass.cute.atom import make_atom
     from cutlass.cute.core import _pack_shape
-    from cutlass.cute.nvgpu.warp.mma import MmaF16BF16Trait
+    from cutlass.cute.nvgpu.warp.mma import MmaF16BF16Op, MmaF16BF16Trait
 
     from quack import layout_utils
 
@@ -91,13 +91,13 @@ class WindowAttnFwdTF32:
         self.head_dim = head_dim
         self.seq_len = seq_len
         self.has_bias = has_bias
-        self.num_stages = num_stages
         self.num_threads = self._NUM_THREADS
         self.tile_m = min(tile_m, seq_len)
         self.tile_n = min(tile_n, seq_len)
         self.single_kv_tile = self.tile_n >= seq_len
+        self.num_stages = 1 if self.single_kv_tile else 2
 
-        hdim_align = 8
+        hdim_align = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_align) * hdim_align)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.dtype = Float32
@@ -116,9 +116,11 @@ class WindowAttnFwdTF32:
     ) -> None:
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         _tr = [2, 3, 1, 0]
-        mQ_t, mK_t, mV_t, mO_t = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=_tr)) for t in (mQ, mK, mV, mO)
+        mQ_t, mK_t, mO_t = [
+            cute.make_tensor(t.iterator, cute.select(t.layout, mode=_tr)) for t in (mQ, mK, mO)
         ]
+        # V in gmem is BF16 (host cast); PV MMA uses m16n8k16 on swizzled smem like BF16 FA.
+        mV_t = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=_tr))
 
         N = mQ.shape[2]
         H = mQ.shape[1]
@@ -127,47 +129,61 @@ class WindowAttnFwdTF32:
 
         num_stages = self.num_stages
         sQK_atom = get_smem_layout_atom(Float32, self.tile_hdim)
-        sV_atom = get_smem_layout_atom(Float32, self.tile_hdim)
+        sV_atom = get_smem_layout_atom(BFloat16, self.tile_hdim)
 
         sQ_layout = cute.tile_to_shape(sQK_atom, (self.tile_m, self.tile_hdim), (0, 1))
         sK_layout = cute.tile_to_shape(
             sQK_atom, (self.tile_n, self.tile_hdim, num_stages), (0, 1, 2)
         )
-        sV_layout = cute.tile_to_shape(sV_atom, (self.tile_n, self.tile_hdim, num_stages), (0, 1, 2))
-        sO_layout = cute.tile_to_shape(sV_atom, (self.tile_m, self.tile_hdim), (0, 1))
+        sV_layout = cute.tile_to_shape(
+            sV_atom, (self.tile_n, self.tile_hdim, num_stages), (0, 1, 2)
+        )
+        sO_layout = cute.tile_to_shape(sQK_atom, (self.tile_m, self.tile_hdim), (0, 1))
 
-        _mma_op = MmaTF32Op()
+        _mma_op_qk = MmaTF32Op()
+        _mma_op_pv = warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))
         num_warps = self.num_threads // 32
-        _mma_args = dict(permutation_mnk=(num_warps * 16, 8, 8))
-        tiled_mma_qk = cute.make_tiled_mma(_mma_op, (num_warps, 1, 1), **_mma_args)
-        tiled_mma_pv = cute.make_tiled_mma(_mma_op, (num_warps, 1, 1), **_mma_args)
+        tiled_mma_qk = cute.make_tiled_mma(
+            _mma_op_qk, (num_warps, 1, 1), permutation_mnk=(num_warps * 16, 16, 8)
+        )
+        tiled_mma_pv = cute.make_tiled_mma(
+            _mma_op_pv, (num_warps, 1, 1), permutation_mnk=(num_warps * 16, 16, 16)
+        )
 
-        _bits = 128
-        _elems = _bits // Float32.width
-        atom_async = cute.make_copy_atom(
+        _bits_f32 = 128
+        _elems_f32 = _bits_f32 // Float32.width
+        _bits_bf16 = 128
+        _elems_bf16 = _bits_bf16 // BFloat16.width
+        atom_async_f32 = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             Float32,
-            num_bits_per_copy=_bits,
+            num_bits_per_copy=_bits_f32,
+        )
+        atom_async_bf16 = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            BFloat16,
+            num_bits_per_copy=_bits_bf16,
         )
         atom_store = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=_bits
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=_bits_f32
         )
 
-        _sQK_dim1 = sQK_atom.outer.shape[1] // _elems
-        _sV_dim1 = sV_atom.outer.shape[1] // _elems
-        vQKV = cute.make_layout((1, _elems))
+        _sQK_dim1 = sQK_atom.outer.shape[1] // _elems_f32
+        _sV_dim1 = sV_atom.outer.shape[1] // _elems_bf16
+        vQK = cute.make_layout((1, _elems_f32))
+        vV = cute.make_layout((1, _elems_bf16))
 
         def _tv(dim1):
             return cute.make_ordered_layout((self.num_threads // dim1, dim1), order=(1, 0))
 
-        gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_async, _tv(_sQK_dim1), vQKV)
-        gmem_tiled_copy_K = cute.make_tiled_copy_tv(atom_async, _tv(_sQK_dim1), vQKV)
-        gmem_tiled_copy_V = cute.make_tiled_copy_tv(atom_async, _tv(_sV_dim1), vQKV)
-        gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_store, _tv(_sV_dim1), vQKV)
+        gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_async_f32, _tv(_sQK_dim1), vQK)
+        gmem_tiled_copy_K = cute.make_tiled_copy_tv(atom_async_f32, _tv(_sQK_dim1), vQK)
+        gmem_tiled_copy_V = cute.make_tiled_copy_tv(atom_async_bf16, _tv(_sV_dim1), vV)
+        gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_store, _tv(_sQK_dim1), vQK)
 
         sQ_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(sQ_layout)], 1024]
         sK_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(sK_layout)], 1024]
-        sV_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(sV_layout)], 1024]
+        sV_struct = cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(sV_layout)], 1024]
 
         @cute.struct
         class SharedStorage:
@@ -238,7 +254,6 @@ class WindowAttnFwdTF32:
 
         blkQ = (self.tile_m, self.tile_hdim)
         blkKV = (self.tile_n, self.tile_hdim)
-
         gQ = cute.local_tile(mQ_cur, blkQ, (m_block, 0))
         gK = cute.local_tile(mK_cur, blkKV, (None, 0))
         gV = cute.local_tile(mV_cur, blkKV, (None, 0))
@@ -268,13 +283,17 @@ class WindowAttnFwdTF32:
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
 
-        acc_O = cute.make_fragment(
+        acc_O = cute.make_rmem_tensor(
             thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdim)), Float32
         )
         acc_O.fill(0.0)
 
-        smem_cp_QK = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128)
-        smem_cp_V = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128)
+        smem_cp_QK = cute.make_copy_atom(
+            warp.LdMatrix8x16x8bOp(transpose=False, num_matrices=4), TFloat32
+        )
+        smem_cp_V = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), BFloat16
+        )
         smem_thr_cp_Q = make_tiled_copy_A(smem_cp_QK, tiled_mma_qk).get_slice(tidx)
         smem_thr_cp_K = make_tiled_copy_B(smem_cp_QK, tiled_mma_qk).get_slice(tidx)
         smem_thr_cp_V = make_tiled_copy_B(smem_cp_V, tiled_mma_pv).get_slice(tidx)
@@ -325,6 +344,18 @@ class WindowAttnFwdTF32:
             seqlen=seqlen,
             need_predicates=True,
         )
+        if cutlass.const_expr(not self.single_kv_tile):
+            self._load_V(
+                gmem_tiled_copy_V,
+                tVgV,
+                tVsV,
+                tVcV,
+                t0VcV,
+                tVpV,
+                n_block=0,
+                seqlen=seqlen,
+                smem_stage=0,
+            )
         cute.arch.cp_async_commit_group()
 
         cute.arch.cp_async_wait_group(1)
@@ -334,13 +365,15 @@ class WindowAttnFwdTF32:
             nW = mBias.shape[0]
             win_id = bwin_id % nW
             mBias_w = mBias[win_id, None, None]
+
+        if cutlass.const_expr(self.seq_len % self.tile_n != 0 or mBias is not None):
             cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
             tScS = thr_mma_qk.partition_C(cS)
 
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        acc_S = cute.make_fragment(
+        acc_S = cute.make_rmem_tensor(
             thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
         )
         acc_S.fill(0.0)
@@ -365,54 +398,83 @@ class WindowAttnFwdTF32:
                 t0KcK,
                 tKpK,
                 n_block=1,
-                smem_stage=0,
+                smem_stage=1 if cutlass.const_expr(not self.single_kv_tile) else 0,
                 seqlen=seqlen,
                 need_predicates=False,
             )
+            if cutlass.const_expr(not self.single_kv_tile):
+                self._load_V(
+                    gmem_tiled_copy_V,
+                    tVgV,
+                    tVsV,
+                    tVcV,
+                    t0VcV,
+                    tVpV,
+                    n_block=1,
+                    seqlen=seqlen,
+                    smem_stage=1,
+                )
             cute.arch.cp_async_commit_group()
 
-        if cutlass.const_expr(mBias is not None):
+        if cutlass.const_expr(self.seq_len % self.tile_n != 0 or mBias is not None):
             m_start = m_block * self.tile_m
-            for i in cutlass.range_constexpr(cute.size(acc_S)):
-                m_idx = m_start + tScS[i][0]
+            for i in cutlass.range(cute.size(acc_S), unroll_full=True):
                 n_idx = tScS[i][1]
-                m_valid = m_idx < seqlen
-                n_valid = n_idx < seqlen
-                both = m_valid & n_valid
-                m_safe = m_idx if m_valid else Int32(0)
-                n_safe = n_idx if n_valid else Int32(0)
-                acc_S[i] = acc_S[i] + (mBias_w[m_safe, n_safe] if both else Float32(0.0))
+                if cutlass.const_expr(self.seq_len % self.tile_n != 0):
+                    if n_idx >= seqlen:
+                        acc_S[i] = -Float32.inf
+                if cutlass.const_expr(mBias is not None):
+                    m_idx = m_start + tScS[i][0]
+                    m_valid = m_idx < seqlen
+                    n_valid = n_idx < seqlen
+                    both = m_valid & n_valid
+                    m_safe = m_idx if m_valid else Int32(0)
+                    n_safe = n_idx if n_valid else Int32(0)
+                    acc_S[i] = acc_S[i] + (mBias_w[m_safe, n_safe] if both else Float32(0.0))
 
         row_scale = softmax.online_softmax(acc_S, is_first=True, check_inf=True)
 
-        self._load_V(
-            gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, n_block=0, seqlen=seqlen
-        )
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+        if cutlass.const_expr(self.single_kv_tile):
+            self._load_V(
+                gmem_tiled_copy_V,
+                tVgV,
+                tVsV,
+                tVcV,
+                t0VcV,
+                tVpV,
+                n_block=0,
+                seqlen=seqlen,
+                smem_stage=0,
+            )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
 
-        acc_S_tf32 = cute.make_fragment_like(acc_S, TFloat32)
-        acc_S_tf32.store(acc_S.load().to(TFloat32))
+        acc_S_bf16 = cute.make_rmem_tensor_like(acc_S, BFloat16)
+        acc_S_bf16.store(acc_S.load().to(BFloat16))
+        tOrP = layout_utils.reshape_acc_to_frgA(acc_S_bf16)
 
         gemm_rs(
             tiled_mma_pv,
             acc_O,
-            acc_S_tf32,
+            tOrP,
             tOrVt,
             tOsVt[None, None, None, 0],
             smem_thr_cp_V,
         )
-        cute.arch.sync_threads()
+        if cutlass.const_expr(self.single_kv_tile):
+            cute.arch.sync_threads()
 
         if cutlass.const_expr(not self.single_kv_tile):
             for n_tile in cutlass.range(n_block_max - 1, unroll=1):
                 n_block = n_tile + 1
+                stage_cur = n_block % 2
+                stage_nxt = (n_block + 1) % 2
 
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()
 
-                acc_S = cute.make_fragment(
+                acc_S = cute.make_rmem_tensor(
                     thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
                 )
                 acc_S.fill(0.0)
@@ -423,7 +485,7 @@ class WindowAttnFwdTF32:
                     tSrQ,
                     tSrK,
                     tSsQ,
-                    tSsK[None, None, None, 0],
+                    tSsK[None, None, None, stage_cur],
                     smem_thr_cp_Q,
                     smem_thr_cp_K,
                 )
@@ -437,59 +499,62 @@ class WindowAttnFwdTF32:
                         t0KcK,
                         tKpK,
                         n_block=n_block + 1,
-                        smem_stage=0,
+                        smem_stage=stage_nxt,
                         seqlen=seqlen,
                         need_predicates=False,
                     )
+                    self._load_V(
+                        gmem_tiled_copy_V,
+                        tVgV,
+                        tVsV,
+                        tVcV,
+                        t0VcV,
+                        tVpV,
+                        n_block=n_block + 1,
+                        seqlen=seqlen,
+                        smem_stage=stage_nxt,
+                    )
                     cute.arch.cp_async_commit_group()
 
-                if cutlass.const_expr(mBias is not None):
+                if cutlass.const_expr(self.seq_len % self.tile_n != 0 or mBias is not None):
                     m_start = m_block * self.tile_m
                     n_start = n_block * self.tile_n
-                    for i in cutlass.range_constexpr(cute.size(acc_S)):
-                        m_idx = m_start + tScS[i][0]
+                    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
                         n_idx = n_start + tScS[i][1]
-                        m_valid = m_idx < seqlen
-                        n_valid = n_idx < seqlen
-                        both = m_valid & n_valid
-                        m_safe = m_idx if m_valid else Int32(0)
-                        n_safe = n_idx if n_valid else Int32(0)
-                        acc_S[i] = acc_S[i] + (mBias_w[m_safe, n_safe] if both else Float32(0.0))
+                        if cutlass.const_expr(self.seq_len % self.tile_n != 0):
+                            if n_idx >= seqlen:
+                                acc_S[i] = -Float32.inf
+                        if cutlass.const_expr(mBias is not None):
+                            m_idx = m_start + tScS[i][0]
+                            m_valid = m_idx < seqlen
+                            n_valid = n_idx < seqlen
+                            both = m_valid & n_valid
+                            m_safe = m_idx if m_valid else Int32(0)
+                            n_safe = n_idx if n_valid else Int32(0)
+                            acc_S[i] = acc_S[i] + (
+                                mBias_w[m_safe, n_safe] if both else Float32(0.0)
+                            )
 
                 row_scale = softmax.online_softmax(acc_S, is_first=False, check_inf=True)
                 softmax.rescale_O(acc_O, row_scale)
 
-                self._load_V(
-                    gmem_tiled_copy_V,
-                    tVgV,
-                    tVsV,
-                    tVcV,
-                    t0VcV,
-                    tVpV,
-                    n_block=n_block,
-                    seqlen=seqlen,
-                )
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.sync_threads()
-
-                acc_S_tf32 = cute.make_fragment_like(acc_S, TFloat32)
-                acc_S_tf32.store(acc_S.load().to(TFloat32))
+                acc_S_bf16 = cute.make_rmem_tensor_like(acc_S, BFloat16)
+                acc_S_bf16.store(acc_S.load().to(BFloat16))
+                tOrP = layout_utils.reshape_acc_to_frgA(acc_S_bf16)
 
                 gemm_rs(
                     tiled_mma_pv,
                     acc_O,
-                    acc_S_tf32,
+                    tOrP,
                     tOrVt,
-                    tOsVt[None, None, None, 0],
+                    tOsVt[None, None, None, stage_cur],
                     smem_thr_cp_V,
                 )
-                cute.arch.sync_threads()
 
         final_row_scale = softmax.finalize()
         softmax.rescale_O(acc_O, final_row_scale)
 
-        rO = cute.make_fragment_like(acc_O, Float32)
+        rO = cute.make_rmem_tensor_like(acc_O, Float32)
         rO.store(acc_O.load())
 
         arch_v = self.arch.major * 10 + self.arch.minor
@@ -504,7 +569,7 @@ class WindowAttnFwdTF32:
         gO = cute.local_tile(mO_cur, blkQ, (m_block, 0))
         gmem_thr_cp_O = gmem_tiled_copy_O.get_slice(tidx)
         tOsO = gmem_thr_cp_O.partition_S(sO)
-        tOrO = cute.make_fragment_like(tOsO, Float32)
+        tOrO = cute.make_rmem_tensor_like(tOsO, Float32)
         cute.autovec_copy(tOsO, tOrO)
         tOgO = gmem_thr_cp_O.partition_D(gO)
         cO = cute.make_identity_tensor(blkQ)
@@ -565,13 +630,15 @@ class WindowAttnFwdTF32:
         tVpV: cute.Tensor,
         n_block: Int32,
         seqlen: Int32,
+        smem_stage: Int32,
     ):
         is_even_n = cutlass.const_expr(self.tile_n % gmem_tiled_copy_V.tiler_mn[0].shape == 0)
-        if cutlass.const_expr(is_even_n):
+        has_partial_tile = cutlass.const_expr(self.seq_len % self.tile_n != 0)
+        if cutlass.const_expr(is_even_n and not has_partial_tile):
             cute.copy(
                 gmem_tiled_copy_V,
                 tVgV[None, None, None, n_block],
-                tVsV[None, None, None, 0],
+                tVsV[None, None, None, smem_stage],
             )
         else:
             seqlen_limit = seqlen - n_block * self.tile_n - tVcV[0][0]
@@ -580,7 +647,7 @@ class WindowAttnFwdTF32:
                     cute.copy(
                         gmem_tiled_copy_V,
                         tVgV[None, n, None, n_block],
-                        tVsV[None, n, None, 0],
+                        tVsV[None, n, None, smem_stage],
                         pred=tVpV[None, n, None]
                         if cutlass.const_expr(self.check_hdim_oob) else None,
                     )
@@ -598,7 +665,8 @@ def _get_or_compile_tf32(
     o: torch.Tensor,
     bias_or_none: Optional[torch.Tensor],
 ):
-    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n)
+    single_kv = tile_n >= seq_len
+    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "hybrid_pv_bf16_v4")
     if compile_key in _tf32_compile_cache:
         return _tf32_compile_cache[compile_key]
 
