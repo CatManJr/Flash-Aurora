@@ -15,7 +15,12 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from ._smem_utils import _get_smem_budget_bytes, _choose_tile_n, _choose_tile_n_tf32  # noqa: F401
+from ._smem_utils import (  # noqa: F401
+    _get_smem_budget_bytes,
+    _choose_tile_n,
+    _choose_tile_n_tf32,
+    _tf32_hybrid_smem_bytes,
+)
 
 try:
     from ._kernel_bf16 import (

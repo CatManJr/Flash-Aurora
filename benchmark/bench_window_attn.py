@@ -5,8 +5,8 @@ Measures forward-pass latency and TFLOPS for Aurora encoder window shapes.
 Paths benchmarked
 -----------------
 * **BF16_MIXED** — BF16 I/O, FP32 softmax/accum (CuTe) vs BF16 SDPA.
-* **TF32_ACC_FP32** — FP32 I/O, TF32 QK MMA (CuTe) vs strict-FP32 SDPA
-  (TF32 disabled in torch matmuls).
+* **TF32_ACC_FP32** — FP32 I/O, TF32 QK MMA (CuTe) vs torch SDPA with TF32 matmuls
+  (1×TF32 apples-to-apples) and vs strict-FP32 SDPA (quality reference).
 
 Aurora uses window_size=(2, 6, 12) for all encoder and decoder stages.
 The actual N = Wc×Wh×Ww depends on the spatial resolution of the input:
@@ -25,6 +25,11 @@ import statistics
 import sys
 from dataclasses import dataclass
 from typing import Callable
+
+_BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
+import _bootstrap  # noqa: F401, E402  — before torch (OMP_NUM_THREADS)
 
 import torch
 import torch.nn.functional as F
@@ -155,24 +160,26 @@ def fp32_reference_bf16(q_bf, k_bf, v_bf, scale):
 
 def _print_accuracy_result(
     label: str,
-    out: torch.Tensor,
-    ref: torch.Tensor,
+    candidate: torch.Tensor,
+    baseline: torch.Tensor,
     rtol: float,
     atol: float,
 ) -> bool:
-    out_f = out.float()
-    ref_f = ref.float()
+    out_f = candidate.float()
+    ref_f = baseline.float()
     abs_err = (out_f - ref_f).abs()
     max_err = abs_err.max().item()
     mean_err = abs_err.mean().item()
     passed = torch.allclose(out_f, ref_f, rtol=rtol, atol=atol)
     status = "PASS" if passed else "FAIL"
     print(f"  [{status}] {label}")
-    print(f"         max_abs={max_err:.4e}  mean_abs={mean_err:.4e}  "
-          f"(atol={atol}, rtol={rtol})")
+    print(f"         max_abs={max_err:.6e}  mean_abs={mean_err:.6e}  "
+          f"(atol={atol:g}, rtol={rtol:g})")
     if not passed:
         frac = (abs_err.reshape(-1) > atol).float().mean().item()
         print(f"         {frac * 100:.1f}% of elements exceed atol")
+    elif max_err > 0.0:
+        print(f"         bitwise_equal={torch.equal(out_f, ref_f)}")
     return passed
 
 
@@ -186,7 +193,9 @@ def check_accuracy_bf16(Bwin, H, N, Dh, scale, label, rtol=2e-2, atol=2e-2):
     return _print_accuracy_result(label, out_cute, ref, rtol, atol)
 
 
-def check_accuracy_tf32(Bwin, H, N, Dh, scale, label, rtol=1e-3, atol=1e-3):
+def check_accuracy_tf32(
+    Bwin, H, N, Dh, scale, label, *, ref_allow_tf32: bool, rtol=1e-3, atol=1e-3,
+):
     if not _CUTE_AVAILABLE:
         print(f"  [SKIP] {label}  (CuTeDSL not available)")
         return True
@@ -195,7 +204,7 @@ def check_accuracy_tf32(Bwin, H, N, Dh, scale, label, rtol=1e-3, atol=1e-3):
         out_cute = window_attn_fwd_cute(
             q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32, scale_qk=scale,
         )
-        ref = fp32_sdpa(q, k, v, scale, allow_tf32=False)
+        ref = fp32_sdpa(q, k, v, scale, allow_tf32=ref_allow_tf32)
     return _print_accuracy_result(label, out_cute, ref, rtol, atol)
 
 
@@ -316,7 +325,7 @@ def main():
     scale = 1.0 / math.sqrt(64)
 
     print("=" * 60)
-    print("Numerical accuracy: CuTe BF16  vs  FP32 SDPA reference")
+    print("Numerical accuracy: CuTe BF16  vs  FP32 SDPA  (baseline)")
     print("=" * 60)
     all_passed = True
     for Bwin, H, N, Dh, label in SHAPES:
@@ -327,20 +336,41 @@ def main():
 
     print()
     print("=" * 60)
-    print("Numerical accuracy: CuTe TF32_ACC_FP32  vs  strict-FP32 SDPA")
+    print("Numerical accuracy: CuTe TF32  vs  SDPA-TF32 baseline  (1×TF32)")
     print("=" * 60)
-    tf32_passed = True
+    tf32_sdpa_passed = True
     if not _CUTE_AVAILABLE:
         print("  [SKIP] CuTeDSL not available — TF32 kernel not built.")
     else:
         for Bwin, H, N, Dh, label in SHAPES:
-            ok = check_accuracy_tf32(Bwin, H, N, Dh, scale, label)
-            tf32_passed = tf32_passed and ok
+            ok = check_accuracy_tf32(
+                Bwin, H, N, Dh, scale, label, ref_allow_tf32=True,
+            )
+            tf32_sdpa_passed = tf32_sdpa_passed and ok
         print()
-        print("Overall:", "ALL PASS" if tf32_passed else "SOME FAILED")
+        print("Overall:", "ALL PASS" if tf32_sdpa_passed else "SOME FAILED")
+
+    print()
+    print("=" * 60)
+    print("Numerical accuracy: CuTe TF32  vs  strict-FP32 SDPA baseline")
+    print("=" * 60)
+    tf32_strict_passed = True
+    if not _CUTE_AVAILABLE:
+        print("  [SKIP] CuTeDSL not available.")
+    else:
+        for Bwin, H, N, Dh, label in SHAPES:
+            ok = check_accuracy_tf32(
+                Bwin, H, N, Dh, scale, label, ref_allow_tf32=False,
+            )
+            tf32_strict_passed = tf32_strict_passed and ok
+        print()
+        print("Overall:", "ALL PASS" if tf32_strict_passed else "SOME FAILED")
 
     def sdpa_bf16(q, k, v, s):
         return lambda: F.scaled_dot_product_attention(q, k, v, scale=s)
+
+    def sdpa_tf32_fp32(q, k, v, s):
+        return lambda: fp32_sdpa(q, k, v, s, allow_tf32=True)
 
     def sdpa_strict_fp32(q, k, v, s):
         return lambda: fp32_sdpa(q, k, v, s, allow_tf32=False)
@@ -360,7 +390,20 @@ def main():
     if _CUTE_AVAILABLE:
         run_perf_table(
             SHAPES,
-            title="Performance: CuTe TF32_ACC_FP32  vs  strict-FP32 SDPA",
+            title="Performance: CuTe TF32  vs  SDPA-TF32  (1×TF32 matmul, fair)",
+            dtype=torch.float32,
+            choose_tile_n=_choose_tile_n_tf32,
+            cute_precision=WinAttnPrecision.TF32_ACC_FP32,
+            make_baseline=sdpa_tf32_fp32,
+            cute_col="CuTe-TF32",
+            baseline_col="SDPA-TF32",
+        )
+        _print_latency_note()
+        print("      speedup > 1  → CuTe TF32 kernel faster than torch SDPA @ TF32.")
+
+        run_perf_table(
+            SHAPES,
+            title="Performance: CuTe TF32  vs  strict-FP32 SDPA  (quality ref)",
             dtype=torch.float32,
             choose_tile_n=_choose_tile_n_tf32,
             cute_precision=WinAttnPrecision.TF32_ACC_FP32,
@@ -369,6 +412,7 @@ def main():
             baseline_col="SDPA-strict",
         )
         _print_latency_note()
+        print("      strict baseline disables TF32; larger speedup is not apples-to-apples.")
     else:
         print()
         print("=" * 60)
@@ -390,13 +434,13 @@ def main():
     if _CUTE_AVAILABLE:
         run_perf_table(
             SHAPES_REALISTIC,
-            title="Realistic Aurora shapes: CuTe TF32_ACC_FP32  vs  strict-FP32 SDPA",
+            title="Realistic shapes: CuTe TF32  vs  SDPA-TF32",
             dtype=torch.float32,
             choose_tile_n=_choose_tile_n_tf32,
             cute_precision=WinAttnPrecision.TF32_ACC_FP32,
-            make_baseline=sdpa_strict_fp32,
+            make_baseline=sdpa_tf32_fp32,
             cute_col="CuTe-TF32",
-            baseline_col="SDPA-strict",
+            baseline_col="SDPA-TF32",
         )
         _print_latency_note()
 

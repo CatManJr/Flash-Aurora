@@ -14,6 +14,11 @@ import os
 import statistics
 import sys
 
+_BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
+import _bootstrap  # noqa: F401, E402
+
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "aurora"))

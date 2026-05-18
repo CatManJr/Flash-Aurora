@@ -30,6 +30,7 @@ from aurora.ops.cute.window_attn_fwd import (
     _expand_bias_for_sdpa,
     _choose_tile_n,
     _choose_tile_n_tf32,
+    _tf32_hybrid_smem_bytes,
     _get_smem_budget_bytes,
     WinAttnPrecision,
     window_attn_dispatch,
@@ -448,15 +449,22 @@ class TestChooseTileN:
     def test_tf32_n144_single_pass_99kb(self) -> None:
         """N=144 must select tile_n=144 (single-pass) on 99 KB device."""
         tile_n = _choose_tile_n_tf32(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
-        # sQ=16KB, sK+sV=2×144×64×4B=72KB → 88KB < 99KB
+        # sQ=16KB, sK+sV=144×64×(4+2)B=54KB → 70KB < 99KB
         assert tile_n == 144
+        assert _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=1) <= 99 * 1024
+
+    def test_tf32_n288_streams_99kb_hybrid(self) -> None:
+        """N=288 must stream on 99 KB; 2-stage hybrid SMEM fits half budget."""
+        tile_n = _choose_tile_n_tf32(288, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+        assert tile_n < 288
+        assert tile_n == 32
+        assert _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=2) <= 99 * 1024 // 2
 
     def test_tf32_n144_streaming_on_48kb(self) -> None:
-        """N=144 must stream on a 48 KB device (88 KB needed > 48 KB budget)."""
+        """N=144 must stream on a 48 KB device (70 KB single-pass > 48 KB budget)."""
         tile_n = _choose_tile_n_tf32(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
         assert tile_n < 144
-        smem = 64 * 64 * 4 + 2 * tile_n * 64 * 4
-        assert smem <= 48 * 1024
+        assert _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=2) <= 48 * 1024
 
     def test_tf32_tile_n_aligned_to_8(self) -> None:
         for N in (100, 144, 200, 288):
@@ -469,8 +477,10 @@ class TestChooseTileN:
         for N in (8, 32, 64, 144, 288):
             tile_n = _choose_tile_n_tf32(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
             assert tile_n <= N, f"tile_n={tile_n} > N={N}"
-            smem = 64 * 64 * 4 + 2 * tile_n * 64 * 4
-            assert smem <= budget, f"SMEM {smem} > budget {budget} for N={N}"
+            stages = 1 if tile_n >= N else 2
+            limit = budget if stages == 1 else budget // 2
+            smem = _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=stages)
+            assert smem <= limit, f"SMEM {smem} > limit {limit} for N={N}"
 
     # ----- _get_smem_budget_bytes -----
 

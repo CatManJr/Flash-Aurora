@@ -1,13 +1,14 @@
 """Benchmark: Swin3DTransformerBlock — pure PyTorch vs Triton/CuTe optimizations.
 
-Accuracy comparisons (same weights; ref = Optimized BF16 unless noted):
-  A. BF16 Baseline  vs  BF16 Optimized           → kernel fidelity
-  B. FP32+autocast Baseline  vs  BF16 Optimized  → autocast vs explicit BF16
-  C. FP32 strict SDPA Baseline  vs  BF16 Optimized
-  D. FP32 strict SDPA Baseline  vs  FP32 TF32 Optimized (CuTe TF32_ACC_FP32)
+Accuracy (same weights; error = |candidate − baseline|):
+  A. BF16 OPT  vs  BF16 BL
+  B. BF16 OPT  vs  FP32+autocast BL
+  C. BF16 OPT  vs  FP32 strict SDPA BL
+  D. TF32 OPT  vs  FP32 strict SDPA BL
+  E. TF32 OPT  vs  SDPA-TF32 BL  (1×TF32 fair compare)
 
-Timing & memory (latency in µs; speedup vs FP32 strict SDPA baseline):
-  FP32-BL (strict SDPA) | TF32-OPT | BF16-BL | BF16-OPT
+Timing & memory (latency in µs):
+  FP32-strict | SDPA-TF32 | TF32-OPT | T32/TF32 | T32/str | BF16-BL | BF16-OPT
 
 Run:
     uv run python benchmark/bench_swin_block.py
@@ -18,6 +19,11 @@ import contextlib
 import os
 import statistics
 import sys
+
+_BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
+import _bootstrap  # noqa: F401, E402
 
 import torch
 
@@ -87,22 +93,24 @@ def make_block(D, num_heads, shift, optimized: bool, dtype=torch.float32):
 
 
 @contextlib.contextmanager
-def _sdpa_strict_ctx():
-    """torch SDPA baseline: disable TF32 in matmuls (strict FP32)."""
+def _matmul_tf32_ctx(allow_tf32: bool):
     old = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
     try:
         yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old
 
 
-def fwd(blk, x, c, res, pool=None, autocast=False, sdpa_strict=False):
+def fwd(blk, x, c, res, pool=None, autocast=False, matmul_tf32: bool | None = None):
     if pool is not None:
         blk._layout_pool = pool
     ac = torch.autocast("cuda", dtype=torch.bfloat16) if autocast else contextlib.nullcontext()
-    sdpa = _sdpa_strict_ctx() if sdpa_strict else contextlib.nullcontext()
-    with torch.no_grad(), ac, sdpa:
+    if matmul_tf32 is None:
+        mm = contextlib.nullcontext()
+    else:
+        mm = _matmul_tf32_ctx(matmul_tf32)
+    with torch.no_grad(), ac, mm:
         return blk(x, c, res, rollout_step=0)
 
 
@@ -115,31 +123,34 @@ def fmt_mb(n): return f"{n/1024**2:.1f} MB"
 
 def verify_accuracy():
     print("=" * 80)
-    print("NUMERICAL ACCURACY  (same weights)")
+    print("NUMERICAL ACCURACY  (same weights; |candidate − baseline|)")
     print("=" * 80)
     if not _CUTE_AVAILABLE:
-        print("  [note] CuTeDSL unavailable — row D (TF32) will be skipped.\n")
+        print("  [note] CuTeDSL unavailable — TF32 rows skipped.\n")
 
     col_l = 14
     col_c = 38
-    col_e = 12
+    col_e = 14
     hdr = (f"{'Shape':<{col_l}}"
-           f"{'Comparison':<{col_c}}"
+           f"{'candidate (baseline)':<{col_c}}"
            f"{'max|err|':>{col_e}}"
            f"{'mean|err|':>{col_e}}"
            f"{'cosine':>{col_e}}")
     print(hdr)
     print("-" * len(hdr))
 
-    def row(a, b, lshape, lcmp):
-        a, b = a.float(), b.float()
-        d = (a - b).abs()
+    def row(candidate, baseline, lshape, label, err_fmt: str = ".6e"):
+        cand = candidate.float()
+        base = baseline.float()
+        d = (cand - base).abs()
         cos = torch.nn.functional.cosine_similarity(
-            a.reshape(1, -1), b.reshape(1, -1)).item()
-        print(f"{lshape:<{col_l}}{lcmp:<{col_c}}"
-              f"{d.max().item():>{col_e}.3e}"
-              f"{d.mean().item():>{col_e}.3e}"
+            cand.reshape(1, -1), base.reshape(1, -1)).item()
+        print(f"{lshape:<{col_l}}{label:<{col_c}}"
+              f"{d.max().item():>{col_e}{err_fmt}}"
+              f"{d.mean().item():>{col_e}{err_fmt}}"
               f"{cos:>{col_e}.8f}")
+        if d.max().item() == 0.0:
+            print(f"{'':<{col_l}}{'  (bitwise equal to baseline)':<{col_c}}")
 
     for sw_lbl, shift in [("W", False), ("SW", True)]:
         for C, H, W, D, nh, slbl in SHAPES:
@@ -164,24 +175,35 @@ def verify_accuracy():
             pool = InferenceWorkspacePool()
 
             with torch.no_grad():
-                op_bf16._layout_pool = pool
-                out_opt = op_bf16(x16, c16, res, rollout_step=0)
-
                 out_bl16 = bl_bf16(x16, c16, res, rollout_step=0)
-                row(out_bl16, out_opt, lbl, "A: BF16 BL  vs  BF16 OPT")
-
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     out_ac = ref_fp32(x32, c32, res, rollout_step=0)
-                row(out_ac, out_opt, lbl, "B: FP32+autocast BL  vs  BF16 OPT")
+                with _matmul_tf32_ctx(False):
+                    out_fp32_strict = ref_fp32(x32, c32, res, rollout_step=0)
+                with _matmul_tf32_ctx(True):
+                    out_sdpa_tf32 = ref_fp32(x32, c32, res, rollout_step=0)
 
-                with _sdpa_strict_ctx():
-                    out_fp32 = ref_fp32(x32, c32, res, rollout_step=0)
-                row(out_fp32, out_opt, lbl, "C: FP32 strict SDPA BL  vs  BF16 OPT")
+                op_bf16._layout_pool = pool
+                out_bf16_opt = op_bf16(x16, c16, res, rollout_step=0)
+                row(out_bf16_opt, out_bl16, lbl, "BF16 OPT  (BL: BF16 PyTorch)")
+
+                row(out_bf16_opt, out_ac, lbl, "BF16 OPT  (BL: FP32+autocast)")
+
+                row(out_bf16_opt, out_fp32_strict, lbl, "BF16 OPT  (BL: FP32 strict)")
 
                 if _CUTE_AVAILABLE:
                     op_tf32._layout_pool = pool
-                    out_tf32 = op_tf32(x32, c32, res, rollout_step=0)
-                    row(out_tf32, out_fp32, lbl, "D: TF32 OPT  vs  FP32 strict SDPA BL")
+                    out_tf32_opt = op_tf32(x32, c32, res, rollout_step=0)
+                    row(
+                        out_tf32_opt, out_fp32_strict, lbl,
+                        "TF32 OPT  (BL: FP32 strict SDPA)",
+                        err_fmt=".6e",
+                    )
+                    row(
+                        out_tf32_opt, out_sdpa_tf32, lbl,
+                        "TF32 OPT  (BL: SDPA-TF32)",
+                        err_fmt=".6e",
+                    )
 
         print()
 
@@ -195,19 +217,20 @@ def run_bench():
     print(f"TIMING & PEAK MEMORY  (B={B}  warmup={WARMUP}  measured={MEASURED})")
     print("=" * 80)
 
-    col_l = 20
-    col_t = 12
-    col_m = 12
-    col_s = 8
+    col_l = 18
+    col_t = 11
+    col_m = 11
+    col_s = 7
     hdr = (
         f"{'Shape':<{col_l}}"
-        f"{'FP32-BL':>{col_t}}"
+        f"{'FP32-str':>{col_t}}"
+        f"{'SDPA-TF32':>{col_t}}"
         f"{'TF32-OPT':>{col_t}}"
-        f"{'T32/BL':>{col_s}}"
+        f"{'T/T32':>{col_s}}"
+        f"{'T/str':>{col_s}}"
         f"{'BF16-BL':>{col_t}}"
         f"{'BF16-OPT':>{col_t}}"
         f"{'B16/BL':>{col_s}}"
-        f"{'FP32 mem':>{col_m}}"
         f"{'TF32 mem':>{col_m}}"
         f"{'OPT mem':>{col_m}}"
     )
@@ -226,25 +249,37 @@ def run_bench():
             x16  = x32.bfloat16()
             c16  = c32.bfloat16()
 
-            # FP32 strict SDPA baseline (TF32 disabled in matmuls)
             blk_fp32 = make_block(D, nh, shift, optimized=False, dtype=torch.float32)
-            fwd(blk_fp32, x32, c32, res, sdpa_strict=True)
-            t_fp32 = bench(lambda b=blk_fp32: fwd(b, x32, c32, res, sdpa_strict=True))
-            m_fp32 = peak_mem(lambda b=blk_fp32: fwd(b, x32, c32, res, sdpa_strict=True))
 
-            # FP32 optimized: Triton layout/AdaLN/MLP + CuTe TF32_ACC_FP32 window attn
+            fwd(blk_fp32, x32, c32, res, matmul_tf32=False)
+            t_fp32_strict = bench(
+                lambda b=blk_fp32: fwd(b, x32, c32, res, matmul_tf32=False)
+            )
+
+            fwd(blk_fp32, x32, c32, res, matmul_tf32=True)
+            t_sdpa_tf32 = bench(
+                lambda b=blk_fp32: fwd(b, x32, c32, res, matmul_tf32=True)
+            )
+
             pool = InferenceWorkspacePool()
             if _CUTE_AVAILABLE:
                 blk_tf32 = make_block(D, nh, shift, optimized=True, dtype=torch.float32)
+                blk_tf32.load_state_dict(blk_fp32.state_dict())
                 fwd(blk_tf32, x32, c32, res, pool)
-                t_tf32 = bench(lambda b=blk_tf32, p=pool: fwd(b, x32, c32, res, p))
-                m_tf32 = peak_mem(lambda b=blk_tf32, p=pool: fwd(b, x32, c32, res, p))
-                tf32_speedup = t_fp32 / t_tf32
-                t_tf32_us = t_tf32 * 1000
+                t_tf32_opt = bench(
+                    lambda b=blk_tf32, p=pool: fwd(b, x32, c32, res, p)
+                )
+                m_tf32 = peak_mem(
+                    lambda b=blk_tf32, p=pool: fwd(b, x32, c32, res, p)
+                )
+                spd_tf32 = t_sdpa_tf32 / t_tf32_opt
+                spd_strict = t_fp32_strict / t_tf32_opt
+                t_tf32_us = t_tf32_opt * 1000
                 m_tf32_s = fmt_mb(m_tf32)
             else:
                 t_tf32_us = float("nan")
-                tf32_speedup = float("nan")
+                spd_tf32 = float("nan")
+                spd_strict = float("nan")
                 m_tf32_s = "n/a"
 
             # BF16 baseline
@@ -261,28 +296,31 @@ def run_bench():
 
             if _CUTE_AVAILABLE:
                 tf32_time_s = f"{t_tf32_us:>{col_t}.1f}"
-                tf32_spd_s = f"{tf32_speedup:>{col_s}.2f}x"
+                spd_tf32_s = f"{spd_tf32:>{col_s}.2f}x"
+                spd_strict_s = f"{spd_strict:>{col_s}.2f}x"
             else:
                 tf32_time_s = f"{'n/a':>{col_t}}"
-                tf32_spd_s = f"{'n/a':>{col_s}}"
+                spd_tf32_s = f"{'n/a':>{col_s}}"
+                spd_strict_s = f"{'n/a':>{col_s}}"
 
             print(
                 f"{lbl:<{col_l}}"
-                f"{t_fp32*1000:>{col_t}.1f}"
+                f"{t_fp32_strict*1000:>{col_t}.1f}"
+                f"{t_sdpa_tf32*1000:>{col_t}.1f}"
                 f"{tf32_time_s}"
-                f"{tf32_spd_s}"
+                f"{spd_tf32_s}"
+                f"{spd_strict_s}"
                 f"{t_bl16*1000:>{col_t}.1f}"
                 f"{t_opt*1000:>{col_t}.1f}"
                 f"{t_bl16/t_opt:>{col_s}.2f}x"
-                f"{fmt_mb(m_fp32):>{col_m}}"
                 f"{m_tf32_s:>{col_m}}"
                 f"{fmt_mb(m_opt):>{col_m}}"
             )
 
     print()
-    print("Time in µs. FP32-BL = strict torch SDPA (TF32 off). TF32-OPT = CuTe TF32_ACC_FP32 + Triton.")
-    print("T32/BL = TF32-OPT speedup vs FP32-BL; B16/BL = BF16-OPT vs BF16-BL.")
-    print("Mem = peak extra alloc above model weights.")
+    print("Time in µs. FP32-str = PyTorch BL, TF32 off. SDPA-TF32 = PyTorch BL, TF32 on (1×TF32).")
+    print("TF32-OPT = CuTe TF32_ACC_FP32 + Triton.  T/T32 = OPT speedup vs SDPA-TF32 (fair).")
+    print("T/str = OPT vs strict (quality ref, not same numerics).  Mem = peak extra alloc.")
 
 
 # ---------------------------------------------------------------------------

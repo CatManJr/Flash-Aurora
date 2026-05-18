@@ -95,33 +95,54 @@ def _choose_tile_n(
     return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
 
 
+def _tf32_hybrid_smem_bytes(
+    tile_n: int,
+    head_dim: int,
+    tile_m: int = 64,
+    num_stages: int = 1,
+) -> int:
+    """Bytes for TF32 hybrid kernel SMEM: FP32 ``sQ``/``sK``, BF16 ``sV`` (see ``_kernel_fp32``)."""
+    return (
+        tile_m * head_dim * 4
+        + tile_n * head_dim * 4 * num_stages
+        + tile_n * head_dim * 2 * num_stages
+    )
+
+
 def _choose_tile_n_tf32(
     seq_len: int,
     head_dim: int = 64,
     tile_m: int = 64,
     smem_budget_bytes: Optional[int] = None,
 ) -> int:
-    """Choose tile_n for TF32/FP32 (4-byte elements).
+    """Choose tile_n for TF32_ACC_FP32 (hybrid FP32 Q/K + BF16 V).
 
-    Same single-pass / multi-pass strategy as :func:`_choose_tile_n` but
-    with 4-byte elements.  Rounded down to a multiple of 16.
+    SMEM layout (matches ``WindowAttnFwdTF32``)::
+
+        sQ : tile_m  × head_dim × 4B
+        sK : tile_n  × head_dim × 4B × num_stages
+        sV : tile_n  × head_dim × 2B × num_stages
+
+    Single-pass uses ``num_stages=1``; streaming uses ``num_stages=2`` (K/V
+    double-buffer) with half the SMEM budget for occupancy, same as BF16.
     """
     if smem_budget_bytes is None:
         smem_budget_bytes = _get_smem_budget_bytes()
 
-    sQ_bytes     = tile_m * head_dim * 4
-    kv_row_bytes = head_dim * 4
+    sQ_bytes = tile_m * head_dim * 4
+    # Per tile_n row: one FP32 K tile + one BF16 V tile (per stage).
+    kv_single = head_dim * 6
+    kv_stream = head_dim * 12
 
-    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // (2 * kv_row_bytes)
+    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // kv_single
     max_tile_n_full = max((max_tile_n_full // 16) * 16, 16)
 
     if seq_len <= max_tile_n_full:
         capped = min(seq_len, max_tile_n_full)
         return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
 
-    # Multi-pass: cap at half budget for ≥2 CTAs per SM.
-    half_budget     = smem_budget_bytes // 2
-    max_tile_n_half = max((half_budget - sQ_bytes) // (2 * kv_row_bytes), 0)
+    half_budget = smem_budget_bytes // 2
+    max_tile_n_half = max((half_budget - sQ_bytes) // kv_stream, 0)
     max_tile_n_half = max((max_tile_n_half // 16) * 16, 16)
     capped = min(seq_len, max_tile_n_half)
     return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)

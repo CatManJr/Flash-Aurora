@@ -1,6 +1,17 @@
 """Copyright (c) Microsoft Corporation. Licensed under the MIT license."""
 
+import importlib.util
 import os
+
+_omp_path = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "aurora", "_openmp_env.py")
+)
+_omp_spec = importlib.util.spec_from_file_location("aurora._openmp_env", _omp_path)
+assert _omp_spec is not None and _omp_spec.loader is not None
+_omp_mod = importlib.util.module_from_spec(_omp_spec)
+_omp_spec.loader.exec_module(_omp_mod)
+_omp_mod.sanitize_openmp_env()
+
 import pickle
 from datetime import datetime
 from typing import Generator, TypedDict
