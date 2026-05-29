@@ -239,8 +239,14 @@ def window_attn_fwd_cute(
     v_run = v
     if precision == WinAttnPrecision.TF32_ACC_FP32:
         _tile_n = tile_n if tile_n is not None else _choose_tile_n_tf32(N, head_dim=Dh, tile_m=tile_m)
-        # PV smem uses BF16 + 8x8x16b transpose (same as BF16 FA); cast V at gmem load.
-        v_run = v.to(torch.bfloat16)
+        # PV smem uses BF16 + 8x8x16b transpose (ldmatrix.trans is 16-bit only).
+        # Single-pass (+ aligned head_dim): pass V as FP32 and let the kernel convert
+        # to BF16 during the gmem→smem load, fusing away this full-tensor cast.
+        # Multi-pass: keep the host cast (cp.async V prefetch path stays intact).
+        if _tile_n >= N and Dh % 16 == 0:
+            v_run = v
+        else:
+            v_run = v.to(torch.bfloat16)
         fn = _get_or_compile_tf32_v2(
             head_dim=Dh, seq_len=N, has_bias=has_bias,
             tile_m=tile_m, tile_n=_tile_n,
