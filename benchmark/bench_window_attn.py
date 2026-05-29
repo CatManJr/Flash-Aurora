@@ -40,6 +40,7 @@ from aurora.ops.cute.window_attn_fwd import (
     _choose_tile_n,
     _choose_tile_n_tf32,
     _CUTE_AVAILABLE,
+    _CUTE_KERNEL_VERSION,
     WinAttnPrecision,
     window_attn_fwd_cute,
 )
@@ -52,7 +53,7 @@ WARMUP      = 20
 MEASURED    = 1000
 TRIM_FRAC   = 0.05
 
-USE_CUTE_KERNEL = os.environ.get("AURORA_CUTE_WINDOW_ATTN", "") == "1"
+USE_CUTE_KERNEL = os.environ.get("AURORA_CUTE_WINDOW_ATTN", "1") != "0"
 
 SHAPES = [
     (16,   8, 144, 64, "N=144 (2×6×12)  H=8"),
@@ -320,7 +321,11 @@ def main():
     print(f"GPU : {props.name}  (SM{props.major}{props.minor}, "
           f"{props.total_memory // 2**20} MB)")
     print(f"CuTe kernel available : {_CUTE_AVAILABLE}")
-    print(f"CuTe GEMM tiles : {'active (AURORA_CUTE_WINDOW_ATTN=1)' if USE_CUTE_KERNEL else 'disabled (stable softmax path)'}")
+    print(
+        "CuTe GEMM tiles : "
+        f"{'active' if USE_CUTE_KERNEL else 'disabled (stable softmax path)'} "
+        f"(kernel={_CUTE_KERNEL_VERSION}, AURORA_CUTE_WINDOW_ATTN={os.environ.get('AURORA_CUTE_WINDOW_ATTN', '1')})"
+    )
     print()
 
     scale = 1.0 / math.sqrt(64)

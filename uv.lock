@@ -401,7 +401,7 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'cu13'", specifier = ">=4.4.2" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-xdist", marker = "extra == 'dev'" },
-    { name = "quack-kernels", specifier = ">=0.3.3" },
+    { name = "quack-kernels", specifier = ">=0.4.0" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "torch", marker = "extra == 'cu13'", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torch", marker = "extra != 'cu13'" },
@@ -1268,17 +1268,18 @@ wheels = [
 
 [[package]]
 name = "quack-kernels"
-version = "0.3.11"
+version = "0.4.1"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
+    { name = "einops" },
     { name = "nvidia-cutlass-dsl" },
     { name = "torch" },
     { name = "torch-c-dlpack-ext" },
 ]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/73/34/bcc87d1ee53cf245bf58ea563b276b9bd86a405bda5a42e7bd1386db9941/quack_kernels-0.3.11.tar.gz", hash = "sha256:d589417476030fb62e70730c4bd0732339a04b8bb91fd49bf4cc70e20a27170b", size = 246675, upload-time = "2026-04-20T01:08:12.269Z" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/2a/58/58b82e91b236539f424ff5681e7095b1f2860ddfb7778fe0be14d8fb58de/quack_kernels-0.4.1.tar.gz", hash = "sha256:9d7d6ba412bc0c8a9b1331c52a73db76280adb9dc2f2750df4851ddabef1466b", size = 274766, upload-time = "2026-04-30T14:37:55.65Z" }
 wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/3f/63/e80a50a1af53f102535fd701abaeb8f1d5c294223027b794fd5279b30a9e/quack_kernels-0.3.11-py3-none-any.whl", hash = "sha256:9a0fb71fd5f1efd909b2aef3d4965df831328fbbe6f57641f77ffd0da90fee3b", size = 240043, upload-time = "2026-04-20T01:08:10.747Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/38/e4/a6c3bbbe3d4242fa412454b8e8069a079e500be331aecf8f2aa666164e9c/quack_kernels-0.4.1-py3-none-any.whl", hash = "sha256:c1c8df2935bf5156ec47d2c5384ac08b411fd0ee702d80ae916dbf6d6f5ae813", size = 260827, upload-time = "2026-04-30T14:37:54.584Z" },
 ]
 
 [[package]]
