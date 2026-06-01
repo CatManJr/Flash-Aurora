@@ -216,7 +216,9 @@ def _measure_block_stages(
                     bias = None if attn_mask is None else attn_mask.to(dtype=torch.float32, device=qkv.device)
                     if bias is not None and not bias.is_contiguous():
                         bias = bias.contiguous()
-                    return window_attn_fwd_cute_qkvpacked(qkv, attn.num_heads, bias=bias)
+                    return window_attn_fwd_cute_qkvpacked(
+                        qkv, attn.num_heads, bias=bias, output_layout="bnc"
+                    )
                 if use_cute:
                     from aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
 
@@ -237,10 +239,13 @@ def _measure_block_stages(
                 return F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
 
             attn_out = timed("attention_core", _attention)
-            x_attn = timed(
-                "attn_output_layout",
-                lambda: attn_out.permute(0, 2, 1, 3).reshape(Bwin, N, D),
-            )
+            if use_cute_qkvpacked:
+                x_attn = attn_out
+            else:
+                x_attn = timed(
+                    "attn_output_layout",
+                    lambda: attn_out.permute(0, 2, 1, 3).reshape(Bwin, N, D),
+                )
             x_attn = timed(
                 "proj_linear",
                 lambda: attn._linear_with_optional_lora_merge(

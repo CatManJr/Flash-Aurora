@@ -643,13 +643,17 @@ def _get_or_compile_bf16_qkvpacked(
     v: torch.Tensor,
     o: torch.Tensor,
     bias_or_none: Optional[torch.Tensor],
+    output_layout: str = "bhnd",
 ):
     """Compile BF16 kernel for non-contiguous Q/K/V views derived from packed qkv.
 
     The kernel body is the same as the regular BF16 path, but this separate cache
     prevents a contiguous-layout compile from being reused for qkv-packed strides.
     """
-    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, "qkvpacked_strided_v1")
+    compile_key = (
+        head_dim, seq_len, has_bias, tile_m, tile_n,
+        output_layout, "qkvpacked_strided_v2",
+    )
     if compile_key in _bf16_qkvpacked_compile_cache:
         return _bf16_qkvpacked_compile_cache[compile_key]
 

@@ -276,6 +276,35 @@ def test_bf16_qkvpacked_matches_regular_cute(has_bias: bool) -> None:
     torch.testing.assert_close(packed, regular, rtol=0, atol=0)
 
 
+@requires_cute
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_bf16_qkvpacked_bnc_output_matches_regular_cute(has_bias: bool) -> None:
+    """Packed qkv can write directly to the projection-friendly (Bwin,N,C) layout."""
+    Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.bfloat16, "cuda")
+    bias = _make_bias(nW, N, "cuda") if has_bias else None
+    scale = 1.0 / math.sqrt(Dh)
+
+    qkv = torch.empty(Bwin, N, 3 * H * Dh, device="cuda", dtype=torch.bfloat16)
+    qkv_view = qkv.view(Bwin, N, 3, H, Dh)
+    qkv_view[:, :, 0].copy_(q.permute(0, 2, 1, 3))
+    qkv_view[:, :, 1].copy_(k.permute(0, 2, 1, 3))
+    qkv_view[:, :, 2].copy_(v.permute(0, 2, 1, 3))
+
+    with torch.no_grad():
+        regular = window_attn_fwd_cute(
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.BF16_MIXED
+        )
+        packed_bnc = window_attn_fwd_cute_qkvpacked(
+            qkv, H, bias=bias, scale_qk=scale, output_layout="bnc"
+        )
+
+    expected = regular.permute(0, 2, 1, 3).reshape(Bwin, N, H * Dh)
+    assert packed_bnc.shape == (Bwin, N, H * Dh)
+    assert packed_bnc.is_contiguous()
+    torch.testing.assert_close(packed_bnc, expected, rtol=0, atol=0)
+
+
 # ===========================================================================
 # window_attn_dispatch — routing tests
 # ===========================================================================

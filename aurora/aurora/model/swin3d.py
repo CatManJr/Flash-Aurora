@@ -276,6 +276,7 @@ class WindowAttention(nn.Module):
                 qkv,
                 self.num_heads,
                 bias=bias,
+                output_layout="bnc",
             )
         else:
             qkv = rearrange(qkv, "B N (qkv H D) -> qkv B H N D", H=self.num_heads, qkv=3)
@@ -305,8 +306,7 @@ class WindowAttention(nn.Module):
                 x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=attn_dropout)
             else:
                 x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
-
-        x = rearrange(x, "B H N D -> B N (H D)")
+            x = rearrange(x, "B H N D -> B N (H D)")
         if isinstance(self.lora_proj, LoRARollout):
             x = self._linear_with_optional_lora_merge(
                 x,

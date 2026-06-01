@@ -284,6 +284,7 @@ def window_attn_fwd_cute_qkvpacked(
     scale_qk: Optional[float] = None,
     tile_m: int = 64,
     tile_n: Optional[int] = None,
+    output_layout: str = "bhnd",
 ) -> torch.Tensor:
     """BF16 CuTe attention reading Q/K/V directly from packed ``qkv``.
 
@@ -292,6 +293,9 @@ def window_attn_fwd_cute_qkvpacked(
     views shaped ``(Bwin, H, N, Dh)`` and uses a separate CuTe compile cache for
     those strides, avoiding the three explicit ``q/k/v.contiguous()`` copies in
     the Swin3D inference path.
+
+    ``output_layout="bnc"`` returns a contiguous ``(Bwin, N, H * Dh)`` tensor by
+    passing a strided ``(Bwin, H, N, Dh)`` view into the unchanged CuTe kernel.
     """
     assert qkv.dtype == torch.bfloat16, "qkv-packed CuTe path currently supports BF16 only"
     if qkv.ndim != 3:
@@ -302,6 +306,8 @@ def window_attn_fwd_cute_qkvpacked(
         raise ValueError(
             f"last dim {qkv.shape[-1]} must be divisible by 3*num_heads={3 * num_heads}"
         )
+    if output_layout not in {"bhnd", "bnc"}:
+        raise ValueError(f"output_layout must be 'bhnd' or 'bnc', got {output_layout!r}")
 
     Bwin, N, three_c = qkv.shape
     Dh = three_c // (3 * num_heads)
@@ -320,7 +326,10 @@ def window_attn_fwd_cute_qkvpacked(
         q = qkv_view[:, :, 0].permute(0, 2, 1, 3)
         k = qkv_view[:, :, 1].permute(0, 2, 1, 3)
         v = qkv_view[:, :, 2].permute(0, 2, 1, 3)
-        return _attention_window_stable(q, k, v, bias, scale_qk, strict_fp32=False)
+        out = _attention_window_stable(q, k, v, bias, scale_qk, strict_fp32=False)
+        if output_layout == "bnc":
+            return out.permute(0, 2, 1, 3).reshape(Bwin, N, H * Dh)
+        return out
     _require_sm120_v2(qkv)
 
     if bias is not None and not bias.is_contiguous():
@@ -330,7 +339,12 @@ def window_attn_fwd_cute_qkvpacked(
     q = qkv_view[:, :, 0].permute(0, 2, 1, 3)
     k = qkv_view[:, :, 1].permute(0, 2, 1, 3)
     v = qkv_view[:, :, 2].permute(0, 2, 1, 3)
-    out = torch.empty((Bwin, H, N, Dh), device=qkv.device, dtype=qkv.dtype)
+    if output_layout == "bnc":
+        out = torch.empty((Bwin, N, H * Dh), device=qkv.device, dtype=qkv.dtype)
+        out_kernel = out.view(Bwin, N, H, Dh).permute(0, 2, 1, 3)
+    else:
+        out = torch.empty((Bwin, H, N, Dh), device=qkv.device, dtype=qkv.dtype)
+        out_kernel = out
     scale_log2 = Float32(math.log2(math.e) * scale_qk)
     has_bias = bias is not None
 
@@ -339,7 +353,8 @@ def window_attn_fwd_cute_qkvpacked(
         fn = _get_or_compile_bf16_qkvpacked(
             head_dim=Dh, seq_len=N, has_bias=has_bias,
             tile_m=tile_m, tile_n=_tile_n,
-            q=q, k=k, v=v, o=out, bias_or_none=bias,
+            q=q, k=k, v=v, o=out_kernel, bias_or_none=bias,
+            output_layout=output_layout,
         )
     else:
         # Streaming v2 can already overlap K/V loads; keep the existing contiguous
@@ -350,7 +365,7 @@ def window_attn_fwd_cute_qkvpacked(
             tile_m=tile_m, tile_n=_tile_n,
         )
 
-    fn(q, k, v, out, bias, scale_log2)
+    fn(q, k, v, out_kernel, bias, scale_log2)
     return out
 
 
