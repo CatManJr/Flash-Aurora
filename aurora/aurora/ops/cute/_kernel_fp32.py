@@ -1,7 +1,7 @@
 """FP32/TF32 window attention kernel (CuTeDSL, SM80+).
 
 TF32 truncates mantissa inside MMA only; softmax/accumulation stay FP32.
-Epilogue: direct MMA → GMEM (no SMEM staging).
+Epilogue: direct MMA -> GMEM (no SMEM staging).
 """
 import math
 from dataclasses import dataclass as _dataclass
