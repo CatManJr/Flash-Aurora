@@ -14,3 +14,11 @@ tutorials_python/
 aurora/.pytest_cache
 aurora/.github
 cuda-keyring_1.1-1_all.deb
+
+# Nsight Systems / Compute profiling outputs
+profiling/nsight/
+*.nsys-rep
+*.nsys-rep.*
+*.ncu-rep
+*.qdstrm
+*.qdrep
