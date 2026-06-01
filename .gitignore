@@ -22,3 +22,4 @@ profiling/nsight/
 *.ncu-rep
 *.qdstrm
 *.qdrep
+profiling/*.json

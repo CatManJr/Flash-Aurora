@@ -35,6 +35,7 @@ from aurora.ops.cute.window_attn_fwd import (
     WinAttnPrecision,
     window_attn_dispatch,
     window_attn_fwd_cute,
+    window_attn_fwd_cute_qkvpacked,
 )
 
 # ---------------------------------------------------------------------------
@@ -247,6 +248,32 @@ def test_bf16_mixed_is_deterministic() -> None:
         out1 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.BF16_MIXED)
         out2 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.BF16_MIXED)
     torch.testing.assert_close(out1, out2, rtol=0, atol=0)
+
+
+@requires_cute
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_bf16_qkvpacked_matches_regular_cute(has_bias: bool) -> None:
+    """Packed qkv path must match the existing q/k/v CuTe path."""
+    Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
+    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.bfloat16, "cuda")
+    bias = _make_bias(nW, N, "cuda") if has_bias else None
+    scale = 1.0 / math.sqrt(Dh)
+
+    qkv = torch.empty(Bwin, N, 3 * H * Dh, device="cuda", dtype=torch.bfloat16)
+    qkv_view = qkv.view(Bwin, N, 3, H, Dh)
+    qkv_view[:, :, 0].copy_(q.permute(0, 2, 1, 3))
+    qkv_view[:, :, 1].copy_(k.permute(0, 2, 1, 3))
+    qkv_view[:, :, 2].copy_(v.permute(0, 2, 1, 3))
+
+    with torch.no_grad():
+        regular = window_attn_fwd_cute(
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.BF16_MIXED
+        )
+        packed = window_attn_fwd_cute_qkvpacked(
+            qkv, H, bias=bias, scale_qk=scale
+        )
+
+    torch.testing.assert_close(packed, regular, rtol=0, atol=0)
 
 
 # ===========================================================================

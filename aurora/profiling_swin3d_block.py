@@ -26,6 +26,7 @@ import contextlib
 import sys
 import time
 import warnings
+import statistics
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,329 @@ from profiling_swin3d import (
     _shorten,
     _top_ops_ms,
 )
+
+
+_MATRIX_CONFIGS = [
+    ("baseline_sdpa", []),
+    ("triton_layout_sdpa", ["--use-triton-layout"]),
+    ("triton_layout_cute", ["--use-triton-layout", "--use-cute-window-attn", "--autocast"]),
+    (
+        "triton_all_cute",
+        [
+            "--use-triton-layout",
+            "--use-triton-adaln",
+            "--use-triton-mlp",
+            "--use-cute-window-attn",
+            "--autocast",
+        ],
+    ),
+]
+
+
+def _timing_stats(samples: list[float]) -> dict[str, float]:
+    samples = sorted(samples)
+    trim = max(1, int(len(samples) * 0.05)) if len(samples) >= 20 else 0
+    core = samples[trim : len(samples) - trim] if trim else samples
+    mean = statistics.mean(core)
+    return {
+        "mean": mean,
+        "median": samples[len(samples) // 2],
+        "p5": samples[int(len(samples) * 0.05)],
+        "p95": samples[min(len(samples) - 1, int(len(samples) * 0.95))],
+    }
+
+
+def _cuda_stage_timer(fn) -> float:
+    import torch
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = fn()
+    end.record()
+    return result, start, end
+
+
+def _measure_block_stages(
+    block: Any,
+    x: Any,
+    c: Any,
+    patch_res: tuple[int, int, int],
+    *,
+    rollout_step: int,
+    warped: bool,
+    autocast: bool,
+    device: str,
+) -> dict[str, float]:
+    """Run one block forward manually and return CUDA-event stage timings."""
+    import torch
+    import torch.nn.functional as F
+
+    from aurora.model.swin3d import (
+        compute_3d_shifted_window_mask,
+        crop_3d,
+        maybe_adjust_windows,
+        pad_3d,
+        window_partition_3d,
+        window_reverse_3d,
+    )
+
+    events: list[tuple[str, Any, Any]] = []
+
+    def timed(name: str, fn):
+        result, start, end = _cuda_stage_timer(fn)
+        events.append((name, start, end))
+        return result
+
+    ctx: Any
+    if autocast and device.startswith("cuda"):
+        ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+        ctx = contextlib.nullcontext()
+
+    with ctx:
+        with torch.inference_mode():
+            C, H, W = patch_res
+            B, L, D = x.shape
+            ws, ss = maybe_adjust_windows(block.window_size, block.shift_size, patch_res)
+            shortcut = x
+            x_5d = x.view(B, C, H, W, D)
+            if not all(s == 0 for s in ss):
+                attn_mask, _ = timed(
+                    "shifted_mask",
+                    lambda: compute_3d_shifted_window_mask(
+                        C, H, W, ws, ss, x.device, x.dtype, warped=warped
+                    ),
+                )
+            else:
+                attn_mask = None
+
+            if block.use_triton_layout:
+                from aurora.ops.triton_swin3d_layout import (
+                    crop_roll_unmerge_windows_triton,
+                    roll_pad_partition_windows_triton,
+                )
+
+                x_windows = timed(
+                    "layout_partition",
+                    lambda: roll_pad_partition_windows_triton(
+                        x_5d, patch_res, block.window_size, block.shift_size, pool=block._layout_pool
+                    ),
+                )
+            else:
+                def _torch_partition():
+                    shifted_x = (
+                        torch.roll(x_5d, shifts=(-ss[0], -ss[1], -ss[2]), dims=(1, 2, 3))
+                        if not all(s == 0 for s in ss)
+                        else x_5d
+                    )
+                    pad_size = ((-C) % ws[0], (-H) % ws[1], (-W) % ws[2])
+                    shifted_x = pad_3d(shifted_x, pad_size)
+                    windows = window_partition_3d(shifted_x, ws)
+                    return windows.view(-1, ws[0] * ws[1] * ws[2], D), shifted_x.shape, pad_size
+
+                x_windows, shifted_shape, pad_size = timed("layout_partition", _torch_partition)
+
+            attn = block.attn
+            qkv = timed(
+                "qkv_linear",
+                lambda: attn._linear_with_optional_lora_merge(
+                    x_windows, attn.qkv, attn.lora_qkv, step=rollout_step, cache_name="qkv"
+                )
+                if hasattr(attn, "_linear_with_optional_lora_merge")
+                else attn.qkv(x_windows),
+            )
+
+            Bwin, N, _ = qkv.shape
+            head_dim = D // attn.num_heads
+
+            attn_dropout = attn.attn_drop if attn.training else 0.0
+            use_cute = (
+                attn.use_cute_window_attn
+                and (not attn.training)
+                and attn_dropout == 0.0
+                and qkv.is_cuda
+                and qkv.dtype in (torch.float32, torch.bfloat16)
+                and (not torch.is_grad_enabled())
+            )
+            use_cute_qkvpacked = (
+                use_cute
+                and qkv.dtype == torch.bfloat16
+                and qkv.is_contiguous()
+                and qkv.shape[-1] == 3 * attn.num_heads * head_dim
+            )
+            if not use_cute_qkvpacked:
+                def _qkv_layout():
+                    qkv_view = qkv.view(Bwin, N, 3, attn.num_heads, head_dim).permute(2, 0, 3, 1, 4)
+                    q, k, v = qkv_view[0], qkv_view[1], qkv_view[2]
+                    return q, k, v
+
+                q, k, v = timed("qkv_rearrange_split", _qkv_layout)
+                if use_cute:
+                    q, k, v = timed(
+                        "qkv_contiguous",
+                        lambda: (
+                            q.contiguous() if not q.is_contiguous() else q,
+                            k.contiguous() if not k.is_contiguous() else k,
+                            v.contiguous() if not v.is_contiguous() else v,
+                        ),
+                    )
+
+            def _attention():
+                if use_cute_qkvpacked:
+                    from aurora.ops.cute import window_attn_fwd_cute_qkvpacked
+
+                    bias = None if attn_mask is None else attn_mask.to(dtype=torch.float32, device=qkv.device)
+                    if bias is not None and not bias.is_contiguous():
+                        bias = bias.contiguous()
+                    return window_attn_fwd_cute_qkvpacked(qkv, attn.num_heads, bias=bias)
+                if use_cute:
+                    from aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+
+                    precision = (
+                        WinAttnPrecision.BF16_MIXED
+                        if q.dtype == torch.bfloat16
+                        else WinAttnPrecision.TF32_ACC_FP32
+                    )
+                    bias = None if attn_mask is None else attn_mask.to(dtype=torch.float32, device=q.device)
+                    if bias is not None and not bias.is_contiguous():
+                        bias = bias.contiguous()
+                    return window_attn_fwd_cute(q, k, v, bias=bias, precision=precision)
+                if attn_mask is not None:
+                    mask = attn_mask.unsqueeze(1).unsqueeze(0)
+                    batch = q.shape[0] // mask.shape[1]
+                    mask = mask.repeat(batch, 1, 1, 1, 1).reshape(-1, *mask.shape[2:])
+                    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=attn_dropout)
+                return F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
+
+            attn_out = timed("attention_core", _attention)
+            x_attn = timed(
+                "attn_output_layout",
+                lambda: attn_out.permute(0, 2, 1, 3).reshape(Bwin, N, D),
+            )
+            x_attn = timed(
+                "proj_linear",
+                lambda: attn._linear_with_optional_lora_merge(
+                    x_attn, attn.proj, attn.lora_proj, step=rollout_step, cache_name="proj"
+                )
+                if hasattr(attn, "_linear_with_optional_lora_merge")
+                else attn.proj(x_attn),
+            )
+            x_attn = attn.proj_drop(x_attn)
+
+            if block.use_triton_layout:
+                x_after_layout = timed(
+                    "layout_unmerge",
+                    lambda: crop_roll_unmerge_windows_triton(
+                        x_attn, patch_res, block.window_size, block.shift_size, pool=block._layout_pool
+                    ),
+                )
+            else:
+                def _torch_unmerge():
+                    attn_windows = x_attn.view(-1, ws[0], ws[1], ws[2], D)
+                    _, pad_C, pad_H, pad_W, _ = shifted_shape
+                    shifted_x = window_reverse_3d(attn_windows, ws, pad_C, pad_H, pad_W)
+                    shifted_x = crop_3d(shifted_x, pad_size)
+                    if not all(s == 0 for s in ss):
+                        return torch.roll(shifted_x, shifts=(ss[0], ss[1], ss[2]), dims=(1, 2, 3))
+                    return shifted_x
+
+                x_after_layout = timed("layout_unmerge", _torch_unmerge)
+            x_attn_flat = timed("layout_flatten", lambda: x_after_layout.reshape(B, C * H * W, D))
+
+            use_d2_norm1 = (
+                block.norm1.use_triton
+                and not block.training
+                and shortcut.is_cuda
+                and shortcut.dtype in (torch.float32, torch.bfloat16)
+                and isinstance(block.drop_path, torch.nn.Identity)
+            )
+            x_normed = timed(
+                "residual_adaln1",
+                lambda: block.norm1.forward_add_residual(shortcut, x_attn_flat, c)
+                if use_d2_norm1
+                else shortcut + block.drop_path(block.norm1(x_attn_flat, c)),
+            )
+
+            mlp = block.mlp
+            h = timed("mlp_fc1", lambda: mlp.fc1(x_normed))
+            h = timed(
+                "mlp_gelu",
+                lambda: __import__("aurora.ops.triton_gelu", fromlist=["gelu_forward_triton"]).gelu_forward_triton(h)
+                if (
+                    mlp.use_triton_gelu
+                    and (not mlp.training)
+                    and mlp.drop.p == 0.0
+                    and h.is_cuda
+                    and h.dtype in (torch.float32, torch.bfloat16)
+                )
+                else mlp.act(h),
+            )
+            h = mlp.drop(h)
+            h = timed("mlp_fc2", lambda: mlp.fc2(h))
+            h = mlp.drop(h)
+
+            use_d2_norm2 = (
+                block.norm2.use_triton
+                and not block.training
+                and x_normed.is_cuda
+                and x_normed.dtype in (torch.float32, torch.bfloat16)
+                and isinstance(block.drop_path, torch.nn.Identity)
+            )
+            _ = timed(
+                "residual_adaln2",
+                lambda: block.norm2.forward_add_residual(x_normed, h, c)
+                if use_d2_norm2
+                else x_normed + block.drop_path(block.norm2(h, c)),
+            )
+
+    torch.cuda.synchronize()
+    return {name: start.elapsed_time(end) for name, start, end in events}
+
+
+def _measure_stage_stats(
+    block: Any,
+    x: Any,
+    c: Any,
+    patch_res: tuple[int, int, int],
+    *,
+    rollout_step: int,
+    warped: bool,
+    autocast: bool,
+    device: str,
+    warmup: int,
+    repeat: int,
+) -> dict[str, dict[str, float]]:
+    for _ in range(warmup):
+        _measure_block_stages(
+            block, x, c, patch_res, rollout_step=rollout_step,
+            warped=warped, autocast=autocast, device=device,
+        )
+    buckets: dict[str, list[float]] = {}
+    for _ in range(repeat):
+        row = _measure_block_stages(
+            block, x, c, patch_res, rollout_step=rollout_step,
+            warped=warped, autocast=autocast, device=device,
+        )
+        for name, ms in row.items():
+            buckets.setdefault(name, []).append(ms)
+    return {name: _timing_stats(values) for name, values in buckets.items()}
+
+
+def _print_stage_stats(stage_stats: dict[str, dict[str, float]]) -> list[str]:
+    total = sum(v["mean"] for v in stage_stats.values())
+    lines = ["", "--- Explicit CUDA-event stage timings ---"]
+    lines.append(f"{'stage':<24}{'mean ms':>10}{'%':>8}{'median':>10}{'p5':>10}{'p95':>10}")
+    lines.append("-" * 72)
+    for name, stats in sorted(stage_stats.items(), key=lambda item: -item[1]["mean"]):
+        pct = 100.0 * stats["mean"] / total if total > 0 else 0.0
+        lines.append(
+            f"{name:<24}{stats['mean']:>10.4f}{pct:>7.1f}%"
+            f"{stats['median']:>10.4f}{stats['p5']:>10.4f}{stats['p95']:>10.4f}"
+        )
+    lines.append("-" * 72)
+    lines.append(f"{'stage sum':<24}{total:>10.4f}")
+    return lines
 
 
 def _bucket_swin3d_block(name: str) -> str:
@@ -223,11 +547,18 @@ def main() -> None:
     p.add_argument("--plot-out", type=str, default="")
     p.add_argument("--plot-top", type=int, default=30)
     p.add_argument("--report-out", type=str, default="")
+    p.add_argument("--trace-out", type=str, default="", help="Export torch profiler Chrome trace JSON.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument(
         "--autocast",
         action="store_true",
         help="Run block under BF16 autocast (not default FP32).",
+    )
+    p.add_argument(
+        "--input-dtype",
+        choices=("float32", "bfloat16"),
+        default="float32",
+        help="Synthetic x/c input dtype. Use bfloat16 for Triton AdaLN + CuTe BF16 profiling.",
     )
     p.add_argument(
         "--compile",
@@ -248,6 +579,21 @@ def main() -> None:
         "--use-triton-mlp",
         action="store_true",
         help="Triton GELU in MLP (CUDA float32, eval).",
+    )
+    p.add_argument(
+        "--use-cute-window-attn",
+        action="store_true",
+        help="Use CuTe window attention inside the block (requires CUDA inference path).",
+    )
+    p.add_argument(
+        "--stage-timing",
+        action="store_true",
+        help="Print explicit CUDA-event timings for block stages in addition to torch profiler.",
+    )
+    p.add_argument(
+        "--stage-only",
+        action="store_true",
+        help="Only run full-block and explicit stage timings; skip torch.profiler table.",
     )
     p.add_argument(
         "--use-lora",
@@ -291,15 +637,17 @@ def main() -> None:
         use_triton_mlp=args.use_triton_mlp,
         use_lora=args.use_lora,
         use_lora_merged_inference=args.use_lora_merged,
+        use_cute_window_attn=args.use_cute_window_attn,
     )
     block.eval()
-    block.to(args.device)
+    input_dtype = torch.bfloat16 if args.input_dtype == "bfloat16" else torch.float32
+    block.to(device=args.device, dtype=input_dtype)
 
     if args.compile:
         block = torch.compile(block, dynamic=False)
 
-    x = torch.randn(args.batch_size, L, dim, device=args.device, dtype=torch.float32)
-    c = torch.randn(args.batch_size, time_dim, device=args.device, dtype=torch.float32)
+    x = torch.randn(args.batch_size, L, dim, device=args.device, dtype=input_dtype)
+    c = torch.randn(args.batch_size, time_dim, device=args.device, dtype=input_dtype)
     patch_res = (C, H, W)
 
     def run_once() -> None:
@@ -317,10 +665,10 @@ def main() -> None:
     print(
         f"[config] preset={args.preset}, dim={dim}, heads={num_heads}, time_dim={time_dim}, "
         f"patch_res={patch_res}, L={L}, window={ws}, shift={shift}, "
-        f"autocast={args.autocast}, compile={args.compile}, "
+        f"input_dtype={args.input_dtype}, autocast={args.autocast}, compile={args.compile}, "
         f"use_triton_layout={args.use_triton_layout}, use_triton_adaln={args.use_triton_adaln}, "
-        f"use_triton_mlp={args.use_triton_mlp}, use_lora={args.use_lora}, "
-        f"use_lora_merged={args.use_lora_merged}"
+        f"use_triton_mlp={args.use_triton_mlp}, use_cute_window_attn={args.use_cute_window_attn}, "
+        f"use_lora={args.use_lora}, use_lora_merged={args.use_lora_merged}"
     )
 
     if not args.device.startswith("cuda") and torch.cuda.is_available():
@@ -358,6 +706,29 @@ def main() -> None:
         timing_line = f"CPU: {ms:.2f} ms for {args.repeat} iters"
         print(f"[timing] {timing_line}")
 
+    stage_stats: dict[str, dict[str, float]] = {}
+    if args.stage_timing:
+        if not args.device.startswith("cuda"):
+            warnings.warn("--stage-timing requires CUDA; skipping explicit stage timings.")
+        else:
+            stage_stats = _measure_stage_stats(
+                block,
+                x,
+                c,
+                patch_res,
+                rollout_step=0,
+                warped=True,
+                autocast=args.autocast,
+                device=args.device,
+                warmup=max(1, args.warmup),
+                repeat=max(1, args.repeat),
+            )
+            for line in _print_stage_stats(stage_stats):
+                print(line)
+
+    if args.stage_only:
+        return
+
     activities = [ProfilerActivity.CPU]
     if args.device.startswith("cuda"):
         activities.append(ProfilerActivity.CUDA)
@@ -376,6 +747,12 @@ def main() -> None:
     sort_by = "self_cuda_time_total" if args.device.startswith("cuda") else "self_cpu_time_total"
     table = prof.key_averages().table(sort_by=sort_by, row_limit=args.table_rows)
     print("\n" + table)
+
+    if args.trace_out:
+        trace_path = Path(args.trace_out)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        prof.export_chrome_trace(str(trace_path))
+        print(f"[trace] {trace_path.resolve()}")
 
     use_cuda = args.device.startswith("cuda")
     names, tms = _top_ops_ms(prof, use_cuda=use_cuda, top_k=args.plot_top)
@@ -421,8 +798,10 @@ def main() -> None:
             f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
             f"- Torch: {torch.__version__}",
             f"- Config: preset={args.preset}, dim={dim}, heads={num_heads}, patch_res={patch_res}, "
-            f"window={ws}, shift={shift}, autocast={args.autocast}, compile={args.compile}, "
-            f"Triton layout/AdaLN/MLP={args.use_triton_layout}/{args.use_triton_adaln}/{args.use_triton_mlp}",
+            f"window={ws}, shift={shift}, input_dtype={args.input_dtype}, "
+            f"autocast={args.autocast}, compile={args.compile}, "
+            f"Triton layout/AdaLN/MLP={args.use_triton_layout}/{args.use_triton_adaln}/{args.use_triton_mlp}, "
+            f"CuTe attention={args.use_cute_window_attn}",
             "",
             "## Timer",
             "",
@@ -438,6 +817,23 @@ def main() -> None:
                 ms = buckets[b]
                 pct = 100.0 * ms / total_kpi_ms
                 lines.append(f"| {b} | {ms:.3f} | {pct:.1f} |")
+        if stage_stats:
+            stage_total = sum(v["mean"] for v in stage_stats.values())
+            lines.extend(
+                [
+                    "",
+                    "## Explicit Stage Timings",
+                    "",
+                    "| Stage | Mean (ms) | % of stage sum | Median | p5 | p95 |",
+                    "| --- | ---: | ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for name, stats in sorted(stage_stats.items(), key=lambda item: -item[1]["mean"]):
+                pct = 100.0 * stats["mean"] / stage_total if stage_total > 0 else 0.0
+                lines.append(
+                    f"| {name} | {stats['mean']:.4f} | {pct:.1f} | "
+                    f"{stats['median']:.4f} | {stats['p5']:.4f} | {stats['p95']:.4f} |"
+                )
         lines.extend(
             [
                 "",

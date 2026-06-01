@@ -32,10 +32,12 @@ try:
 
     _CUTE_AVAILABLE = True
     _bf16_compile_cache: dict = {}
+    _bf16_qkvpacked_compile_cache: dict = {}
 
 except ImportError:
     _CUTE_AVAILABLE = False
     _bf16_compile_cache = {}
+    _bf16_qkvpacked_compile_cache = {}
 
 
 class WindowAttnFwdBf16:
@@ -627,4 +629,55 @@ def _get_or_compile_bf16(
         options="--enable-tvm-ffi",
     )
     _bf16_compile_cache[compile_key] = compiled
+    return compiled
+
+
+def _get_or_compile_bf16_qkvpacked(
+    head_dim: int,
+    seq_len: int,
+    has_bias: bool,
+    tile_m: int,
+    tile_n: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    bias_or_none: Optional[torch.Tensor],
+):
+    """Compile BF16 kernel for non-contiguous Q/K/V views derived from packed qkv.
+
+    The kernel body is the same as the regular BF16 path, but this separate cache
+    prevents a contiguous-layout compile from being reused for qkv-packed strides.
+    """
+    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, "qkvpacked_strided_v1")
+    if compile_key in _bf16_qkvpacked_compile_cache:
+        return _bf16_qkvpacked_compile_cache[compile_key]
+
+    kernel_obj = WindowAttnFwdBf16(
+        head_dim=head_dim,
+        seq_len=seq_len,
+        has_bias=has_bias,
+        tile_m=tile_m,
+        tile_n=tile_n,
+    )
+
+    q_ct = to_cute_tensor(q)
+    k_ct = to_cute_tensor(k)
+    v_ct = to_cute_tensor(v)
+    o_ct = to_cute_tensor(o)
+    bias_ct = to_cute_tensor(bias_or_none) if bias_or_none is not None else None
+
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = cute.compile(
+        kernel_obj,
+        q_ct,
+        k_ct,
+        v_ct,
+        o_ct,
+        bias_ct,
+        Float32(1.0),
+        stream,
+        options="--enable-tvm-ffi",
+    )
+    _bf16_qkvpacked_compile_cache[compile_key] = compiled
     return compiled

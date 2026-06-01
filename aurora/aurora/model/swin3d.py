@@ -250,43 +250,61 @@ class WindowAttention(nn.Module):
             )
         else:
             qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
-        qkv = rearrange(qkv, "B N (qkv H D) -> qkv B H N D", H=self.num_heads, qkv=3)
-        q, k, v = qkv[0], qkv[1], qkv[2]
         attn_dropout = self.attn_drop if self.training else 0.0
 
         use_cute = (
             self.use_cute_window_attn
             and (not self.training)
             and attn_dropout == 0.0
-            and q.is_cuda
-            and q.dtype in (torch.float32, torch.bfloat16)
+            and qkv.is_cuda
+            and qkv.dtype in (torch.float32, torch.bfloat16)
             and (not torch.is_grad_enabled())
         )
-        if use_cute:
-            from aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+        use_cute_qkvpacked = (
+            use_cute
+            and qkv.dtype == torch.bfloat16
+            and qkv.is_contiguous()
+            and qkv.shape[-1] == 3 * self.num_heads * self.head_dim
+        )
+        if use_cute_qkvpacked:
+            from aurora.ops.cute import window_attn_fwd_cute_qkvpacked
 
-            precision = (
-                WinAttnPrecision.BF16_MIXED
-                if q.dtype == torch.bfloat16
-                else WinAttnPrecision.TF32_ACC_FP32
-            )
-            # Bias kept as float32: the CuTeDSL kernel explicitly takes FP32 bias,
-            # and the SDPA fallback path also works with FP32 attn_mask for FP32 Q.
-            bias = None if mask is None else mask.to(dtype=torch.float32, device=q.device)
+            bias = None if mask is None else mask.to(dtype=torch.float32, device=qkv.device)
             if bias is not None and not bias.is_contiguous():
                 bias = bias.contiguous()
-            if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
-                q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-            x = window_attn_fwd_cute(q, k, v, bias=bias, precision=precision)
-        elif mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(0)  # (1, nW, 1, ws, ws)
-            # Repeat the mask for every batch size and merge `B` and `nW` into one
-            # dimension.
-            B = q.shape[0] // mask.shape[1]
-            mask = mask.repeat(B, 1, 1, 1, 1).reshape(-1, *mask.shape[2:])
-            x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=attn_dropout)
+            x = window_attn_fwd_cute_qkvpacked(
+                qkv,
+                self.num_heads,
+                bias=bias,
+            )
         else:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
+            qkv = rearrange(qkv, "B N (qkv H D) -> qkv B H N D", H=self.num_heads, qkv=3)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            if use_cute:
+                from aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+
+                precision = (
+                    WinAttnPrecision.BF16_MIXED
+                    if q.dtype == torch.bfloat16
+                    else WinAttnPrecision.TF32_ACC_FP32
+                )
+                # Bias kept as float32: the CuTeDSL kernel explicitly takes FP32 bias,
+                # and the SDPA fallback path also works with FP32 attn_mask for FP32 Q.
+                bias = None if mask is None else mask.to(dtype=torch.float32, device=q.device)
+                if bias is not None and not bias.is_contiguous():
+                    bias = bias.contiguous()
+                if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+                    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+                x = window_attn_fwd_cute(q, k, v, bias=bias, precision=precision)
+            elif mask is not None:
+                mask = mask.unsqueeze(1).unsqueeze(0)  # (1, nW, 1, ws, ws)
+                # Repeat the mask for every batch size and merge `B` and `nW` into one
+                # dimension.
+                B = q.shape[0] // mask.shape[1]
+                mask = mask.repeat(B, 1, 1, 1, 1).reshape(-1, *mask.shape[2:])
+                x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=attn_dropout)
+            else:
+                x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
 
         x = rearrange(x, "B H N D -> B N (H D)")
         if isinstance(self.lora_proj, LoRARollout):

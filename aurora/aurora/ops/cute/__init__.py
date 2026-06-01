@@ -9,6 +9,7 @@ from aurora.ops.cute.window_attn_fwd import (
     WinAttnPrecision,
     window_attn_dispatch,
     window_attn_fwd_cute,
+    window_attn_fwd_cute_qkvpacked,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "WinAttnPrecision",
     "window_attn_dispatch",
     "window_attn_fwd_cute",
+    "window_attn_fwd_cute_qkvpacked",
 ]

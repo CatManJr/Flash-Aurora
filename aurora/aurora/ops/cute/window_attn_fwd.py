@@ -31,7 +31,7 @@ try:
     # v1: simpler 128-thread cp.async BF16 kernel.  Used for the single-pass case
     # (the dominant N=144 production shape), where v2's dedicated DMA warp has no
     # prefetch overlap to exploit and only costs MMA throughput.
-    from ._kernel_bf16 import _get_or_compile_bf16
+    from ._kernel_bf16 import _get_or_compile_bf16, _get_or_compile_bf16_qkvpacked
     from ._kernel_fp32_v2 import (
         WindowAttnFwdTF32V2,
         _get_or_compile_tf32_v2,
@@ -273,6 +273,84 @@ def window_attn_fwd_cute(
             )
 
     fn(q, k, v_run, out, bias, scale_log2)
+    return out
+
+
+def window_attn_fwd_cute_qkvpacked(
+    qkv: torch.Tensor,
+    num_heads: int,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    scale_qk: Optional[float] = None,
+    tile_m: int = 64,
+    tile_n: Optional[int] = None,
+) -> torch.Tensor:
+    """BF16 CuTe attention reading Q/K/V directly from packed ``qkv``.
+
+    ``qkv`` is the contiguous output of ``Linear(dim, 3 * dim)`` with shape
+    ``(Bwin, N, 3 * num_heads * head_dim)``.  This creates zero-copy strided
+    views shaped ``(Bwin, H, N, Dh)`` and uses a separate CuTe compile cache for
+    those strides, avoiding the three explicit ``q/k/v.contiguous()`` copies in
+    the Swin3D inference path.
+    """
+    assert qkv.dtype == torch.bfloat16, "qkv-packed CuTe path currently supports BF16 only"
+    if qkv.ndim != 3:
+        raise ValueError(f"qkv must have shape (Bwin, N, 3*C); got {tuple(qkv.shape)}")
+    if not qkv.is_contiguous():
+        raise ValueError("qkv-packed CuTe path requires contiguous qkv linear output")
+    if qkv.shape[-1] % (3 * num_heads) != 0:
+        raise ValueError(
+            f"last dim {qkv.shape[-1]} must be divisible by 3*num_heads={3 * num_heads}"
+        )
+
+    Bwin, N, three_c = qkv.shape
+    Dh = three_c // (3 * num_heads)
+    H = num_heads
+    if scale_qk is None:
+        scale_qk = 1.0 / math.sqrt(Dh)
+
+    use_cute_kernel = os.environ.get(_ENV_CUTE_WINDOW, "1") != "0"
+    if use_cute_kernel and not _CUTE_AVAILABLE:
+        raise RuntimeError(
+            "Aurora CuTe window attention is enabled but CuTeDSL is unavailable. "
+            f"Set {_ENV_CUTE_WINDOW}=0 to explicitly use the torch fallback."
+        )
+    if not use_cute_kernel:
+        qkv_view = qkv.view(Bwin, N, 3, H, Dh)
+        q = qkv_view[:, :, 0].permute(0, 2, 1, 3)
+        k = qkv_view[:, :, 1].permute(0, 2, 1, 3)
+        v = qkv_view[:, :, 2].permute(0, 2, 1, 3)
+        return _attention_window_stable(q, k, v, bias, scale_qk, strict_fp32=False)
+    _require_sm120_v2(qkv)
+
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
+
+    qkv_view = qkv.view(Bwin, N, 3, H, Dh)
+    q = qkv_view[:, :, 0].permute(0, 2, 1, 3)
+    k = qkv_view[:, :, 1].permute(0, 2, 1, 3)
+    v = qkv_view[:, :, 2].permute(0, 2, 1, 3)
+    out = torch.empty((Bwin, H, N, Dh), device=qkv.device, dtype=qkv.dtype)
+    scale_log2 = Float32(math.log2(math.e) * scale_qk)
+    has_bias = bias is not None
+
+    _tile_n = tile_n if tile_n is not None else _choose_tile_n(N, head_dim=Dh, tile_m=tile_m)
+    if _tile_n >= N:
+        fn = _get_or_compile_bf16_qkvpacked(
+            head_dim=Dh, seq_len=N, has_bias=has_bias,
+            tile_m=tile_m, tile_n=_tile_n,
+            q=q, k=k, v=v, o=out, bias_or_none=bias,
+        )
+    else:
+        # Streaming v2 can already overlap K/V loads; keep the existing contiguous
+        # path until a strided v2 compile is validated separately.
+        return window_attn_fwd_cute(
+            q.contiguous(), k.contiguous(), v.contiguous(), bias=bias,
+            scale_qk=scale_qk, precision=WinAttnPrecision.BF16_MIXED,
+            tile_m=tile_m, tile_n=_tile_n,
+        )
+
+    fn(q, k, v, out, bias, scale_log2)
     return out
 
 
