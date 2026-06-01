@@ -8,7 +8,7 @@ import contextlib
 import dataclasses
 import warnings
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -24,8 +24,15 @@ from aurora.model.compat import (
     _adapt_checkpoint_pretrained,
     _adapt_checkpoint_wave,
 )
+from aurora.model.checkpoint_local import load_aurora_checkpoint_prefer_local
 from aurora.model.decoder import Perceiver3DDecoder
 from aurora.model.encoder import Perceiver3DEncoder
+from aurora.model.inference_precision import (
+    AuroraInferenceConfig,
+    AuroraInferencePrecision,
+    apply_inference_config,
+    resolve_inference_config,
+)
 from aurora.model.lora import LoRAMode
 from aurora.model.swin3d import Swin3DTransformerBackbone
 from aurora.model.workspace_pool import InferenceWorkspacePool
@@ -90,6 +97,7 @@ class Aurora(torch.nn.Module):
         use_triton_adaln: bool = False,
         use_triton_mlp: bool = False,
         use_cute_window_attn: bool = False,
+        inference_precision: Optional[Union[str, AuroraInferencePrecision]] = None,
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         autocast: bool = False,
         bf16_mode: bool = False,
@@ -168,8 +176,13 @@ class Aurora(torch.nn.Module):
                 Defaults to ``False``.
             use_cute_window_attn (bool, optional): Swin backbone — use :mod:`aurora.ops.cute` for
                 window attention on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel
-                (BF16 I/O, FP32 accumulators); float32 tensors delegate to torch SDPA with TF32.
-                Requires ``attn_drop=0``. Defaults to ``False``.
+                (BF16 I/O, FP32 accumulators); float32 tensors use the TF32 CuTe kernel when
+                enabled. Requires ``attn_drop=0``. Defaults to ``False``.
+            inference_precision (str, optional): Named preset that configures Swin3D kernels:
+                ``fp32`` (strict PyTorch), ``fast_fp32`` (TF32 CuTe + Triton Swin), or
+                ``bf16_mixed`` (backbone autocast + CuTe BF16 + Triton Swin). Perceiver
+                encoder/decoder remain PyTorch naive. When set, overrides the scattered
+                ``use_triton_*`` / ``use_cute_window_attn`` / ``autocast`` flags below.
             surf_stats (dict[str, tuple[float, float]], optional): For these surface-level
                 variables, adjust the normalisation to the given tuple consisting of a new location
                 and scale.
@@ -223,6 +236,18 @@ class Aurora(torch.nn.Module):
                 fixed-shape inference. Defaults to ``None``.
         """
         super().__init__()
+        self.inference_config: AuroraInferenceConfig | None = resolve_inference_config(
+            inference_precision,
+        )
+        if self.inference_config is not None:
+            preset_kwargs = apply_inference_config(inference_precision)
+            autocast = preset_kwargs["autocast"]
+            use_triton_layout = preset_kwargs["use_triton_layout"]
+            use_triton_adaln = preset_kwargs["use_triton_adaln"]
+            use_triton_mlp = preset_kwargs["use_triton_mlp"]
+            use_cute_window_attn = preset_kwargs["use_cute_window_attn"]
+            use_triton_perceiver_ln_fusion = preset_kwargs["use_triton_perceiver_ln_fusion"]
+
         self.surf_vars = surf_vars
         self.atmos_vars = atmos_vars
         self.patch_size = patch_size
@@ -325,19 +350,14 @@ class Aurora(torch.nn.Module):
             autocast = True
 
         self.autocast = autocast
+        self._cuda_graph_runner: Any | None = None
+        self._cuda_graph_scope: str | None = None
+        self._cuda_graph_patch_res: tuple[int, int, int] | None = None
 
-    def forward(self, batch: Batch) -> Batch:
-        """Forward pass.
-
-        Args:
-            batch (:class:`aurora.Batch`): Batch to run the model on.
-
-        Returns:
-            :class:`Batch`: Prediction for the batch.
-        """
+    def _prepare_encoder_batch(self, batch: Batch) -> tuple[Batch, Batch, tuple[int, int, int]]:
+        """Normalise/crop batch and expand static vars for encoder input."""
         batch = self.batch_transform_hook(batch)
 
-        # Get the first parameter. We'll derive the data type and device from this parameter.
         p = next(self.parameters())
         batch = batch.type(p.dtype)
         batch = batch.normalise(surf_stats=self.surf_stats)
@@ -351,18 +371,13 @@ class Aurora(torch.nn.Module):
             W // self.encoder.patch_size,
         )
 
-        # Insert batch and history dimension for static variables.
         B, T = next(iter(batch.surf_vars.values())).shape[:2]
         batch = dataclasses.replace(
             batch,
             static_vars={k: v[None, None].repeat(B, T, 1, 1) for k, v in batch.static_vars.items()},
         )
 
-        # Apply some transformations before feeding `batch` to the encoder. We'll later want to
-        # refer to the original batch too, so rename the variable.
         transformed_batch = batch
-
-        # Clamp positive variables.
         if self.positive_surf_vars:
             transformed_batch = dataclasses.replace(
                 transformed_batch,
@@ -381,8 +396,127 @@ class Aurora(torch.nn.Module):
             )
 
         transformed_batch = self._pre_encoder_hook(transformed_batch)
+        return batch, transformed_batch, patch_res
 
-        # The encoder is always just run.
+    def capture_inference_cuda_graph(
+        self,
+        batch: Batch,
+        *,
+        scope: str | None = None,
+        warmup_iters: int = 2,
+    ) -> None:
+        """Capture a fixed-shape CUDA graph for inference replay.
+
+        ``scope`` defaults to the active precision preset (``full_gpu`` for fast presets,
+        otherwise ``backbone`` when explicitly requested). Perceiver modules stay PyTorch naive.
+        """
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA graph capture requires CUDA.")
+
+        from aurora.model.cuda_graph import build_aurora_cuda_graph_runner
+
+        if scope is None:
+            if self.inference_config is None:
+                raise ValueError("Pass scope explicitly when inference_precision is unset.")
+            scope = self.inference_config.cuda_graph_scope
+        if scope == "off":
+            raise ValueError("CUDA graph capture is disabled for the active inference preset.")
+
+        self.eval()
+        encoder_batch, transformed_batch, patch_res = self._prepare_encoder_batch(batch)
+        rollout_step = batch.metadata.rollout_step
+
+        backbone_input = None
+        if scope == "backbone":
+            with torch.inference_mode():
+                backbone_input = self.encoder(transformed_batch, lead_time=self.timestep)
+
+        self._cuda_graph_runner = build_aurora_cuda_graph_runner(
+            self,
+            scope=scope,
+            encoder_batch=transformed_batch,
+            backbone_input=backbone_input,
+            patch_res=patch_res,
+            rollout_step=rollout_step,
+            autocast_backbone=self.autocast,
+            warmup_iters=warmup_iters,
+        )
+        self._cuda_graph_scope = scope
+        self._cuda_graph_patch_res = patch_res
+
+    def clear_inference_cuda_graph(self) -> None:
+        self._cuda_graph_runner = None
+        self._cuda_graph_scope = None
+        self._cuda_graph_patch_res = None
+
+    def _finish_prediction(self, batch: Batch, pred: Batch) -> Batch:
+        pred = dataclasses.replace(
+            pred,
+            static_vars={k: v[0, 0] for k, v in batch.static_vars.items()},
+        )
+        pred = dataclasses.replace(
+            pred,
+            surf_vars={k: v[:, None] for k, v in pred.surf_vars.items()},
+            atmos_vars={k: v[:, None] for k, v in pred.atmos_vars.items()},
+        )
+        pred = self._post_decoder_hook(batch, pred)
+
+        clamp_at_rollout_step = (
+            pred.metadata.rollout_step >= 1
+            if self.clamp_at_first_step
+            else pred.metadata.rollout_step > 1
+        )
+        if self.positive_surf_vars and clamp_at_rollout_step:
+            pred = dataclasses.replace(
+                pred,
+                surf_vars={
+                    k: v.clamp(min=0) if k in self.positive_surf_vars else v
+                    for k, v in pred.surf_vars.items()
+                },
+            )
+        if self.positive_atmos_vars and clamp_at_rollout_step:
+            pred = dataclasses.replace(
+                pred,
+                atmos_vars={
+                    k: v.clamp(min=0) if k in self.positive_atmos_vars else v
+                    for k, v in pred.atmos_vars.items()
+                },
+            )
+
+        return pred.unnormalise(surf_stats=self.surf_stats)
+
+    def forward(self, batch: Batch) -> Batch:
+        """Forward pass.
+
+        Args:
+            batch (:class:`aurora.Batch`): Batch to run the model on.
+
+        Returns:
+            :class:`Batch`: Prediction for the batch.
+        """
+        batch, transformed_batch, patch_res = self._prepare_encoder_batch(batch)
+
+        if self._cuda_graph_runner is not None:
+            runner = self._cuda_graph_runner
+            rollout_step = batch.metadata.rollout_step
+            if self._cuda_graph_scope == "full_gpu":
+                if runner.can_replay(transformed_batch, rollout_step):
+                    pred = runner(transformed_batch, rollout_step=rollout_step)
+                    return self._finish_prediction(batch, pred)
+            elif self._cuda_graph_scope == "backbone":
+                with torch.inference_mode():
+                    x = self.encoder(transformed_batch, lead_time=self.timestep)
+                if runner.can_replay(x, rollout_step):
+                    x = runner(x, rollout_step=rollout_step)
+                    with torch.inference_mode():
+                        pred = self.decoder(
+                            x,
+                            batch,
+                            lead_time=self.timestep,
+                            patch_res=patch_res,
+                        )
+                    return self._finish_prediction(batch, pred)
+
         x = self.encoder(
             transformed_batch,
             lead_time=self.timestep,
@@ -413,47 +547,7 @@ class Aurora(torch.nn.Module):
             patch_res=patch_res,
         )
 
-        # Remove batch and history dimension from static variables.
-        pred = dataclasses.replace(
-            pred,
-            static_vars={k: v[0, 0] for k, v in batch.static_vars.items()},
-        )
-
-        # Insert history dimension in prediction. The time should already be right.
-        pred = dataclasses.replace(
-            pred,
-            surf_vars={k: v[:, None] for k, v in pred.surf_vars.items()},
-            atmos_vars={k: v[:, None] for k, v in pred.atmos_vars.items()},
-        )
-
-        pred = self._post_decoder_hook(batch, pred)
-
-        # Clamp positive variables.
-        clamp_at_rollout_step = (
-            pred.metadata.rollout_step >= 1
-            if self.clamp_at_first_step
-            else pred.metadata.rollout_step > 1
-        )
-        if self.positive_surf_vars and clamp_at_rollout_step:
-            pred = dataclasses.replace(
-                pred,
-                surf_vars={
-                    k: v.clamp(min=0) if k in self.positive_surf_vars else v
-                    for k, v in pred.surf_vars.items()
-                },
-            )
-        if self.positive_atmos_vars and clamp_at_rollout_step:
-            pred = dataclasses.replace(
-                pred,
-                atmos_vars={
-                    k: v.clamp(min=0) if k in self.positive_atmos_vars else v
-                    for k, v in pred.atmos_vars.items()
-                },
-            )
-
-        pred = pred.unnormalise(surf_stats=self.surf_stats)
-
-        return pred
+        return self._finish_prediction(batch, pred)
 
     def batch_transform_hook(self, batch: Batch) -> Batch:
         """Transform the batch right after receiving it and before normalisation.
@@ -518,6 +612,28 @@ class Aurora(torch.nn.Module):
             )
 
         self.load_state_dict(d, strict=strict)
+
+    def load_checkpoint_prefer_local(
+        self,
+        *,
+        checkpoint_dir: Optional[str] = None,
+        path: Optional[str] = None,
+        strict: bool = True,
+        allow_hub_download: bool = True,
+    ) -> str:
+        """Load checkpoint from a local directory, falling back to Hub download.
+
+        Defaults to :data:`~aurora.model.checkpoint_local.DEFAULT_CHECKPOINT_DIR`
+        (``/root/autodl-tmp/aurora`` on AutoDL).
+        """
+        ckpt_path = load_aurora_checkpoint_prefer_local(
+            self,
+            checkpoint_dir=checkpoint_dir,
+            path=path,
+            strict=strict,
+            allow_hub_download=allow_hub_download,
+        )
+        return str(ckpt_path)
 
     def _adapt_checkpoint(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Adapt an existing checkpoint to make it compatible with the current version of the model.

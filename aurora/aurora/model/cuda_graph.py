@@ -7,6 +7,45 @@ from typing import Any
 
 import torch
 
+from aurora.batch import Batch
+
+
+def _batch_tensor_shapes(batch: Batch) -> dict[str, tuple[int, ...]]:
+    shapes: dict[str, tuple[int, ...]] = {}
+    for group in ("surf_vars", "static_vars", "atmos_vars"):
+        for name, tensor in getattr(batch, group).items():
+            shapes[f"{group}.{name}"] = tuple(tensor.shape)
+    return shapes
+
+
+def _allocate_batch_like(batch: Batch) -> Batch:
+    return Batch(
+        surf_vars={k: torch.empty_like(v) for k, v in batch.surf_vars.items()},
+        static_vars={k: torch.empty_like(v) for k, v in batch.static_vars.items()},
+        atmos_vars={k: torch.empty_like(v) for k, v in batch.atmos_vars.items()},
+        metadata=batch.metadata,
+    )
+
+
+def _copy_batch(src: Batch, dst: Batch) -> None:
+    for group in ("surf_vars", "static_vars", "atmos_vars"):
+        src_group = getattr(src, group)
+        dst_group = getattr(dst, group)
+        if src_group.keys() != dst_group.keys():
+            raise ValueError("Batch keys must match for CUDA graph replay.")
+        for name, src_tensor in src_group.items():
+            dst_tensor = dst_group[name]
+            if src_tensor.shape != dst_tensor.shape:
+                raise ValueError(
+                    f"Shape mismatch for {group}.{name}: {tuple(src_tensor.shape)} "
+                    f"vs {tuple(dst_tensor.shape)}"
+                )
+            if src_tensor.dtype != dst_tensor.dtype:
+                raise ValueError(f"Dtype mismatch for {group}.{name}.")
+            if src_tensor.device != dst_tensor.device:
+                raise ValueError(f"Device mismatch for {group}.{name}.")
+            dst_tensor.copy_(src_tensor)
+
 
 class CudaGraphSwin3DBlockRunner:
     """Replay one fixed-shape Swin3D block inference call with a CUDA graph.
@@ -85,3 +124,188 @@ class CudaGraphSwin3DBlockRunner:
         self.static_c.copy_(c)
         self.graph.replay()
         return self.static_out
+
+
+class CudaGraphAuroraBackboneRunner:
+    """Replay a fixed-shape Swin3D backbone call with a CUDA graph."""
+
+    def __init__(
+        self,
+        backbone: Any,
+        x: torch.Tensor,
+        patch_res: tuple[int, int, int],
+        *,
+        lead_time: Any,
+        rollout_step: int,
+        autocast: bool = False,
+        warmup_iters: int = 3,
+    ) -> None:
+        if not x.is_cuda:
+            raise ValueError("CudaGraphAuroraBackboneRunner requires CUDA tensors.")
+
+        self.backbone = backbone
+        self.static_x = torch.empty_like(x)
+        self.patch_res = patch_res
+        self.lead_time = lead_time
+        self.rollout_step = rollout_step
+        self.autocast = autocast
+        self.graph = torch.cuda.CUDAGraph()
+
+        self.static_x.copy_(x)
+        torch.cuda.synchronize()
+
+        if warmup_iters > 0:
+            side_stream = torch.cuda.Stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                for _ in range(warmup_iters):
+                    self._forward_static()
+            torch.cuda.current_stream().wait_stream(side_stream)
+            torch.cuda.synchronize()
+
+        with torch.cuda.graph(self.graph):
+            self.static_out = self._forward_static()
+
+    def _forward_static(self) -> torch.Tensor:
+        ctx: Any
+        if self.autocast:
+            ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        else:
+            ctx = contextlib.nullcontext()
+        with ctx:
+            with torch.inference_mode():
+                return self.backbone(
+                    self.static_x,
+                    lead_time=self.lead_time,
+                    patch_res=self.patch_res,
+                    rollout_step=self.rollout_step,
+                )
+
+    def can_replay(self, x: torch.Tensor, rollout_step: int) -> bool:
+        return (
+            x.shape == self.static_x.shape
+            and x.dtype == self.static_x.dtype
+            and x.device == self.static_x.device
+            and rollout_step == self.rollout_step
+        )
+
+    def __call__(self, x: torch.Tensor, *, rollout_step: int) -> torch.Tensor:
+        if not self.can_replay(x, rollout_step):
+            raise ValueError("CUDA graph replay inputs must match captured shapes/dtypes/step.")
+        self.static_x.copy_(x)
+        self.graph.replay()
+        return self.static_out
+
+
+class CudaGraphAuroraGpuRunner:
+    """Replay encoder → backbone → decoder on fixed-shape batches.
+
+    Perceiver modules remain standard PyTorch (FlashAttention when enabled); this
+    only removes launch overhead by capturing the GPU stack in one graph.
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        encoder_batch: Batch,
+        patch_res: tuple[int, int, int],
+        *,
+        rollout_step: int,
+        autocast_backbone: bool = False,
+        warmup_iters: int = 2,
+    ) -> None:
+        if not next(iter(encoder_batch.surf_vars.values())).is_cuda:
+            raise ValueError("CudaGraphAuroraGpuRunner requires CUDA batches.")
+
+        self.model = model
+        self.static_batch = _allocate_batch_like(encoder_batch)
+        _copy_batch(encoder_batch, self.static_batch)
+        self.patch_res = patch_res
+        self.rollout_step = rollout_step
+        self.autocast_backbone = autocast_backbone
+        self.lead_time = model.timestep
+        self.graph = torch.cuda.CUDAGraph()
+        self._captured_shapes = _batch_tensor_shapes(encoder_batch)
+
+        torch.cuda.synchronize()
+
+        if warmup_iters > 0:
+            side_stream = torch.cuda.Stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                for _ in range(warmup_iters):
+                    self._forward_static()
+            torch.cuda.current_stream().wait_stream(side_stream)
+            torch.cuda.synchronize()
+
+        with torch.cuda.graph(self.graph):
+            self.static_pred = self._forward_static()
+
+    def _autocast_ctx(self):
+        if self.autocast_backbone:
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
+
+    def _forward_static(self) -> Batch:
+        with torch.inference_mode():
+            x = self.model.encoder(self.static_batch, lead_time=self.lead_time)
+            with self._autocast_ctx():
+                x = self.model.backbone(
+                    x,
+                    lead_time=self.lead_time,
+                    patch_res=self.patch_res,
+                    rollout_step=self.rollout_step,
+                )
+            return self.model.decoder(
+                x,
+                self.static_batch,
+                patch_res=self.patch_res,
+                lead_time=self.lead_time,
+            )
+
+    def can_replay(self, encoder_batch: Batch, rollout_step: int) -> bool:
+        if rollout_step != self.rollout_step:
+            return False
+        return _batch_tensor_shapes(encoder_batch) == self._captured_shapes
+
+    def __call__(self, encoder_batch: Batch, *, rollout_step: int) -> Batch:
+        if not self.can_replay(encoder_batch, rollout_step):
+            raise ValueError("CUDA graph replay batch must match captured shapes and rollout step.")
+        _copy_batch(encoder_batch, self.static_batch)
+        self.graph.replay()
+        return self.static_pred
+
+
+def build_aurora_cuda_graph_runner(
+    model: Any,
+    *,
+    scope: str,
+    encoder_batch: Batch,
+    backbone_input: torch.Tensor | None,
+    patch_res: tuple[int, int, int],
+    rollout_step: int,
+    autocast_backbone: bool,
+    warmup_iters: int = 2,
+) -> CudaGraphAuroraBackboneRunner | CudaGraphAuroraGpuRunner:
+    if scope == "backbone":
+        if backbone_input is None:
+            raise ValueError("backbone_input is required for scope='backbone'.")
+        return CudaGraphAuroraBackboneRunner(
+            model.backbone,
+            backbone_input,
+            patch_res,
+            lead_time=model.timestep,
+            rollout_step=rollout_step,
+            autocast=autocast_backbone,
+            warmup_iters=warmup_iters,
+        )
+    if scope == "full_gpu":
+        return CudaGraphAuroraGpuRunner(
+            model,
+            encoder_batch,
+            patch_res,
+            rollout_step=rollout_step,
+            autocast_backbone=autocast_backbone,
+            warmup_iters=warmup_iters,
+        )
+    raise ValueError(f"Unsupported CUDA graph scope {scope!r}")

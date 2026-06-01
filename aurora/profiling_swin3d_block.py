@@ -42,6 +42,7 @@ from profiling_swin3d import (
     _top_ops_ms,
 )
 from aurora.model.cuda_graph import CudaGraphSwin3DBlockRunner
+from aurora.model.inference_precision import apply_inference_config
 
 
 _MATRIX_CONFIGS = [
@@ -572,6 +573,15 @@ def main() -> None:
         help="torch.compile this block only (fixed shape recommended).",
     )
     p.add_argument(
+        "--inference-precision",
+        choices=("fp32", "fast_fp32", "bf16_mixed"),
+        default=None,
+        help=(
+            "Apply a named Swin3D kernel preset (overrides --input-dtype and scattered "
+            "Triton/CuTe flags): fp32, fast_fp32, bf16_mixed."
+        ),
+    )
+    p.add_argument(
         "--cuda-graph",
         action="store_true",
         help="Capture and replay the fixed-shape block with torch.cuda.CUDAGraph.",
@@ -617,6 +627,22 @@ def main() -> None:
         help="Merge LoRA into linear at inference (requires --use-lora).",
     )
     args = p.parse_args()
+
+    if args.inference_precision is not None:
+        preset = apply_inference_config(args.inference_precision)
+        args.use_triton_layout = preset["use_triton_layout"]
+        args.use_triton_adaln = preset["use_triton_adaln"]
+        args.use_triton_mlp = preset["use_triton_mlp"]
+        args.use_cute_window_attn = preset["use_cute_window_attn"]
+        if args.inference_precision == "bf16_mixed":
+            args.input_dtype = "bfloat16"
+            args.autocast = preset["autocast"]
+        elif args.inference_precision == "fast_fp32":
+            args.input_dtype = "float32"
+            args.autocast = False
+        else:
+            args.input_dtype = "float32"
+            args.autocast = False
 
     if args.cuda_graph and args.compile:
         raise SystemExit("--cuda-graph and --compile are mutually exclusive in this profiler.")
@@ -692,6 +718,7 @@ def main() -> None:
         f"[config] preset={args.preset}, dim={dim}, heads={num_heads}, time_dim={time_dim}, "
         f"patch_res={patch_res}, L={L}, window={ws}, shift={shift}, "
         f"input_dtype={args.input_dtype}, autocast={args.autocast}, compile={args.compile}, "
+        f"inference_precision={args.inference_precision}, "
         f"cuda_graph={args.cuda_graph}, "
         f"use_triton_layout={args.use_triton_layout}, use_triton_adaln={args.use_triton_adaln}, "
         f"use_triton_mlp={args.use_triton_mlp}, use_cute_window_attn={args.use_cute_window_attn}, "

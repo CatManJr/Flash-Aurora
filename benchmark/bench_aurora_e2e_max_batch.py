@@ -51,7 +51,7 @@ if _AURORA_PKG.is_dir():
 
 _DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 # AutoDL: large fast volume, standard mount
-_DEFAULT_CHECKPOINT_DIR = "/root/autodl-tmp"
+_DEFAULT_CHECKPOINT_DIR = "/root/autodl-tmp/aurora"
 
 
 def _apply_hf_hub_endpoint_from_argv(argv: list[str]) -> None:

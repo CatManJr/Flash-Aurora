@@ -11,6 +11,7 @@ from aurora.model.aurora import (
     AuroraSmallPretrained,
     AuroraWave,
 )
+from aurora.model.inference_precision import AuroraInferencePrecision
 from aurora.rollout import rollout
 from aurora.tracker import Tracker
 
@@ -23,6 +24,7 @@ __all__ = [
     "AuroraHighRes",
     "AuroraAirPollution",
     "AuroraWave",
+    "AuroraInferencePrecision",
     "Batch",
     "Metadata",
     "rollout",

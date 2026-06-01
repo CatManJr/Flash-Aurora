@@ -457,6 +457,42 @@ def _probe_max_batch(
     return lo
 
 
+def _aurora_model_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    from aurora.model.inference_precision import apply_inference_config, resolve_inference_config
+    from aurora.model.workspace_pool import InferenceWorkspacePool
+
+    pool_kw = {"workspace_pool": InferenceWorkspacePool()} if args.use_workspace_pool else {}
+    base = {
+        "use_lora": True,
+        "lora_mode": "single",
+        "use_lora_merged_inference": args.use_lora_merged_inference,
+        **pool_kw,
+    }
+    if args.inference_precision:
+        cfg = resolve_inference_config(args.inference_precision)
+        if args.no_autocast_backbone and cfg is not None and cfg.autocast_backbone:
+            raise SystemExit(
+                f"--no-autocast-backbone conflicts with inference_precision={args.inference_precision!r}."
+            )
+        if args.use_triton_layout or args.use_triton_adaln or args.use_triton_mlp:
+            print(
+                "[warn] --inference-precision overrides scattered --use-triton-* flags."
+            )
+        preset = apply_inference_config(args.inference_precision)
+        return {
+            **base,
+            **preset,
+            "inference_precision": args.inference_precision,
+        }
+    return {
+        **base,
+        "autocast": not args.no_autocast_backbone,
+        "use_triton_layout": args.use_triton_layout,
+        "use_triton_adaln": args.use_triton_adaln,
+        "use_triton_mlp": args.use_triton_mlp,
+    }
+
+
 def _timed_e2e_config(
     args: argparse.Namespace,
     batch_b1: Any,
@@ -499,7 +535,12 @@ def _timed_e2e_config(
         use_lora_merged_inference=use_lora_merged_inference,
         workspace_pool=pool,
     )
-    model.load_checkpoint(strict=False)
+    model.load_checkpoint_prefer_local(
+        checkpoint_dir=args.checkpoint_dir,
+        path=args.checkpoint or None,
+        strict=False,
+        allow_hub_download=args.hub_download,
+    )
     model.eval()
     model.to(args.device)
 
@@ -763,6 +804,42 @@ def main() -> None:
         help="Swin backbone: InferenceWorkspacePool for decoder concat scratch (D3).",
     )
     parser.add_argument(
+        "--inference-precision",
+        choices=("fp32", "fast_fp32", "bf16_mixed"),
+        default=None,
+        help=(
+            "Named Swin3D inference preset. Overrides scattered Triton/CuTe/autocast flags. "
+            "Perceiver encoder/decoder stay PyTorch naive."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Capture a fixed-shape CUDA graph after warmup. Requires fast_fp32 or bf16_mixed "
+            "(or pass --inference-precision with a graph-capable preset)."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="/root/autodl-tmp/aurora",
+        metavar="DIR",
+        help="Directory for Aurora .ckpt files (default: /root/autodl-tmp/aurora).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="Explicit checkpoint file path (overrides --checkpoint-dir).",
+    )
+    parser.add_argument(
+        "--hub-download",
+        action="store_true",
+        help="If the checkpoint is missing locally, download from Hugging Face Hub.",
+    )
+    parser.add_argument(
         "--compare-e2e-swin",
         action="store_true",
         help=(
@@ -816,6 +893,18 @@ def main() -> None:
             raise SystemExit("--compare-find-max-batch requires CUDA (--device cuda).")
         if args.compare_batch_cap < 1:
             raise SystemExit("--compare-batch-cap must be >= 1.")
+
+    if args.cuda_graph:
+        if not str(args.device).startswith("cuda"):
+            raise SystemExit("--cuda-graph requires CUDA (--device cuda).")
+        if args.inference_precision in (None, "fp32"):
+            raise SystemExit(
+                "--cuda-graph requires --inference-precision fast_fp32 or bf16_mixed."
+            )
+    if args.inference_precision and (
+        args.use_triton_layout or args.use_triton_adaln or args.use_triton_mlp
+    ):
+        print("[warn] --inference-precision overrides scattered --use-triton-* flags.")
 
     if args.no_torch_profiler and (
         args.trace_out
@@ -973,17 +1062,17 @@ def main() -> None:
     from aurora.model.workspace_pool import InferenceWorkspacePool
 
     pool = InferenceWorkspacePool() if args.use_workspace_pool else None
-    model = AuroraSmallPretrained(
-        use_lora=True,
-        lora_mode="single",
-        autocast=not args.no_autocast_backbone,
-        use_triton_layout=args.use_triton_layout,
-        use_triton_adaln=args.use_triton_adaln,
-        use_triton_mlp=args.use_triton_mlp,
-        use_lora_merged_inference=args.use_lora_merged_inference,
-        workspace_pool=pool,
+    model_kwargs = _aurora_model_kwargs(args)
+    if pool is not None and "workspace_pool" not in model_kwargs:
+        model_kwargs["workspace_pool"] = pool
+    model = AuroraSmallPretrained(**model_kwargs)
+    ckpt_path = model.load_checkpoint_prefer_local(
+        checkpoint_dir=args.checkpoint_dir,
+        path=args.checkpoint or None,
+        strict=False,
+        allow_hub_download=args.hub_download,
     )
-    model.load_checkpoint(strict=False)
+    print(f"[checkpoint] {ckpt_path}")
     model.eval()
     model.to(args.device)
 
@@ -1002,6 +1091,18 @@ def main() -> None:
         run_once()
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
+
+    if args.cuda_graph:
+        capture_batch = batch.to(args.device)
+        model.capture_inference_cuda_graph(capture_batch)
+        print(
+            f"[cuda-graph] captured scope="
+            f"{getattr(model, '_cuda_graph_scope', 'unknown')} for inference replay"
+        )
+        for _ in range(max(1, args.warmup // 2)):
+            run_once()
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
 
     warmup_alloc_mb: float | None = None
     if args.device.startswith("cuda"):
