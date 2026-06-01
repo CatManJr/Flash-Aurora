@@ -574,11 +574,11 @@ def main() -> None:
     )
     p.add_argument(
         "--inference-precision",
-        choices=("fp32", "fast_fp32", "bf16_mixed"),
+        choices=("fp32", "pytorch_autocast", "fast_fp32", "tf32_1x", "bf16_mixed", "full_bf16"),
         default=None,
         help=(
-            "Apply a named Swin3D kernel preset (overrides --input-dtype and scattered "
-            "Triton/CuTe flags): fp32, fast_fp32, bf16_mixed."
+            "Apply one of the five inference presets (overrides scattered flags): "
+            "fp32, pytorch_autocast, fast_fp32, tf32_1x, bf16_mixed, full_bf16."
         ),
     )
     p.add_argument(
@@ -634,15 +634,10 @@ def main() -> None:
         args.use_triton_adaln = preset["use_triton_adaln"]
         args.use_triton_mlp = preset["use_triton_mlp"]
         args.use_cute_window_attn = preset["use_cute_window_attn"]
-        if args.inference_precision == "bf16_mixed":
-            args.input_dtype = "bfloat16"
-            args.autocast = preset["autocast"]
-        elif args.inference_precision == "fast_fp32":
-            args.input_dtype = "float32"
-            args.autocast = False
-        else:
-            args.input_dtype = "float32"
-            args.autocast = False
+        args.input_dtype = (
+            "bfloat16" if preset["backbone_compute_dtype"] == "bfloat16" else "float32"
+        )
+        args.autocast = preset["autocast"]
 
     if args.cuda_graph and args.compile:
         raise SystemExit("--cuda-graph and --compile are mutually exclusive in this profiler.")

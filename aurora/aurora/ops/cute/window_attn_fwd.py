@@ -147,6 +147,12 @@ _ENV_CUTE_WINDOW = "AURORA_CUTE_WINDOW_ATTN"
 _CUTE_KERNEL_VERSION = "v2"
 
 
+def _bf16_tile_n(seq_len: int, head_dim: int, tile_m: int, tile_n: Optional[int]) -> int:
+    if tile_n is not None:
+        return tile_n
+    return _choose_tile_n(seq_len, head_dim=head_dim, tile_m=tile_m)
+
+
 def _require_sm120_v2(q: torch.Tensor) -> None:
     """Fail loudly when the v2 CuTe path is used outside its target architecture."""
     if not q.is_cuda:
@@ -254,7 +260,7 @@ def window_attn_fwd_cute(
             q=q, k=k, v=v_run, o=out, bias_or_none=bias,
         )
     else:
-        _tile_n = tile_n if tile_n is not None else _choose_tile_n(N, head_dim=Dh, tile_m=tile_m)
+        _tile_n = _bf16_tile_n(N, head_dim=Dh, tile_m=tile_m, tile_n=tile_n)
         # Adaptive kernel selection by KV-pass count:
         #   single-pass (tile_n >= N): v1 — simpler 128-thread cp.async; a dedicated
         #     DMA warp gives no prefetch overlap here and only wastes MMA threads.
@@ -356,7 +362,7 @@ def window_attn_fwd_cute_qkvpacked(
     is_bf16 = qkv.dtype == torch.bfloat16
 
     if is_bf16:
-        _tile_n = tile_n if tile_n is not None else _choose_tile_n(N, head_dim=Dh, tile_m=tile_m)
+        _tile_n = _bf16_tile_n(N, head_dim=Dh, tile_m=tile_m, tile_n=tile_n)
         if _tile_n >= N:
             fn = _get_or_compile_bf16_qkvpacked(
                 head_dim=Dh, seq_len=N, has_bias=has_bias,

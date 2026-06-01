@@ -167,19 +167,17 @@ class CudaGraphAuroraBackboneRunner:
             self.static_out = self._forward_static()
 
     def _forward_static(self) -> torch.Tensor:
-        ctx: Any
-        if self.autocast:
-            ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            ctx = contextlib.nullcontext()
-        with ctx:
-            with torch.inference_mode():
-                return self.backbone(
-                    self.static_x,
-                    lead_time=self.lead_time,
-                    patch_res=self.patch_res,
-                    rollout_step=self.rollout_step,
-                )
+        from aurora.model.custom_op_paths import run_backbone_with_dtype_routing
+
+        with torch.inference_mode():
+            return run_backbone_with_dtype_routing(
+                self.backbone,
+                self.static_x,
+                autocast=self.autocast,
+                lead_time=self.lead_time,
+                patch_res=self.patch_res,
+                rollout_step=self.rollout_step,
+            )
 
     def can_replay(self, x: torch.Tensor, rollout_step: int) -> bool:
         return (
@@ -212,6 +210,7 @@ class CudaGraphAuroraGpuRunner:
         *,
         rollout_step: int,
         autocast_backbone: bool = False,
+        autocast_encoder_decoder: bool = False,
         warmup_iters: int = 2,
     ) -> None:
         if not next(iter(encoder_batch.surf_vars.values())).is_cuda:
@@ -223,6 +222,7 @@ class CudaGraphAuroraGpuRunner:
         self.patch_res = patch_res
         self.rollout_step = rollout_step
         self.autocast_backbone = autocast_backbone
+        self.autocast_encoder_decoder = autocast_encoder_decoder
         self.lead_time = model.timestep
         self.graph = torch.cuda.CUDAGraph()
         self._captured_shapes = _batch_tensor_shapes(encoder_batch)
@@ -241,23 +241,26 @@ class CudaGraphAuroraGpuRunner:
         with torch.cuda.graph(self.graph):
             self.static_pred = self._forward_static()
 
-    def _autocast_ctx(self):
-        if self.autocast_backbone:
-            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        return contextlib.nullcontext()
-
     def _forward_static(self) -> Batch:
+        from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+
         with torch.inference_mode():
-            x = self.model.encoder(self.static_batch, lead_time=self.lead_time)
-            with self._autocast_ctx():
-                x = self.model.backbone(
-                    x,
-                    lead_time=self.lead_time,
-                    patch_res=self.patch_res,
-                    rollout_step=self.rollout_step,
-                )
-            return self.model.decoder(
+            x = run_with_encoder_decoder_autocast(
+                self.model.encoder,
+                self.static_batch,
+                enabled=self.autocast_encoder_decoder,
+                lead_time=self.lead_time,
+            )
+            x = self.model._run_backbone(
                 x,
+                lead_time=self.lead_time,
+                patch_res=self.patch_res,
+                rollout_step=self.rollout_step,
+            )
+            return run_with_encoder_decoder_autocast(
+                self.model.decoder,
+                x,
+                enabled=self.autocast_encoder_decoder,
                 self.static_batch,
                 patch_res=self.patch_res,
                 lead_time=self.lead_time,
@@ -285,6 +288,7 @@ def build_aurora_cuda_graph_runner(
     patch_res: tuple[int, int, int],
     rollout_step: int,
     autocast_backbone: bool,
+    autocast_encoder_decoder: bool = False,
     warmup_iters: int = 2,
 ) -> CudaGraphAuroraBackboneRunner | CudaGraphAuroraGpuRunner:
     if scope == "backbone":
@@ -306,6 +310,7 @@ def build_aurora_cuda_graph_runner(
             patch_res,
             rollout_step=rollout_step,
             autocast_backbone=autocast_backbone,
+            autocast_encoder_decoder=autocast_encoder_decoder,
             warmup_iters=warmup_iters,
         )
     raise ValueError(f"Unsupported CUDA graph scope {scope!r}")

@@ -84,9 +84,11 @@ class AdaptiveLayerNorm(nn.Module):
         """
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
         if self.use_triton and x.is_cuda and x.dtype in (torch.float32, torch.bfloat16):
+            from aurora.model.custom_op_paths import align_binary_activations
             from aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
+            residual, activation = align_binary_activations(residual, x)
             return adaptive_layernorm_film_add_residual_forward(
-                residual, x, scale, shift, float(self.scale_bias), float(self.ln.eps)
+                residual, activation, scale, shift, float(self.scale_bias), float(self.ln.eps)
             )
         return residual + self.ln(x) * (self.scale_bias + scale) + shift

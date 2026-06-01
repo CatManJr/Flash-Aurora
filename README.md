@@ -88,6 +88,22 @@ Peak extra memory drops roughly in half on TF32 OPT (e.g. Stage1: 5064 → 2531 
 
 Note: `allow_tf32` speeds up Triton/cuBLAS linear projections but has no effect on PyTorch's FP32 SDPA backend (mem-efficient/math ignores the flag). The TF32 OPT speedup over FP32-TF32* comes almost entirely from our attention kernel.
 
+### Known limitation: small windows (`N < 32`)
+
+Production Aurora inference uses **`N = 144`** tokens per window (`window_size = 2×6×12` on the default patch grid). All encoder/decoder stages in our benchmarks and tests use that size or larger; BF16/TF32 CuTe paths are validated there.
+
+**Downsampled stages can shrink the window** (e.g. patch merge → `N = 16`). We do **not** support BF16 CuTe attention for `N < 32` and have no plan to fix it: those shapes are out of scope for production inference in this repo.
+
+| Observation | Detail |
+|-------------|--------|
+| Symptom | `bf16_mixed` can crash with `cudaErrorIllegalAddress` the first time CuTe BF16 runs on a small window (often misreported at the next CUDA sync, e.g. Triton AdaLN). |
+| Repro | Isolated `window_attn_fwd_cute` / qkv-packed BF16 at `N = 16`; TF32 CuTe at the same shape is fine. |
+| Root cause | BF16 **v1** single-pass prefetches **V** with **K** via **cp.async** before QK. For short `N`, the 128-thread MMA tile covers more rows/cols than `seqlen`; unpredicated V/K gmem copies can **read past valid memory**. TF32 v2 avoids this by loading V **after** QK+softmax with a sync, predicated path. |
+| Why not fixed | A dedicated short-window kernel was explored; padding to 32×32 tiles caused correctness issues on some `N`. User decision: **ignore** — these windows will not appear in target deployments. |
+| Workaround | Use `TF32_ACC_FP32`, PyTorch SDPA, or `AURORA_CUTE_WINDOW_ATTN=0` if you must run architectures with merged windows `N < 32`. |
+
+If you add new patch resolutions or window layouts, confirm **`N ≥ 32`** (ideally `N = 144`) on every stage that enables `use_cute_window_attn` + `cute_window_attn_dtype=bfloat16`.
+
 ### What's next
 
 Attention alone is a small slice of block time (QKV + MLP dominate). BF16 still has headroom — Stage3 parity and shifted-window gap are the obvious places to look. Multi-pass streaming (`N=576`) is a lower priority since Aurora's encoder/decoder stages all use `N=144`.

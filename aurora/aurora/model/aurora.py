@@ -178,11 +178,11 @@ class Aurora(torch.nn.Module):
                 window attention on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel
                 (BF16 I/O, FP32 accumulators); float32 tensors use the TF32 CuTe kernel when
                 enabled. Requires ``attn_drop=0``. Defaults to ``False``.
-            inference_precision (str, optional): Named preset that configures Swin3D kernels:
-                ``fp32`` (strict PyTorch), ``fast_fp32`` (TF32 CuTe + Triton Swin), or
-                ``bf16_mixed`` (backbone autocast + CuTe BF16 + Triton Swin). Perceiver
-                encoder/decoder remain PyTorch naive. When set, overrides the scattered
-                ``use_triton_*`` / ``use_cute_window_attn`` / ``autocast`` flags below.
+            inference_precision (str, optional): Named preset — ``fp32``, ``pytorch_autocast``,
+                ``fast_fp32`` (Triton Swin + native Perceiver), ``tf32_1x``, ``bf16_mixed``,
+                or ``full_bf16`` (full-model BF16 + Perceiver FlashAttention).
+                Overrides scattered ``use_triton_*`` / ``use_cute_window_attn`` / ``autocast``
+                flags below when set.
             surf_stats (dict[str, tuple[float, float]], optional): For these surface-level
                 variables, adjust the normalisation to the given tuple consisting of a new location
                 and scale.
@@ -242,11 +242,21 @@ class Aurora(torch.nn.Module):
         if self.inference_config is not None:
             preset_kwargs = apply_inference_config(inference_precision)
             autocast = preset_kwargs["autocast"]
+            backbone_compute_dtype_name = preset_kwargs["backbone_compute_dtype"]
             use_triton_layout = preset_kwargs["use_triton_layout"]
             use_triton_adaln = preset_kwargs["use_triton_adaln"]
             use_triton_mlp = preset_kwargs["use_triton_mlp"]
             use_cute_window_attn = preset_kwargs["use_cute_window_attn"]
             use_triton_perceiver_ln_fusion = preset_kwargs["use_triton_perceiver_ln_fusion"]
+            use_perceiver_flash_attn = preset_kwargs["use_perceiver_flash_attn"]
+            autocast_encoder_decoder = preset_kwargs["autocast_encoder_decoder"]
+        else:
+            backbone_compute_dtype_name = "float32"
+            autocast_encoder_decoder = False
+
+        from aurora.model.custom_op_paths import backbone_dtype_from_name
+
+        self.cute_window_attn_dtype = backbone_dtype_from_name(backbone_compute_dtype_name)
 
         self.surf_vars = surf_vars
         self.atmos_vars = atmos_vars
@@ -309,6 +319,7 @@ class Aurora(torch.nn.Module):
             use_triton_adaln=use_triton_adaln,
             use_triton_mlp=use_triton_mlp,
             use_cute_window_attn=use_cute_window_attn,
+            cute_window_attn_dtype=self.cute_window_attn_dtype,
             workspace_pool=workspace_pool,
         )
 
@@ -350,6 +361,7 @@ class Aurora(torch.nn.Module):
             autocast = True
 
         self.autocast = autocast
+        self.autocast_encoder_decoder = autocast_encoder_decoder
         self._cuda_graph_runner: Any | None = None
         self._cuda_graph_scope: str | None = None
         self._cuda_graph_patch_res: tuple[int, int, int] | None = None
@@ -439,6 +451,7 @@ class Aurora(torch.nn.Module):
             patch_res=patch_res,
             rollout_step=rollout_step,
             autocast_backbone=self.autocast,
+            autocast_encoder_decoder=self.autocast_encoder_decoder,
             warmup_iters=warmup_iters,
         )
         self._cuda_graph_scope = scope
@@ -485,6 +498,36 @@ class Aurora(torch.nn.Module):
 
         return pred.unnormalise(surf_stats=self.surf_stats)
 
+    def _run_backbone(
+        self,
+        x: torch.Tensor,
+        *,
+        lead_time: timedelta,
+        patch_res: tuple[int, int, int],
+        rollout_step: int,
+    ) -> torch.Tensor:
+        """Run Swin3D backbone with preset-specific dtype routing (autocast or explicit BF16)."""
+        from aurora.model.custom_op_paths import run_backbone_with_dtype_routing
+
+        backbone_compute_dtype = None
+        if (
+            self.autocast_encoder_decoder
+            and self.inference_config is not None
+            and self.inference_config.backbone_compute_dtype == "bfloat16"
+            and self.inference_config.precision != AuroraInferencePrecision.FULL_BF16
+        ):
+            backbone_compute_dtype = self.cute_window_attn_dtype
+
+        return run_backbone_with_dtype_routing(
+            self.backbone,
+            x,
+            autocast=self.autocast,
+            backbone_compute_dtype=backbone_compute_dtype,
+            lead_time=lead_time,
+            patch_res=patch_res,
+            rollout_step=rollout_step,
+        )
+
     def forward(self, batch: Batch) -> Batch:
         """Forward pass.
 
@@ -504,45 +547,49 @@ class Aurora(torch.nn.Module):
                     pred = runner(transformed_batch, rollout_step=rollout_step)
                     return self._finish_prediction(batch, pred)
             elif self._cuda_graph_scope == "backbone":
+                from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+
                 with torch.inference_mode():
-                    x = self.encoder(transformed_batch, lead_time=self.timestep)
+                    x = run_with_encoder_decoder_autocast(
+                        self.encoder,
+                        transformed_batch,
+                        enabled=self.autocast_encoder_decoder,
+                        lead_time=self.timestep,
+                    )
                 if runner.can_replay(x, rollout_step):
                     x = runner(x, rollout_step=rollout_step)
                     with torch.inference_mode():
-                        pred = self.decoder(
+                        pred = run_with_encoder_decoder_autocast(
+                            self.decoder,
                             x,
                             batch,
+                            enabled=self.autocast_encoder_decoder,
                             lead_time=self.timestep,
                             patch_res=patch_res,
                         )
                     return self._finish_prediction(batch, pred)
 
-        x = self.encoder(
+        from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+
+        x = run_with_encoder_decoder_autocast(
+            self.encoder,
             transformed_batch,
+            enabled=self.autocast_encoder_decoder,
             lead_time=self.timestep,
         )
 
-        if self.autocast:
-            if torch.cuda.is_available():
-                device_type = "cuda"
-            elif torch.xpu.is_available():
-                device_type = "xpu"
-            else:
-                device_type = "cpu"
-            context = torch.autocast(device_type=device_type, dtype=torch.bfloat16)
-        else:
-            context = contextlib.nullcontext()
-        with context:
-            x = self.backbone(
-                x,
-                lead_time=self.timestep,
-                patch_res=patch_res,
-                rollout_step=batch.metadata.rollout_step,
-            )
+        x = self._run_backbone(
+            x,
+            lead_time=self.timestep,
+            patch_res=patch_res,
+            rollout_step=batch.metadata.rollout_step,
+        )
 
-        pred = self.decoder(
+        pred = run_with_encoder_decoder_autocast(
+            self.decoder,
             x,
             batch,
+            enabled=self.autocast_encoder_decoder,
             lead_time=self.timestep,
             patch_res=patch_res,
         )

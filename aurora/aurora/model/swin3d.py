@@ -20,6 +20,14 @@ import torch.nn.functional as F
 from einops import rearrange
 from timm.layers import DropPath, to_3tuple
 
+from aurora.model.custom_op_paths import (
+    align_binary_activations,
+    can_use_cute_qkvpacked,
+    can_use_cute_window_attention,
+    can_use_triton_adaln,
+    can_use_triton_gelu,
+    can_use_triton_layout,
+)
 from aurora.model.film import AdaptiveLayerNorm
 from aurora.model.fourier import lead_time_expansion
 from aurora.model.lora import LoRAMode, LoRARollout
@@ -65,12 +73,11 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
         x = self.fc1(x)
-        if (
-            self.use_triton_gelu
-            and (not self.training)
-            and self.drop.p == 0.0
-            and x.is_cuda
-            and x.dtype in (torch.float32, torch.bfloat16)
+        if can_use_triton_gelu(
+            x,
+            enabled=self.use_triton_gelu,
+            training=self.training,
+            drop_p=self.drop.p,
         ):
             from aurora.ops.triton_gelu import gelu_forward_triton
 
@@ -106,6 +113,7 @@ class WindowAttention(nn.Module):
         use_lora: bool = False,
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
+        cute_window_attn_dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialise.
 
@@ -142,6 +150,7 @@ class WindowAttention(nn.Module):
         assert dim % num_heads == 0, f"dim ({dim}) should be divisible by num_heads ({num_heads})."
         self.head_dim = dim // num_heads
         self.use_cute_window_attn = use_cute_window_attn
+        self.cute_window_attn_dtype = cute_window_attn_dtype
 
         self.attn_drop = attn_drop
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -251,24 +260,27 @@ class WindowAttention(nn.Module):
         else:
             qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
         attn_dropout = self.attn_drop if self.training else 0.0
+        activation_dtype = x.dtype
 
-        use_cute = (
-            self.use_cute_window_attn
-            and (not self.training)
-            and attn_dropout == 0.0
-            and qkv.is_cuda
-            and qkv.dtype in (torch.float32, torch.bfloat16)
-            and (not torch.is_grad_enabled())
+        use_cute = can_use_cute_window_attention(
+            qkv,
+            enabled=self.use_cute_window_attn,
+            training=self.training,
+            attn_dropout=attn_dropout,
         )
-        use_cute_qkvpacked = (
-            use_cute
-            and qkv.is_contiguous()
-            and qkv.shape[-1] == 3 * self.num_heads * self.head_dim
-            and qkv.dtype in (torch.bfloat16, torch.float32)
+        use_cute_qkvpacked = can_use_cute_qkvpacked(
+            qkv,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            cute_enabled=self.use_cute_window_attn,
+            training=self.training,
+            attn_dropout=attn_dropout,
         )
         if use_cute_qkvpacked:
             from aurora.ops.cute import window_attn_fwd_cute_qkvpacked
 
+            if qkv.dtype != self.cute_window_attn_dtype:
+                qkv = qkv.to(dtype=self.cute_window_attn_dtype)
             bias = None if mask is None else mask.to(dtype=torch.float32, device=qkv.device)
             if bias is not None and not bias.is_contiguous():
                 bias = bias.contiguous()
@@ -284,6 +296,12 @@ class WindowAttention(nn.Module):
             if use_cute:
                 from aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
 
+                if self.cute_window_attn_dtype == torch.bfloat16 and q.dtype != torch.bfloat16:
+                    q, k, v = (
+                        q.to(torch.bfloat16),
+                        k.to(torch.bfloat16),
+                        v.to(torch.bfloat16),
+                    )
                 precision = (
                     WinAttnPrecision.BF16_MIXED
                     if q.dtype == torch.bfloat16
@@ -307,6 +325,8 @@ class WindowAttention(nn.Module):
             else:
                 x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
             x = rearrange(x, "B H N D -> B N (H D)")
+        if x.dtype != activation_dtype:
+            x = x.to(dtype=activation_dtype)
         if isinstance(self.lora_proj, LoRARollout):
             x = self._linear_with_optional_lora_merge(
                 x,
@@ -536,6 +556,7 @@ class Swin3DTransformerBlock(nn.Module):
         use_triton_mlp: bool = False,
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
+        cute_window_attn_dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialise.
 
@@ -598,6 +619,7 @@ class Swin3DTransformerBlock(nn.Module):
             lora_mode=lora_mode,
             use_lora_merged_inference=use_lora_merged_inference,
             use_cute_window_attn=use_cute_window_attn,
+            cute_window_attn_dtype=cute_window_attn_dtype,
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -650,11 +672,7 @@ class Swin3DTransformerBlock(nn.Module):
         else:
             attn_mask = None
 
-        use_triton = (
-            self.use_triton_layout
-            and x_5d.is_cuda
-            and x_5d.dtype in (torch.float32, torch.bfloat16)
-        )
+        use_triton = can_use_triton_layout(x_5d, enabled=self.use_triton_layout)
         if use_triton:
             from aurora.ops.triton_swin3d_layout import (
                 crop_roll_unmerge_windows_triton,
@@ -705,28 +723,28 @@ class Swin3DTransformerBlock(nn.Module):
 
             x = x.reshape(B, C * H * W, D)
 
-        use_d2_adaln_residual = (
-            self.norm1.use_triton
-            and not self.training
-            and shortcut.is_cuda
-            and shortcut.dtype in (torch.float32, torch.bfloat16)
-            and isinstance(self.drop_path, nn.Identity)
+        use_d2_adaln_residual = can_use_triton_adaln(
+            x,
+            enabled=self.norm1.use_triton,
+            training=self.training,
+            drop_path_is_identity=isinstance(self.drop_path, nn.Identity),
         )
         if use_d2_adaln_residual:
-            x = self.norm1.forward_add_residual(shortcut, x, c)
+            residual, activation = align_binary_activations(shortcut, x)
+            x = self.norm1.forward_add_residual(residual, activation, c)
         else:
             x = shortcut + self.drop_path(self.norm1(x, c))
 
         h = self.mlp(x)
-        use_d2_norm2 = (
-            self.norm2.use_triton
-            and not self.training
-            and x.is_cuda
-            and x.dtype in (torch.float32, torch.bfloat16)
-            and isinstance(self.drop_path, nn.Identity)
+        use_d2_norm2 = can_use_triton_adaln(
+            x,
+            enabled=self.norm2.use_triton,
+            training=self.training,
+            drop_path_is_identity=isinstance(self.drop_path, nn.Identity),
         )
         if use_d2_norm2:
-            x = self.norm2.forward_add_residual(x, h, c)
+            residual, activation = align_binary_activations(x, h)
+            x = self.norm2.forward_add_residual(residual, activation, c)
         else:
             x = x + self.drop_path(self.norm2(h, c))
         return x
@@ -862,6 +880,7 @@ class BasicLayer3D(nn.Module):
         use_triton_mlp: bool = False,
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
+        cute_window_attn_dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialise.
 
@@ -930,6 +949,7 @@ class BasicLayer3D(nn.Module):
                     use_triton_mlp=use_triton_mlp,
                     use_lora_merged_inference=use_lora_merged_inference,
                     use_cute_window_attn=use_cute_window_attn,
+                    cute_window_attn_dtype=cute_window_attn_dtype,
                 )
                 for i in range(depth)
             ]
@@ -1015,6 +1035,7 @@ class Swin3DTransformerBackbone(nn.Module):
         use_triton_mlp: bool = False,
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
+        cute_window_attn_dtype: torch.dtype = torch.float32,
         workspace_pool: Optional[InferenceWorkspacePool] = None,
     ) -> None:
         """Initialise.
@@ -1101,6 +1122,7 @@ class Swin3DTransformerBackbone(nn.Module):
                 use_triton_mlp=use_triton_mlp,
                 use_lora_merged_inference=use_lora_merged_inference,
                 use_cute_window_attn=use_cute_window_attn,
+                cute_window_attn_dtype=cute_window_attn_dtype,
             )
             self.encoder_layers.append(layer)
 
@@ -1128,6 +1150,7 @@ class Swin3DTransformerBackbone(nn.Module):
                 use_triton_mlp=use_triton_mlp,
                 use_lora_merged_inference=use_lora_merged_inference,
                 use_cute_window_attn=use_cute_window_attn,
+                cute_window_attn_dtype=cute_window_attn_dtype,
             )
             self.decoder_layers.append(layer)
 
@@ -1186,7 +1209,7 @@ class Swin3DTransformerBackbone(nn.Module):
 
         lead_hours = lead_time / timedelta(hours=1)
         lead_times = lead_hours * torch.ones(x.shape[0], dtype=torch.float32, device=x.device)
-        c = self.time_mlp(lead_time_expansion(lead_times, self.embed_dim).to(dtype=x.dtype))
+        c = self.time_mlp(lead_time_expansion(lead_times, self.embed_dim))
 
         skips = []
         for i, layer in enumerate(self.encoder_layers):

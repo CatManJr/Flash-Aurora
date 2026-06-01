@@ -1,0 +1,36 @@
+"""Tests for custom-op / model-path dtype adapters."""
+
+from __future__ import annotations
+
+import torch
+
+from aurora.model.custom_op_paths import align_binary_activations, can_use_cute_qkvpacked
+
+
+def test_align_binary_activations_promotes_to_bf16() -> None:
+    fp32 = torch.randn(2, 4, 8, device="cuda", dtype=torch.float32)
+    bf16 = torch.randn(2, 4, 8, device="cuda", dtype=torch.bfloat16)
+    left, right = align_binary_activations(fp32, bf16)
+    assert left.dtype == torch.bfloat16
+    assert right.dtype == torch.bfloat16
+
+
+def test_can_use_cute_qkvpacked_under_autocast() -> None:
+    qkv = torch.randn(4, 144, 768, device="cuda", dtype=torch.bfloat16)
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        assert can_use_cute_qkvpacked(
+            qkv,
+            num_heads=8,
+            head_dim=32,
+            cute_enabled=True,
+            training=False,
+            attn_dropout=0.0,
+        )
+
+
+def test_prepare_backbone_input_casts_to_bf16() -> None:
+    from aurora.model.custom_op_paths import prepare_backbone_input
+
+    x = torch.randn(2, 8, 16, device="cuda", dtype=torch.float32)
+    y = prepare_backbone_input(x, torch.bfloat16)
+    assert y.dtype == torch.bfloat16

@@ -100,6 +100,9 @@ except Exception:
 
 __all__ = ["MLP", "PerceiverResampler"]
 
+# FA-4 CuTe/TMA kernels target longer sequences; Aurora level agg/deagg uses seqlen ≈ 4.
+_MIN_FLASH_ATTN_SEQLEN = 16
+
 
 class MLP(nn.Module):
     """A simple one-hidden-layer MLP."""
@@ -190,14 +193,27 @@ class PerceiverAttention(nn.Module):
             self.use_flash_attn
             and flash_attn_func is not None
             and q.is_cuda
+            and latents.shape[1] >= _MIN_FLASH_ATTN_SEQLEN
+            and x.shape[1] >= _MIN_FLASH_ATTN_SEQLEN
         )
         if use_fa:
             # flash_attn_func: (B, seqlen_q, H, D), (B, seqlen_kv, H, D) — standard cross-attn.
             q = rearrange(q, "b l (h d) -> b l h d", h=h)
             k = rearrange(k, "b l (h d) -> b l h d", h=h)
             v = rearrange(v, "b l (h d) -> b l h d", h=h)
-            _fa_out = flash_attn_func(q, k, v, causal=False)
+            # FA-4 CuTe accepts fp16/bf16 only; run outside autocast with contiguous tensors.
+            out_dtype = q.dtype
+            if out_dtype == torch.float32:
+                q = q.to(torch.bfloat16)
+                k = k.to(torch.bfloat16)
+                v = v.to(torch.bfloat16)
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+            device_type = "cuda" if q.is_cuda else "cpu"
+            with torch.autocast(device_type=device_type, enabled=False):
+                _fa_out = flash_attn_func(q, k, v, causal=False)
             out = _fa_out[0] if isinstance(_fa_out, tuple) else _fa_out
+            if out_dtype == torch.float32:
+                out = out.to(out_dtype)
             out = rearrange(out, "b l h d -> b l (h d)")
         else:
             q, k, v = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=h), (q, k, v))
