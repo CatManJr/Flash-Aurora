@@ -41,6 +41,7 @@ from profiling_swin3d import (
     _shorten,
     _top_ops_ms,
 )
+from aurora.model.cuda_graph import CudaGraphSwin3DBlockRunner
 
 
 _MATRIX_CONFIGS = [
@@ -371,72 +372,6 @@ def _print_stage_stats(stage_stats: dict[str, dict[str, float]]) -> list[str]:
     return lines
 
 
-class _CudaGraphBlockRunner:
-    """Fixed-shape CUDA graph wrapper for one Swin3D block inference call."""
-
-    def __init__(
-        self,
-        block: Any,
-        x: Any,
-        c: Any,
-        patch_res: tuple[int, int, int],
-        *,
-        rollout_step: int,
-        warped: bool,
-        autocast: bool,
-    ) -> None:
-        import torch
-
-        self.block = block
-        self.static_x = torch.empty_like(x)
-        self.static_c = torch.empty_like(c)
-        self.patch_res = patch_res
-        self.rollout_step = rollout_step
-        self.warped = warped
-        self.autocast = autocast
-        self.graph = torch.cuda.CUDAGraph()
-        self.static_out = None
-
-        self.static_x.copy_(x)
-        self.static_c.copy_(c)
-        torch.cuda.synchronize()
-
-        side_stream = torch.cuda.Stream()
-        side_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side_stream):
-            for _ in range(3):
-                self._forward_static()
-        torch.cuda.current_stream().wait_stream(side_stream)
-        torch.cuda.synchronize()
-
-        with torch.cuda.graph(self.graph):
-            self.static_out = self._forward_static()
-
-    def _forward_static(self):
-        import torch
-
-        ctx: Any
-        if self.autocast:
-            ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            ctx = contextlib.nullcontext()
-        with ctx:
-            with torch.inference_mode():
-                return self.block(
-                    self.static_x,
-                    self.static_c,
-                    self.patch_res,
-                    rollout_step=self.rollout_step,
-                    warped=self.warped,
-                )
-
-    def __call__(self, x: Any, c: Any):
-        self.static_x.copy_(x)
-        self.static_c.copy_(c)
-        self.graph.replay()
-        return self.static_out
-
-
 def _bucket_swin3d_block(name: str) -> str:
     """Coarse buckets tuned for one Swin3D block (W-MSA / SW-MSA + AdaLN + MLP)."""
     n = name.lower()
@@ -733,7 +668,7 @@ def main() -> None:
     c = torch.randn(args.batch_size, time_dim, device=args.device, dtype=input_dtype)
     patch_res = (C, H, W)
 
-    graph_runner: _CudaGraphBlockRunner | None = None
+    graph_runner: CudaGraphSwin3DBlockRunner | None = None
 
     def run_once_eager() -> None:
         ctx: Any
@@ -772,7 +707,7 @@ def main() -> None:
             torch.cuda.synchronize()
 
     if args.cuda_graph:
-        graph_runner = _CudaGraphBlockRunner(
+        graph_runner = CudaGraphSwin3DBlockRunner(
             block,
             x,
             c,
