@@ -371,6 +371,72 @@ def _print_stage_stats(stage_stats: dict[str, dict[str, float]]) -> list[str]:
     return lines
 
 
+class _CudaGraphBlockRunner:
+    """Fixed-shape CUDA graph wrapper for one Swin3D block inference call."""
+
+    def __init__(
+        self,
+        block: Any,
+        x: Any,
+        c: Any,
+        patch_res: tuple[int, int, int],
+        *,
+        rollout_step: int,
+        warped: bool,
+        autocast: bool,
+    ) -> None:
+        import torch
+
+        self.block = block
+        self.static_x = torch.empty_like(x)
+        self.static_c = torch.empty_like(c)
+        self.patch_res = patch_res
+        self.rollout_step = rollout_step
+        self.warped = warped
+        self.autocast = autocast
+        self.graph = torch.cuda.CUDAGraph()
+        self.static_out = None
+
+        self.static_x.copy_(x)
+        self.static_c.copy_(c)
+        torch.cuda.synchronize()
+
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                self._forward_static()
+        torch.cuda.current_stream().wait_stream(side_stream)
+        torch.cuda.synchronize()
+
+        with torch.cuda.graph(self.graph):
+            self.static_out = self._forward_static()
+
+    def _forward_static(self):
+        import torch
+
+        ctx: Any
+        if self.autocast:
+            ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        else:
+            ctx = contextlib.nullcontext()
+        with ctx:
+            with torch.inference_mode():
+                return self.block(
+                    self.static_x,
+                    self.static_c,
+                    self.patch_res,
+                    rollout_step=self.rollout_step,
+                    warped=self.warped,
+                )
+
+    def __call__(self, x: Any, c: Any):
+        self.static_x.copy_(x)
+        self.static_c.copy_(c)
+        self.graph.replay()
+        return self.static_out
+
+
 def _bucket_swin3d_block(name: str) -> str:
     """Coarse buckets tuned for one Swin3D block (W-MSA / SW-MSA + AdaLN + MLP)."""
     n = name.lower()
@@ -571,6 +637,11 @@ def main() -> None:
         help="torch.compile this block only (fixed shape recommended).",
     )
     p.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Capture and replay the fixed-shape block with torch.cuda.CUDAGraph.",
+    )
+    p.add_argument(
         "--use-triton-layout",
         action="store_true",
         help="Fused roll/pad/window Triton path (CUDA float32).",
@@ -611,6 +682,13 @@ def main() -> None:
         help="Merge LoRA into linear at inference (requires --use-lora).",
     )
     args = p.parse_args()
+
+    if args.cuda_graph and args.compile:
+        raise SystemExit("--cuda-graph and --compile are mutually exclusive in this profiler.")
+    if args.cuda_graph and args.stage_timing:
+        raise SystemExit("--cuda-graph cannot be combined with --stage-timing.")
+    if args.cuda_graph and not args.device.startswith("cuda"):
+        raise SystemExit("--cuda-graph requires a CUDA device.")
 
     if args.preset == "small":
         dim, num_heads = 256, 4
@@ -655,7 +733,9 @@ def main() -> None:
     c = torch.randn(args.batch_size, time_dim, device=args.device, dtype=input_dtype)
     patch_res = (C, H, W)
 
-    def run_once() -> None:
+    graph_runner: _CudaGraphBlockRunner | None = None
+
+    def run_once_eager() -> None:
         ctx: Any
         if args.autocast and args.device.startswith("cuda"):
             ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -667,10 +747,17 @@ def main() -> None:
             with torch.inference_mode():
                 _ = block(x, c, patch_res, rollout_step=0, warped=True)
 
+    def run_once() -> None:
+        if graph_runner is not None:
+            _ = graph_runner(x, c)
+        else:
+            run_once_eager()
+
     print(
         f"[config] preset={args.preset}, dim={dim}, heads={num_heads}, time_dim={time_dim}, "
         f"patch_res={patch_res}, L={L}, window={ws}, shift={shift}, "
         f"input_dtype={args.input_dtype}, autocast={args.autocast}, compile={args.compile}, "
+        f"cuda_graph={args.cuda_graph}, "
         f"use_triton_layout={args.use_triton_layout}, use_triton_adaln={args.use_triton_adaln}, "
         f"use_triton_mlp={args.use_triton_mlp}, use_cute_window_attn={args.use_cute_window_attn}, "
         f"use_lora={args.use_lora}, use_lora_merged={args.use_lora_merged}"
@@ -680,9 +767,21 @@ def main() -> None:
         warnings.warn(f"CUDA is available but device={args.device!r}; profiling may be CPU-only.")
 
     for _ in range(args.warmup):
-        run_once()
+        run_once_eager()
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
+
+    if args.cuda_graph:
+        graph_runner = _CudaGraphBlockRunner(
+            block,
+            x,
+            c,
+            patch_res,
+            rollout_step=0,
+            warped=True,
+            autocast=args.autocast,
+        )
+        print("[cuda-graph] captured fixed-shape Swin3D block")
 
     timing_line = ""
     if args.device.startswith("cuda"):
@@ -804,7 +903,7 @@ def main() -> None:
             f"- Torch: {torch.__version__}",
             f"- Config: preset={args.preset}, dim={dim}, heads={num_heads}, patch_res={patch_res}, "
             f"window={ws}, shift={shift}, input_dtype={args.input_dtype}, "
-            f"autocast={args.autocast}, compile={args.compile}, "
+            f"autocast={args.autocast}, compile={args.compile}, cuda_graph={args.cuda_graph}, "
             f"Triton layout/AdaLN/MLP={args.use_triton_layout}/{args.use_triton_adaln}/{args.use_triton_mlp}, "
             f"CuTe attention={args.use_cute_window_attn}",
             "",
