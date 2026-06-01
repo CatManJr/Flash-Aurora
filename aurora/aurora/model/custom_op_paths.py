@@ -1,8 +1,9 @@
 """Glue between Aurora model forward paths and custom CUDA/Triton/CuTe ops.
 
 Custom kernels declare supported I/O dtypes; inference presets keep custom Swin paths
-outside ``torch.autocast``. Explicit BF16 presets cast activations at the backbone
-boundary instead of relying on autocast promotion rules.
+outside ``torch.autocast``. The ``bf16_mixed`` preset casts activations at the backbone
+boundary and routes backbone ``F.linear`` matmuls through BF16 (Tensor Core), mimicking
+autocast coverage without wrapping custom kernels in ``torch.autocast``.
 """
 
 from __future__ import annotations
@@ -44,7 +45,45 @@ def run_with_encoder_decoder_autocast(
     with encoder_decoder_autocast(enabled=enabled):
         return fn(*args, **kwargs)
 
-_TRITON_ELEM_DTYPES = frozenset({torch.float32, torch.bfloat16})
+
+@contextmanager
+def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
+    """Route backbone ``F.linear`` matmuls through BF16 on CUDA inference (Tensor Core).
+
+    Patches ``torch.nn.functional.linear`` for the duration of a backbone forward so QKV,
+    projection, MLP, and patch-merge linears match ``pytorch_autocast`` matmul coverage while
+    Triton/CuTe custom ops stay outside ``torch.autocast``.
+    """
+    if not enabled:
+        yield
+        return
+
+    _orig_linear = torch.nn.functional.linear
+
+    def _bf16_linear(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            input.is_cuda
+            and not torch.is_grad_enabled()
+            and input.dtype in _TRITON_ELEM_DTYPES
+        ):
+            matmul_dtype = torch.bfloat16
+            if input.dtype != matmul_dtype:
+                input = input.to(matmul_dtype)
+            weight = weight.to(device=input.device, dtype=matmul_dtype)
+            if bias is not None:
+                bias = bias.to(device=input.device, dtype=matmul_dtype)
+            return _orig_linear(input, weight, bias)
+        return _orig_linear(input, weight, bias)
+
+    torch.nn.functional.linear = _bf16_linear  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        torch.nn.functional.linear = _orig_linear
 
 
 def backbone_dtype_from_name(name: BackboneComputeDtype) -> torch.dtype:
@@ -73,40 +112,42 @@ def run_backbone_with_dtype_routing(
     *,
     autocast: bool,
     backbone_compute_dtype: torch.dtype | None = None,
+    backbone_matmul_bf16: bool = False,
     lead_time: Any,
     patch_res: tuple[int, int, int],
     rollout_step: int,
 ) -> torch.Tensor:
     """Shared backbone entry for eager forward and CUDA graph capture."""
     decoder_dtype = x.dtype
-    if autocast:
-        if torch.cuda.is_available():
-            device_type = "cuda"
-        elif torch.xpu.is_available():
-            device_type = "xpu"
-        else:
-            device_type = "cpu"
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            x = backbone(
-                x,
-                lead_time=lead_time,
-                patch_res=patch_res,
-                rollout_step=rollout_step,
-            )
-        return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
+    with backbone_bf16_matmul_context(enabled=backbone_matmul_bf16):
+        if autocast:
+            if torch.cuda.is_available():
+                device_type = "cuda"
+            elif torch.xpu.is_available():
+                device_type = "xpu"
+            else:
+                device_type = "cpu"
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                x = backbone(
+                    x,
+                    lead_time=lead_time,
+                    patch_res=patch_res,
+                    rollout_step=rollout_step,
+                )
+            return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
 
-    if backbone_compute_dtype is not None and x.dtype != backbone_compute_dtype:
-        x = prepare_backbone_input(x, backbone_compute_dtype)
+        if backbone_compute_dtype is not None and x.dtype != backbone_compute_dtype:
+            x = prepare_backbone_input(x, backbone_compute_dtype)
 
-    x = backbone(
-        x,
-        lead_time=lead_time,
-        patch_res=patch_res,
-        rollout_step=rollout_step,
-    )
+        x = backbone(
+            x,
+            lead_time=lead_time,
+            patch_res=patch_res,
+            rollout_step=rollout_step,
+        )
 
-    if backbone_compute_dtype is not None:
-        return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
+        if backbone_compute_dtype is not None:
+            return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
     return x
 
 

@@ -231,8 +231,11 @@ class Perceiver3DDecoder(nn.Module):
         surf_preds = surf_preds.squeeze(2)  # (B, V_S, H, W)
 
         # Embed the atmospheric levels.
+        from aurora.model.inference_tensors import cached_constant_tensor
+
         atmos_levels_encode = levels_expansion(
-            torch.tensor(atmos_levels, device=x.device), self.embed_dim
+            cached_constant_tensor(atmos_levels, device=x.device, dtype=torch.float32),
+            self.embed_dim,
         ).to(dtype=x.dtype)
         levels_embed = self.atmos_levels_embed(atmos_levels_encode)  # (C_A, D)
 

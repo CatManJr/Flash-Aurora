@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Copyright (c) Catman Jr. Licensed under the MIT license.
 
-Full-model Aurora benchmark: compare six Swin3D optimization tiers on throughput and VRAM.
+Full-model Aurora benchmark: compare five Swin3D optimization tiers on throughput and VRAM.
 
 Tiers (accuracy reference = ``fp32``):
 
@@ -9,36 +9,41 @@ Tiers (accuracy reference = ``fp32``):
 2. ``pytorch_autocast`` — PyTorch backbone BF16 autocast
 3. ``fast_fp32``        — Triton Swin + native Perceiver
 4. ``tf32_1x``          — ``fast_fp32`` + CuTe 1×TF32 window attention
-5. ``bf16_mixed``       — ``fast_fp32`` + explicit BF16 CuTe window attention
-6. ``full_bf16``        — full-model BF16 mixed precision + Perceiver FlashAttention
+5. ``bf16_mixed``       — ``fast_fp32`` + explicit BF16 backbone (CuTe attn + BF16 matmuls)
 
-All tiers except ``full_bf16`` use native Perceiver (PyTorch SDPA). Each tier rebuilds
+All tiers use native Perceiver (PyTorch SDPA). Each tier rebuilds
 the model and fully purges GPU state before timing.
 
 Examples::
 
-    uv run python benchmark/bench_aurora_precision_matrix.py
-    uv run python benchmark/bench_aurora_precision_matrix.py --preset medium
-    uv run python benchmark/bench_aurora_precision_matrix.py --batch-size 4 --repeat 50
+    # Default: Aurora 0.25° pretrained, production grid (721×1440), auto batch @ 90% VRAM
+    CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_precision_matrix.py
+
+    # Quick sanity on debug small model
+    uv run python benchmark/bench_aurora_precision_matrix.py --model small --preset medium --no-auto-batch
+
+    # Full model, fixed batch, CUDA graph on supported tiers
+    CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_precision_matrix.py \\
+        --batch-size 1 --cuda-graph --verify-paths
 
 Unless ``--batch-size`` is set, batch size is auto-probed to target ``--vram-fraction`` (default
 90%) of total GPU memory using a conservative fp32 forward before the tier matrix runs.
+On ``--preset production`` (721×1440) each probe forward can take several minutes; use
+``--batch-size 1`` to skip probing, or watch ``[auto-vram]`` progress lines.
 Use ``--preset smoke`` (32×64) only for quick sanity checks; ``bf16_mixed`` may crash there
 (N<32 CuTe limitation).
 
 Default grid is ``--preset production`` (721×1440, ERA5 0.25° global, patch_res 4×180×360).
-
-Uses ``AuroraSmallPretrained`` (debug-scale embed_dim=256). Swin/CuTe wins are much larger on
-the full Aurora checkpoint and ``--preset production`` grid; see script output section breakdown.
+Default model is ``--model full`` (``AuroraPretrained`` + ``aurora-0.25-pretrained.ckpt``).
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import gc
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -67,6 +72,17 @@ _GRID_PRESETS: dict[str, tuple[int, int]] = {
     "smoke": (32, 64),  # tiny; bf16_mixed may hit N<32 CuTe limitation
 }
 
+_MODEL_PRESETS: dict[str, dict[str, str]] = {
+    "full": {
+        "checkpoint": "aurora-0.25-pretrained.ckpt",
+        "description": "Aurora 0.25° pretrained (embed=512, 48 Swin blocks)",
+    },
+    "small": {
+        "checkpoint": "aurora-0.25-small-pretrained.ckpt",
+        "description": "AuroraSmallPretrained debug model (embed=256, 20 Swin blocks)",
+    },
+}
+
 _DEFAULT_VRAM_FRACTION = 0.90
 _DEFAULT_BATCH_CAP = 512
 _PROBE_PRECISION = "fp32"  # conservative vs all tiers (weights + activations)
@@ -76,9 +92,16 @@ _BENCH_TIERS: tuple[tuple[str, str, str], ...] = (
     ("pytorch_autocast", "pytorch_autocast", "PyTorch backbone BF16 autocast"),
     ("fast_fp32", "fast_fp32", "Triton Swin + native Perceiver"),
     ("tf32_1x", "tf32_1x", "fast_fp32 + CuTe 1×TF32 attention"),
-    ("bf16_mixed", "bf16_mixed", "fast_fp32 + CuTe BF16 attention"),
-    ("full_bf16", "full_bf16", "Full-model BF16 + Perceiver FlashAttention"),
+    ("bf16_mixed", "bf16_mixed", "fast_fp32 + explicit BF16 backbone (CuTe + matmuls)"),
 )
+
+
+@dataclass(frozen=True)
+class ModelBuildOptions:
+    model_name: str
+    use_lora: bool = False
+    lora_mode: str = "single"
+    use_lora_merged_inference: bool = True
 
 
 @dataclass
@@ -93,6 +116,40 @@ class TierResult:
     max_abs_diff_vs_baseline: float | None
     mean_abs_diff_vs_baseline: float | None
     max_rel_diff_vs_baseline: float | None
+    cuda_graph: bool = False
+
+
+def _get_model_class(model_name: str) -> type:
+    from aurora import AuroraPretrained, AuroraSmallPretrained
+
+    if model_name == "full":
+        return AuroraPretrained
+    if model_name == "small":
+        return AuroraSmallPretrained
+    raise ValueError(f"Unknown model {model_name!r}; expected one of: {', '.join(_MODEL_PRESETS)}")
+
+
+def _model_common_kwargs(opts: ModelBuildOptions) -> dict[str, Any]:
+    return {
+        "use_lora": opts.use_lora,
+        "lora_mode": opts.lora_mode,
+        "use_lora_merged_inference": opts.use_lora_merged_inference,
+    }
+
+
+def _swin_block_count(model: Any) -> int:
+    backbone = model.backbone
+    return sum(len(layer.blocks) for layer in backbone.encoder_layers) + sum(
+        len(layer.blocks) for layer in backbone.decoder_layers
+    )
+
+
+def _model_summary(model: Any) -> str:
+    attn = model.backbone.encoder_layers[0].blocks[0].attn
+    return (
+        f"embed={model.backbone.embed_dim} swin_blocks={_swin_block_count(model)} "
+        f"lora_merged={getattr(attn, 'use_lora_merged_inference', False)}"
+    )
 
 
 def _purge_gpu(*objs: Any) -> None:
@@ -169,6 +226,54 @@ def _gpu_total_mb(device: torch.device) -> float:
     return props.total_memory / 1e6
 
 
+def _build_model(
+    precision: str,
+    state_dict: dict[str, torch.Tensor],
+    device: torch.device,
+    *,
+    build_opts: ModelBuildOptions,
+) -> Any:
+    model_cls = _get_model_class(build_opts.model_name)
+    model = model_cls(
+        **_model_common_kwargs(build_opts),
+        inference_precision=precision,
+    )
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys:
+        print(
+            f"[warn] load_state_dict missing {len(incompatible.missing_keys)} keys "
+            f"(first: {incompatible.missing_keys[:3]})"
+        )
+    if incompatible.unexpected_keys:
+        print(
+            f"[warn] load_state_dict unexpected {len(incompatible.unexpected_keys)} keys "
+            f"(first: {incompatible.unexpected_keys[:3]})"
+        )
+    model.eval()
+    return model.to(device)
+
+
+def _maybe_capture_cuda_graph(model: Any, batch: Any, *, precision: str, enabled: bool) -> bool:
+    if not enabled:
+        return False
+    from aurora.model.inference_precision import resolve_inference_config
+
+    cfg = resolve_inference_config(precision)
+    if cfg is None or cfg.cuda_graph_scope == "off":
+        return False
+    try:
+        model.capture_inference_cuda_graph(batch, warmup_iters=2)
+    except RuntimeError as exc:
+        print(
+            f"[cuda-graph] capture failed for {precision}: {exc}\n"
+            "[cuda-graph] continuing with eager forward for this tier"
+        )
+        model.clear_inference_cuda_graph()
+        return False
+    print(f"[cuda-graph] captured scope={cfg.cuda_graph_scope} for {precision}")
+    return True
+
+
 def _forward_peak_mb(
     model: Any,
     batch: Any,
@@ -190,8 +295,9 @@ def _forward_peak_fits_target(
     device: torch.device,
     target_peak_mb: float,
     precision: str,
+    build_opts: ModelBuildOptions,
 ) -> tuple[bool, float]:
-    model = _build_model(precision, state_dict, device)
+    model = _build_model(precision, state_dict, device, build_opts=build_opts)
     try:
         peak_mb = _forward_peak_mb(model, batch, device)
         return peak_mb <= target_peak_mb, peak_mb
@@ -204,6 +310,55 @@ def _forward_peak_fits_target(
         _purge_gpu(model, batch)
 
 
+def _probe_batch_peak(
+    *,
+    state_dict: dict[str, torch.Tensor],
+    device: torch.device,
+    batch_size: int,
+    h: int,
+    w: int,
+    history: int,
+    levels: tuple[int | float, ...],
+    target_peak_mb: float,
+    build_opts: ModelBuildOptions,
+) -> tuple[bool, float]:
+    """Run one fp32 probe forward; log progress (production grids can take minutes)."""
+    print(
+        f"[auto-vram] probing batch={batch_size} grid={h}x{w} precision={_PROBE_PRECISION}...",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    batch = _load_batch_synthetic(
+        batch_size=batch_size,
+        h=h,
+        w=w,
+        history=history,
+        levels=levels,
+        device=device,
+    )
+    fits, peak_mb = _forward_peak_fits_target(
+        state_dict=state_dict,
+        batch=batch,
+        device=device,
+        target_peak_mb=target_peak_mb,
+        precision=_PROBE_PRECISION,
+        build_opts=build_opts,
+    )
+    elapsed = time.perf_counter() - t0
+    if peak_mb == float("inf"):
+        note = "OOM"
+    elif fits:
+        note = "ok"
+    else:
+        note = "over budget"
+    print(
+        f"[auto-vram]   batch={batch_size} peak={peak_mb:.0f} MB "
+        f"(target {target_peak_mb:.0f} MB) elapsed={elapsed:.1f}s → {note}",
+        flush=True,
+    )
+    return fits, peak_mb
+
+
 def _auto_batch_size_for_vram(
     *,
     state_dict: dict[str, torch.Tensor],
@@ -214,83 +369,78 @@ def _auto_batch_size_for_vram(
     levels: tuple[int | float, ...],
     target_fraction: float,
     cap: int,
+    build_opts: ModelBuildOptions,
 ) -> tuple[int, float, float, float]:
     """Pick the largest batch whose fp32 forward peak stays within ``target_fraction`` of total VRAM."""
     total_mb = _gpu_total_mb(device)
     target_peak_mb = total_mb * target_fraction
+    print(
+        f"[auto-vram] GPU total={total_mb:.0f} MB, target peak={target_peak_mb:.0f} MB "
+        f"({target_fraction:.0%}), cap={cap}",
+        flush=True,
+    )
 
-    if not _forward_peak_fits_target(
+    fits, peak_mb = _probe_batch_peak(
         state_dict=state_dict,
-        batch=_load_batch_synthetic(
-            batch_size=1,
+        device=device,
+        batch_size=1,
+        h=h,
+        w=w,
+        history=history,
+        levels=levels,
+        target_peak_mb=target_peak_mb,
+        build_opts=build_opts,
+    )
+    if not fits:
+        print(
+            f"[auto-vram] batch=1 alone exceeds {target_fraction:.0%} of VRAM; using batch_size=1.",
+            flush=True,
+        )
+        return 1, peak_mb if peak_mb != float("inf") else total_mb, total_mb, target_peak_mb
+
+    best_batch = 1
+    best_peak = peak_mb
+    first_fail: int | None = None
+    probe = 2
+    while probe <= cap:
+        fits, peak_mb = _probe_batch_peak(
+            state_dict=state_dict,
+            device=device,
+            batch_size=probe,
             h=h,
             w=w,
             history=history,
             levels=levels,
-            device=device,
-        ),
-        device=device,
-        target_peak_mb=target_peak_mb,
-        precision=_PROBE_PRECISION,
-    )[0]:
-        print(
-            f"[auto-vram] batch=1 peak exceeds {target_fraction:.0%} of total "
-            f"({total_mb:.0f} MB); using batch_size=1."
-        )
-        peak_mb = _forward_peak_fits_target(
-            state_dict=state_dict,
-            batch=_load_batch_synthetic(
-                batch_size=1, h=h, w=w, history=history, levels=levels, device=device
-            ),
-            device=device,
-            target_peak_mb=float("inf"),
-            precision=_PROBE_PRECISION,
-        )[1]
-        return 1, peak_mb, total_mb, target_peak_mb
-
-    lo, hi = 1, max(1, cap)
-    best_batch = 1
-    best_peak = float("inf")
-
-    # Expand hi until OOM or cap when still below target.
-    while hi < cap:
-        fits, peak_mb = _forward_peak_fits_target(
-            state_dict=state_dict,
-            batch=_load_batch_synthetic(
-                batch_size=hi, h=h, w=w, history=history, levels=levels, device=device
-            ),
-            device=device,
             target_peak_mb=target_peak_mb,
-            precision=_PROBE_PRECISION,
+            build_opts=build_opts,
         )
         if fits:
-            best_batch, best_peak = hi, peak_mb
-            if hi >= cap:
-                break
-            hi = min(cap, hi * 2)
+            best_batch, best_peak = probe, peak_mb
+            probe *= 2
             continue
+        first_fail = probe
         break
 
-    if hi > lo and best_batch < hi:
-        # Binary search between last good batch and first failing bound.
-        fail_hi = hi
-        lo = best_batch
-        while lo < fail_hi:
-            mid = (lo + fail_hi + 1) // 2
-            fits, peak_mb = _forward_peak_fits_target(
+    if first_fail is not None and best_batch + 1 < first_fail:
+        lo, hi = best_batch, first_fail - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            fits, peak_mb = _probe_batch_peak(
                 state_dict=state_dict,
-                batch=_load_batch_synthetic(
-                    batch_size=mid, h=h, w=w, history=history, levels=levels, device=device
-                ),
                 device=device,
+                batch_size=mid,
+                h=h,
+                w=w,
+                history=history,
+                levels=levels,
                 target_peak_mb=target_peak_mb,
-                precision=_PROBE_PRECISION,
+                build_opts=build_opts,
             )
             if fits:
                 lo = mid
                 best_batch, best_peak = mid, peak_mb
             else:
-                fail_hi = mid - 1
+                hi = mid - 1
 
     return best_batch, best_peak, total_mb, target_peak_mb
 
@@ -323,25 +473,47 @@ def _diff_vs_reference(
     return max_diff, mean_diff, max_rel
 
 
-def _load_shared_state_dict(checkpoint_path: Path) -> dict[str, torch.Tensor]:
-    from aurora import AuroraSmallPretrained
+def _checkpoint_has_lora(checkpoint_path: Path) -> bool:
+    payload = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
+    return any("lora_" in key for key in payload)
 
-    model = AuroraSmallPretrained(use_lora=True, lora_mode="single")
-    model.load_checkpoint_local(str(checkpoint_path), strict=False)
+
+def _resolve_lora_for_checkpoint(
+    *,
+    checkpoint_path: Path,
+    use_lora: bool,
+) -> bool:
+    """Align ``use_lora`` with checkpoint contents; pretrained ckpts have no LoRA tensors."""
+    ckpt_has_lora = _checkpoint_has_lora(checkpoint_path)
+    if use_lora and not ckpt_has_lora:
+        print(
+            "[config] checkpoint has no LoRA weights (pretrained base); "
+            "building model with use_lora=False"
+        )
+        return False
+    if not use_lora and ckpt_has_lora:
+        print(
+            "[warn] checkpoint contains LoRA weights; pass --use-lora to load them "
+            "(otherwise strict load may fail or LoRA stays uninitialized)"
+        )
+    return use_lora
+
+
+def _load_shared_state_dict(checkpoint_path: Path, *, build_opts: ModelBuildOptions) -> dict[str, torch.Tensor]:
+    model_cls = _get_model_class(build_opts.model_name)
+    model = model_cls(**_model_common_kwargs(build_opts))
+    try:
+        model.load_checkpoint_local(str(checkpoint_path), strict=True)
+    except RuntimeError as exc:
+        if build_opts.use_lora:
+            print(
+                "[warn] strict load failed with use_lora=True; "
+                f"retrying with strict=False ({exc.__class__.__name__})"
+            )
+        else:
+            print(f"[warn] strict checkpoint load failed; retrying with strict=False: {exc}")
+        model.load_checkpoint_local(str(checkpoint_path), strict=False)
     return {k: v.detach().cpu() for k, v in model.state_dict().items()}
-
-
-def _build_model(precision: str, state_dict: dict[str, torch.Tensor], device: torch.device) -> Any:
-    from aurora import AuroraSmallPretrained
-
-    model = AuroraSmallPretrained(
-        use_lora=True,
-        lora_mode="single",
-        inference_precision=precision,
-    )
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    return model.to(device)
 
 
 def _time_forward(
@@ -381,8 +553,98 @@ def _time_forward(
             peak_reserved = float("nan")
 
     ms_per = ms_total / repeat
-    fps = 1000.0 / ms_per if ms_per > 0 else float("inf")
     return ms_per, peak_alloc, peak_reserved
+
+
+def _verify_runtime_paths(model: Any, batch: Any) -> None:
+    """One-shot sanity check that custom kernels fire on an optimized preset."""
+    from collections import Counter
+
+    from aurora.model.custom_op_paths import can_use_cute_qkvpacked, can_use_cute_window_attention
+    from aurora.model import swin3d
+    from aurora.model.lora import LoRARollout
+    import aurora.ops.triton_swin3d_layout as layout_mod
+    import aurora.ops.triton_gelu as gelu_mod
+    import aurora.ops.triton_adaln as adaln_mod
+
+    counts: Counter[str] = Counter()
+    originals: dict[str, Any] = {}
+
+    def patch(module: Any, name: str, counter_key: str) -> None:
+        fn = getattr(module, name)
+        originals[counter_key] = fn
+
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            counts[counter_key] += 1
+            return fn(*args, **kwargs)
+
+        setattr(module, name, wrapped)
+
+    patch(layout_mod, "roll_pad_partition_windows_triton", "triton_layout")
+    patch(gelu_mod, "gelu_forward_triton", "triton_gelu")
+    patch(adaln_mod, "adaptive_layernorm_film_add_residual_forward", "triton_adaln_res")
+
+    orig_attn_fwd = swin3d.WindowAttention.forward
+
+    def attn_fwd(self: Any, x: torch.Tensor, mask: torch.Tensor | None = None, rollout_step: int = 0) -> torch.Tensor:
+        if isinstance(self.lora_qkv, LoRARollout):
+            qkv = self._linear_with_optional_lora_merge(
+                x, self.qkv, self.lora_qkv, step=rollout_step, cache_name="qkv"
+            )
+        else:
+            qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
+        attn_dropout = self.attn_drop if self.training else 0.0
+        if can_use_cute_qkvpacked(
+            qkv,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            cute_enabled=self.use_cute_window_attn,
+            training=self.training,
+            attn_dropout=attn_dropout,
+        ):
+            counts["cute_qkvpacked"] += 1
+        elif can_use_cute_window_attention(
+            qkv,
+            enabled=self.use_cute_window_attn,
+            training=self.training,
+            attn_dropout=attn_dropout,
+        ):
+            counts["cute_split"] += 1
+        else:
+            counts["window_sdpa"] += 1
+        return orig_attn_fwd(self, x, mask, rollout_step)
+
+    swin3d.WindowAttention.forward = attn_fwd  # type: ignore[method-assign]
+
+    n_blocks = _swin_block_count(model)
+    with torch.inference_mode():
+        model.forward(batch)
+
+    swin3d.WindowAttention.forward = orig_attn_fwd
+    for counter_key, fn in originals.items():
+        if counter_key == "triton_layout":
+            layout_mod.roll_pad_partition_windows_triton = fn
+        elif counter_key == "triton_gelu":
+            gelu_mod.gelu_forward_triton = fn
+        elif counter_key == "triton_adaln_res":
+            adaln_mod.adaptive_layernorm_film_add_residual_forward = fn
+
+    cfg = model.inference_config
+    print("\n[verify-paths] runtime kernel counts (single forward):")
+    print(
+        f"  preset={cfg.precision.value if cfg else 'n/a'} "
+        f"triton_layout={counts['triton_layout']}/{n_blocks} "
+        f"triton_adaln_res={counts['triton_adaln_res']}/{2 * n_blocks} "
+        f"triton_gelu={counts['triton_gelu']}/{n_blocks}"
+    )
+    print(
+        f"  cute_qkvpacked={counts['cute_qkvpacked']}/{n_blocks} "
+        f"cute_split={counts['cute_split']} window_sdpa={counts['window_sdpa']}"
+    )
+    if cfg and cfg.use_triton_layout and counts["triton_layout"] == 0:
+        print("[verify-paths] WARN: Triton layout expected but count is 0")
+    if cfg and cfg.use_cute_window_attn and counts["cute_qkvpacked"] + counts["cute_split"] == 0:
+        print("[verify-paths] WARN: CuTe window attn expected but count is 0")
 
 
 def _run_tier(
@@ -396,11 +658,14 @@ def _run_tier(
     warmup: int,
     repeat: int,
     baseline_pred: dict[str, torch.Tensor] | None,
+    build_opts: ModelBuildOptions,
+    cuda_graph: bool,
 ) -> TierResult:
     print(f"\n{'=' * 72}\n[tier] {key} ({precision}) — {label}\n{'=' * 72}")
     _purge_gpu()
 
-    model = _build_model(precision, state_dict, device)
+    model = _build_model(precision, state_dict, device, build_opts=build_opts)
+    graph_captured = _maybe_capture_cuda_graph(model, batch, precision=precision, enabled=cuda_graph)
     ms_per, peak_alloc, peak_reserved = _time_forward(
         model, batch, warmup=warmup, repeat=repeat, device=device
     )
@@ -418,8 +683,9 @@ def _run_tier(
             f"max_rel_diff={max_rel:.6e} vs baseline"
         )
 
+    graph_note = " (cuda-graph)" if graph_captured else ""
     print(
-        f"[timing] {ms_per:.3f} ms/forward ({1000.0 / ms_per:.2f} forwards/s)\n"
+        f"[timing] {ms_per:.3f} ms/forward ({1000.0 / ms_per:.2f} forwards/s){graph_note}\n"
         f"[mem] peak allocated={peak_alloc:.1f} MB, peak reserved={peak_reserved:.1f} MB"
     )
 
@@ -435,6 +701,7 @@ def _run_tier(
         max_abs_diff_vs_baseline=max_diff,
         mean_abs_diff_vs_baseline=mean_diff,
         max_rel_diff_vs_baseline=max_rel,
+        cuda_graph=graph_captured,
     )
 
 
@@ -479,6 +746,12 @@ def _print_summary(results: list[TierResult]) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Aurora full-model precision/throughput matrix benchmark.")
+    p.add_argument(
+        "--model",
+        choices=tuple(_MODEL_PRESETS),
+        default="full",
+        help="Model preset: full = Aurora 0.25° pretrained (default), small = debug AuroraSmallPretrained.",
+    )
     p.add_argument(
         "--batch-size",
         type=int,
@@ -531,7 +804,32 @@ def main() -> None:
     p.add_argument("--repeat", type=int, default=30)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--checkpoint-dir", type=str, default=_DEFAULT_CHECKPOINT_DIR)
-    p.add_argument("--checkpoint", type=str, default="")
+    p.add_argument(
+        "--checkpoint",
+        type=str,
+        default="",
+        help="Explicit checkpoint path (overrides default for --model).",
+    )
+    p.add_argument(
+        "--use-lora",
+        action="store_true",
+        help="Build with LoRA adapters (for finetuned checkpoints). Default off for pretrained ckpts.",
+    )
+    p.add_argument(
+        "--no-lora-merge",
+        action="store_true",
+        help="When --use-lora: disable LoRA weight merge during inference (extra qkv/proj GEMMs).",
+    )
+    p.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Capture CUDA graph before timing on tiers that support it (tf32_1x, bf16_mixed).",
+    )
+    p.add_argument(
+        "--verify-paths",
+        action="store_true",
+        help="Run one forward with kernel counters on tf32_1x before the tier matrix.",
+    )
     p.add_argument("--report-out", type=str, default="")
     args = p.parse_args()
 
@@ -551,18 +849,30 @@ def main() -> None:
     if args.batch_cap < 1:
         raise SystemExit("--batch-cap must be >= 1.")
 
+    model_spec = _MODEL_PRESETS[args.model]
+
     from aurora.model.checkpoint_local import resolve_checkpoint_path
 
     device = torch.device(args.device)
+    ckpt_filename = model_spec["checkpoint"]
     ckpt_path = resolve_checkpoint_path(
-        filename="aurora-0.25-small-pretrained.ckpt",
+        filename=ckpt_filename,
         checkpoint_dir=args.checkpoint_dir,
         explicit_path=args.checkpoint or None,
         allow_hub_download=False,
     )
 
+    use_lora = _resolve_lora_for_checkpoint(checkpoint_path=ckpt_path, use_lora=args.use_lora)
+    build_opts = ModelBuildOptions(
+        model_name=args.model,
+        use_lora=use_lora,
+        use_lora_merged_inference=use_lora and not args.no_lora_merge,
+    )
+
+    print(f"[startup] loading checkpoint {ckpt_path} ...", flush=True)
     _purge_gpu()
-    state_dict = _load_shared_state_dict(ckpt_path)
+    state_dict = _load_shared_state_dict(ckpt_path, build_opts=build_opts)
+    print(f"[startup] checkpoint loaded ({len(state_dict)} tensors on CPU)", flush=True)
     _purge_gpu()
 
     levels = tuple(args.levels)
@@ -582,6 +892,7 @@ def main() -> None:
             levels=levels,
             target_fraction=args.vram_fraction,
             cap=args.batch_cap,
+            build_opts=build_opts,
         )
         auto_vram_note = (
             f" auto_vram={args.vram_fraction:.0%} target={target_mb:.0f}MB "
@@ -594,10 +905,15 @@ def main() -> None:
         )
 
     print(f"[config] device={torch.cuda.get_device_name(device)}")
+    print(f"[config] model={args.model} — {model_spec['description']}")
     print(
         f"[config] batch={batch_size} preset={args.preset} "
         f"grid={synthetic_h}x{synthetic_w} warmup={args.warmup} repeat={args.repeat}"
         f"{auto_vram_note}"
+    )
+    print(
+        f"[config] use_lora={build_opts.use_lora} lora_merged={build_opts.use_lora_merged_inference} "
+        f"cuda_graph={args.cuda_graph} CUTE_DSL_ARCH={os.environ.get('CUTE_DSL_ARCH', '(unset)')}"
     )
     print(f"[checkpoint] {ckpt_path}")
 
@@ -610,11 +926,17 @@ def main() -> None:
         device=device,
     )
 
+    probe_model = _build_model("tf32_1x", state_dict, device, build_opts=build_opts)
+    print(f"[model] {_model_summary(probe_model)}")
+    if args.verify_paths:
+        _verify_runtime_paths(probe_model, batch)
+    _purge_gpu(probe_model, batch)
+
     results: list[TierResult] = []
     baseline_pred: dict[str, torch.Tensor] | None = None
 
     _purge_gpu()
-    ref_model = _build_model("fp32", state_dict, device)
+    ref_model = _build_model("fp32", state_dict, device, build_opts=build_opts)
     with torch.inference_mode():
         baseline_pred = _prediction_tensors(ref_model.forward(batch))
     _purge_gpu(ref_model)
@@ -630,6 +952,8 @@ def main() -> None:
             warmup=args.warmup,
             repeat=args.repeat,
             baseline_pred=None if key == "fp32" else baseline_pred,
+            build_opts=build_opts,
+            cuda_graph=args.cuda_graph,
         )
         results.append(result)
         batch = _load_batch_synthetic(
@@ -650,25 +974,29 @@ def main() -> None:
             "# Aurora precision matrix benchmark",
             "",
             f"- device: {torch.cuda.get_device_name(device)}",
+            f"- model: {args.model} ({model_spec['description']})",
             f"- checkpoint: {ckpt_path}",
             f"- batch_size: {batch_size}",
             f"- vram_fraction: {args.vram_fraction}",
             f"- preset: {args.preset}",
             f"- grid: {synthetic_h}x{synthetic_w}",
+            f"- lora_merged: {build_opts.use_lora_merged_inference}",
+            f"- cuda_graph_flag: {args.cuda_graph}",
             f"- warmup/repeat: {args.warmup}/{args.repeat}",
             "",
-            "| tier | precision | ms/forward | forwards/s | peak alloc MB | peak reserved MB | speedup vs baseline | max abs diff | mean abs diff |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| tier | precision | ms/forward | forwards/s | peak alloc MB | peak reserved MB | speedup vs baseline | cuda graph | max abs diff | mean abs diff |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |",
         ]
         baseline_ms = results[0].ms_per_forward
         for row in results:
             speedup = baseline_ms / row.ms_per_forward
             max_d = "" if row.max_abs_diff_vs_baseline is None else f"{row.max_abs_diff_vs_baseline:.6e}"
             mean_d = "" if row.mean_abs_diff_vs_baseline is None else f"{row.mean_abs_diff_vs_baseline:.6e}"
+            graph = "yes" if row.cuda_graph else "no"
             lines.append(
                 f"| {row.key} | {row.precision} | {row.ms_per_forward:.3f} | "
                 f"{row.forwards_per_sec:.2f} | {row.peak_alloc_mb:.1f} | {row.peak_reserved_mb:.1f} | "
-                f"{speedup:.2f}x | {max_d} | {mean_d} |"
+                f"{speedup:.2f}x | {graph} | {max_d} | {mean_d} |"
             )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"\n[report] {path.resolve()}")

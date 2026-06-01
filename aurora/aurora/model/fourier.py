@@ -65,11 +65,15 @@ class FourierExpansion(nn.Module):
         in_range_or_zero = torch.all(
             torch.logical_or(in_range, x == 0)
         )  # Allow zeros to pass through.
-        if self.assert_range and not in_range_or_zero:
-            raise AssertionError(
-                f"The input tensor is not within the configured range"
-                f" `[{self.lower}, {self.upper}]`."
+        if self.assert_range:
+            capturing = (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
             )
+            if not capturing and not bool(in_range_or_zero.item()):
+                raise AssertionError(
+                    f"The input tensor is not within the configured range"
+                    f" `[{self.lower}, {self.upper}]`."
+                )
 
         # We will use half of the dimensionality for `sin` and the other half for `cos`.
         if not (d % 2 == 0):

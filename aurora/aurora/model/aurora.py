@@ -179,8 +179,8 @@ class Aurora(torch.nn.Module):
                 (BF16 I/O, FP32 accumulators); float32 tensors use the TF32 CuTe kernel when
                 enabled. Requires ``attn_drop=0``. Defaults to ``False``.
             inference_precision (str, optional): Named preset — ``fp32``, ``pytorch_autocast``,
-                ``fast_fp32`` (Triton Swin + native Perceiver), ``tf32_1x``, ``bf16_mixed``,
-                or ``full_bf16`` (full-model BF16 + Perceiver FlashAttention).
+                ``fast_fp32`` (Triton Swin + native Perceiver), ``tf32_1x``, or ``bf16_mixed``
+                (custom Triton/CuTe Swin with explicit BF16 backbone matmuls).
                 Overrides scattered ``use_triton_*`` / ``use_cute_window_attn`` / ``autocast``
                 flags below when set.
             surf_stats (dict[str, tuple[float, float]], optional): For these surface-level
@@ -419,8 +419,9 @@ class Aurora(torch.nn.Module):
     ) -> None:
         """Capture a fixed-shape CUDA graph for inference replay.
 
-        ``scope`` defaults to the active precision preset (``full_gpu`` for fast presets,
-        otherwise ``backbone`` when explicitly requested). Perceiver modules stay PyTorch naive.
+        Preset default is ``backbone`` (Swin only): encoder/decoder stay eager because they
+        use Python metadata and validation not safe under full-graph capture. ``full_gpu`` is
+        experimental and may fail on encoder paths.
         """
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA graph capture requires CUDA.")
@@ -510,19 +511,21 @@ class Aurora(torch.nn.Module):
         from aurora.model.custom_op_paths import run_backbone_with_dtype_routing
 
         backbone_compute_dtype = None
-        if (
-            self.autocast_encoder_decoder
-            and self.inference_config is not None
-            and self.inference_config.backbone_compute_dtype == "bfloat16"
-            and self.inference_config.precision != AuroraInferencePrecision.FULL_BF16
-        ):
-            backbone_compute_dtype = self.cute_window_attn_dtype
+        backbone_matmul_bf16 = False
+        if self.inference_config is not None:
+            backbone_matmul_bf16 = self.inference_config.backbone_matmul_bf16
+            if (
+                not self.autocast
+                and self.inference_config.backbone_compute_dtype == "bfloat16"
+            ):
+                backbone_compute_dtype = self.cute_window_attn_dtype
 
         return run_backbone_with_dtype_routing(
             self.backbone,
             x,
             autocast=self.autocast,
             backbone_compute_dtype=backbone_compute_dtype,
+            backbone_matmul_bf16=backbone_matmul_bf16,
             lead_time=lead_time,
             patch_res=patch_res,
             rollout_step=rollout_step,

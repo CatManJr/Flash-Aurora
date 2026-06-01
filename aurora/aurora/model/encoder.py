@@ -332,7 +332,13 @@ class Perceiver3DEncoder(nn.Module):
         x_surf = x_surf + self.surf_norm(self.surf_mlp(x_surf))
 
         # Add atmospheric pressure encoding of shape (C_A, D) and subsequent embedding.
-        atmos_levels_tensor = torch.tensor(atmos_levels, device=x_atmos.device)
+        from aurora.model.inference_tensors import cached_constant_tensor
+
+        atmos_levels_tensor = cached_constant_tensor(
+            atmos_levels,
+            device=x_atmos.device,
+            dtype=torch.float32,
+        )
         atmos_levels_encode = levels_expansion(atmos_levels_tensor, self.embed_dim).to(dtype=dtype)
         atmos_levels_embed = self.atmos_levels_embed(atmos_levels_encode)[None, :, None, :]
         x_atmos = x_atmos + atmos_levels_embed  # (B, C_A, L, D)
@@ -368,8 +374,13 @@ class Perceiver3DEncoder(nn.Module):
         x = x + lead_time_emb.unsqueeze(1)  # (B, L', D) + (B, 1, D)
 
         # Add absolute time embedding.
-        absolute_times_list = [t.timestamp() / 3600 for t in batch.metadata.time]  # Times in hours
-        absolute_times = torch.tensor(absolute_times_list, dtype=torch.float32, device=x.device)
+        from aurora.model.inference_tensors import cached_absolute_hours_tensor
+
+        absolute_times = cached_absolute_hours_tensor(
+            batch.metadata.time,
+            device=x.device,
+            dtype=torch.float32,
+        )
         absolute_time_encode = absolute_time_expansion(absolute_times, self.embed_dim)
         absolute_time_embed = self.absolute_time_embed(absolute_time_encode.to(dtype=dtype))
         x = x + absolute_time_embed.unsqueeze(1)  # (B, L, D) + (B, 1, D)

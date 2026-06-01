@@ -574,11 +574,11 @@ def main() -> None:
     )
     p.add_argument(
         "--inference-precision",
-        choices=("fp32", "pytorch_autocast", "fast_fp32", "tf32_1x", "bf16_mixed", "full_bf16"),
+        choices=("fp32", "pytorch_autocast", "fast_fp32", "tf32_1x", "bf16_mixed"),
         default=None,
         help=(
             "Apply one of the five inference presets (overrides scattered flags): "
-            "fp32, pytorch_autocast, fast_fp32, tf32_1x, bf16_mixed, full_bf16."
+            "fp32, pytorch_autocast, fast_fp32, tf32_1x, bf16_mixed."
         ),
     )
     p.add_argument(

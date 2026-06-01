@@ -1,0 +1,60 @@
+"""CUDA graph capture tests."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import pytest
+import torch
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _smoke_batch(*, batch_size: int = 1, h: int = 32, w: int = 64) -> "Batch":
+    from aurora import Batch, Metadata
+
+    levels = (100, 250, 500, 850)
+    return Batch(
+        surf_vars={k: torch.randn(batch_size, 2, h, w) for k in ("2t", "10u", "10v", "msl")},
+        static_vars={k: torch.randn(h, w) for k in ("lsm", "z", "slt")},
+        atmos_vars={
+            k: torch.randn(batch_size, 2, len(levels), h, w) for k in ("z", "u", "v", "t", "q")
+        },
+        metadata=Metadata(
+            lat=torch.linspace(90, -90, h),
+            lon=torch.linspace(0, 360, w + 1)[:-1],
+            time=(datetime(2020, 6, 1, 12, 0),),
+            atmos_levels=levels,
+        ),
+    ).to("cuda")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="CuTe tf32_1x preset targets recent NVIDIA GPUs",
+)
+def test_backbone_cuda_graph_capture_tf32_1x() -> None:
+    from aurora.model.aurora import AuroraSmallPretrained
+    from aurora.model.checkpoint_local import resolve_checkpoint_path
+    from aurora.model.inference_tensors import clear_constant_tensor_cache
+
+    clear_constant_tensor_cache()
+    ckpt = resolve_checkpoint_path(
+        filename="aurora-0.25-small-pretrained.ckpt",
+        checkpoint_dir="/root/autodl-tmp/aurora",
+        allow_hub_download=False,
+    )
+    batch = _smoke_batch()
+    model = AuroraSmallPretrained(use_lora=False, inference_precision="tf32_1x")
+    model.load_checkpoint_local(str(ckpt), strict=False)
+    model.eval().cuda()
+
+    model.capture_inference_cuda_graph(batch, warmup_iters=2)
+    assert model._cuda_graph_runner is not None
+    assert model._cuda_graph_scope == "backbone"
+
+    with torch.inference_mode():
+        out = model.forward(batch)
+    assert out.surf_vars["2t"].shape == (1, 1, 32, 64)
+
+    clear_constant_tensor_cache()

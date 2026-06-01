@@ -138,6 +138,8 @@ class CudaGraphAuroraBackboneRunner:
         lead_time: Any,
         rollout_step: int,
         autocast: bool = False,
+        backbone_compute_dtype: torch.dtype | None = None,
+        backbone_matmul_bf16: bool = False,
         warmup_iters: int = 3,
     ) -> None:
         if not x.is_cuda:
@@ -149,6 +151,8 @@ class CudaGraphAuroraBackboneRunner:
         self.lead_time = lead_time
         self.rollout_step = rollout_step
         self.autocast = autocast
+        self.backbone_compute_dtype = backbone_compute_dtype
+        self.backbone_matmul_bf16 = backbone_matmul_bf16
         self.graph = torch.cuda.CUDAGraph()
 
         self.static_x.copy_(x)
@@ -174,6 +178,8 @@ class CudaGraphAuroraBackboneRunner:
                 self.backbone,
                 self.static_x,
                 autocast=self.autocast,
+                backbone_compute_dtype=self.backbone_compute_dtype,
+                backbone_matmul_bf16=self.backbone_matmul_bf16,
                 lead_time=self.lead_time,
                 patch_res=self.patch_res,
                 rollout_step=self.rollout_step,
@@ -260,8 +266,8 @@ class CudaGraphAuroraGpuRunner:
             return run_with_encoder_decoder_autocast(
                 self.model.decoder,
                 x,
-                enabled=self.autocast_encoder_decoder,
                 self.static_batch,
+                enabled=self.autocast_encoder_decoder,
                 patch_res=self.patch_res,
                 lead_time=self.lead_time,
             )
@@ -294,6 +300,13 @@ def build_aurora_cuda_graph_runner(
     if scope == "backbone":
         if backbone_input is None:
             raise ValueError("backbone_input is required for scope='backbone'.")
+        inf = getattr(model, "inference_config", None)
+        backbone_compute_dtype = None
+        backbone_matmul_bf16 = False
+        if inf is not None and not autocast_backbone:
+            if inf.backbone_compute_dtype == "bfloat16":
+                backbone_compute_dtype = model.cute_window_attn_dtype
+            backbone_matmul_bf16 = inf.backbone_matmul_bf16
         return CudaGraphAuroraBackboneRunner(
             model.backbone,
             backbone_input,
@@ -301,6 +314,8 @@ def build_aurora_cuda_graph_runner(
             lead_time=model.timestep,
             rollout_step=rollout_step,
             autocast=autocast_backbone,
+            backbone_compute_dtype=backbone_compute_dtype,
+            backbone_matmul_bf16=backbone_matmul_bf16,
             warmup_iters=warmup_iters,
         )
     if scope == "full_gpu":
