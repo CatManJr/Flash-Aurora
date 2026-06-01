@@ -189,9 +189,9 @@ def _measure_block_stages(
             )
             use_cute_qkvpacked = (
                 use_cute
-                and qkv.dtype == torch.bfloat16
                 and qkv.is_contiguous()
                 and qkv.shape[-1] == 3 * attn.num_heads * head_dim
+                and qkv.dtype in (torch.bfloat16, torch.float32)
             )
             if not use_cute_qkvpacked:
                 def _qkv_layout():

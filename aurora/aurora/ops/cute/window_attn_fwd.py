@@ -35,6 +35,7 @@ try:
     from ._kernel_fp32_v2 import (
         WindowAttnFwdTF32V2,
         _get_or_compile_tf32_v2,
+        _get_or_compile_tf32_qkvpacked,
     )
     from cutlass import Float32
 
@@ -286,7 +287,7 @@ def window_attn_fwd_cute_qkvpacked(
     tile_n: Optional[int] = None,
     output_layout: str = "bhnd",
 ) -> torch.Tensor:
-    """BF16 CuTe attention reading Q/K/V directly from packed ``qkv``.
+    """CuTe attention reading Q/K/V directly from packed ``qkv``.
 
     ``qkv`` is the contiguous output of ``Linear(dim, 3 * dim)`` with shape
     ``(Bwin, N, 3 * num_heads * head_dim)``.  This creates zero-copy strided
@@ -294,10 +295,15 @@ def window_attn_fwd_cute_qkvpacked(
     those strides, avoiding the three explicit ``q/k/v.contiguous()`` copies in
     the Swin3D inference path.
 
+    Supports ``torch.bfloat16`` (BF16 mixed) and ``torch.float32`` (TF32 MMA).
+
     ``output_layout="bnc"`` returns a contiguous ``(Bwin, N, H * Dh)`` tensor by
     passing a strided ``(Bwin, H, N, Dh)`` view into the unchanged CuTe kernel.
     """
-    assert qkv.dtype == torch.bfloat16, "qkv-packed CuTe path currently supports BF16 only"
+    if qkv.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(
+            f"qkv-packed CuTe path supports bfloat16 and float32; got {qkv.dtype}"
+        )
     if qkv.ndim != 3:
         raise ValueError(f"qkv must have shape (Bwin, N, 3*C); got {tuple(qkv.shape)}")
     if not qkv.is_contiguous():
@@ -347,25 +353,45 @@ def window_attn_fwd_cute_qkvpacked(
         out_kernel = out
     scale_log2 = Float32(math.log2(math.e) * scale_qk)
     has_bias = bias is not None
+    is_bf16 = qkv.dtype == torch.bfloat16
 
-    _tile_n = tile_n if tile_n is not None else _choose_tile_n(N, head_dim=Dh, tile_m=tile_m)
-    if _tile_n >= N:
-        fn = _get_or_compile_bf16_qkvpacked(
+    if is_bf16:
+        _tile_n = tile_n if tile_n is not None else _choose_tile_n(N, head_dim=Dh, tile_m=tile_m)
+        if _tile_n >= N:
+            fn = _get_or_compile_bf16_qkvpacked(
+                head_dim=Dh, seq_len=N, has_bias=has_bias,
+                tile_m=tile_m, tile_n=_tile_n,
+                q=q, k=k, v=v, o=out_kernel, bias_or_none=bias,
+                output_layout=output_layout,
+            )
+            v_run = v
+        else:
+            return window_attn_fwd_cute(
+                q.contiguous(), k.contiguous(), v.contiguous(), bias=bias,
+                scale_qk=scale_qk, precision=WinAttnPrecision.BF16_MIXED,
+                tile_m=tile_m, tile_n=_tile_n,
+            )
+    else:
+        _tile_n = tile_n if tile_n is not None else _choose_tile_n_tf32(N, head_dim=Dh, tile_m=tile_m)
+        if _tile_n < N:
+            return window_attn_fwd_cute(
+                q.contiguous(), k.contiguous(), v.contiguous(), bias=bias,
+                scale_qk=scale_qk, precision=WinAttnPrecision.TF32_ACC_FP32,
+                tile_m=tile_m, tile_n=_tile_n,
+            )
+        if Dh % 16 == 0:
+            v_compile, v_run = v, v
+        else:
+            v_compile = v.to(torch.bfloat16)
+            v_run = v_compile
+        fn = _get_or_compile_tf32_qkvpacked(
             head_dim=Dh, seq_len=N, has_bias=has_bias,
             tile_m=tile_m, tile_n=_tile_n,
-            q=q, k=k, v=v, o=out_kernel, bias_or_none=bias,
+            q=q, k=k, v=v_compile, o=out_kernel, bias_or_none=bias,
             output_layout=output_layout,
         )
-    else:
-        # Streaming v2 can already overlap K/V loads; keep the existing contiguous
-        # path until a strided v2 compile is validated separately.
-        return window_attn_fwd_cute(
-            q.contiguous(), k.contiguous(), v.contiguous(), bias=bias,
-            scale_qk=scale_qk, precision=WinAttnPrecision.BF16_MIXED,
-            tile_m=tile_m, tile_n=_tile_n,
-        )
 
-    fn(q, k, v, out_kernel, bias, scale_log2)
+    fn(q, k, v_run, out_kernel, bias, scale_log2)
     return out
 
 
