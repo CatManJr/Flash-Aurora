@@ -164,16 +164,19 @@ def test_aurora_constructor_applies_bf16_mixed_preset() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_backbone_bf16_matmul_context_routes_linear_to_bf16() -> None:
+def test_backbone_bf16_matmul_context_keeps_bf16_activation_chain() -> None:
     from aurora.model.custom_op_paths import backbone_bf16_matmul_context
 
     linear = torch.nn.Linear(32, 16, bias=True).cuda().float()
-    x = torch.randn(4, 32, device="cuda", dtype=torch.float32)
+    norm = torch.nn.LayerNorm(16).cuda().float()
+    x = torch.randn(4, 32, device="cuda", dtype=torch.bfloat16)
 
     with torch.inference_mode():
         with backbone_bf16_matmul_context(enabled=True):
             y = linear(x)
-    assert y.dtype == torch.float32
+            z = norm(y)
+    assert y.dtype == torch.bfloat16
+    assert z.dtype == torch.bfloat16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

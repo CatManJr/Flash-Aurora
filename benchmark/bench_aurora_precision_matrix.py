@@ -116,6 +116,7 @@ class TierResult:
     max_abs_diff_vs_baseline: float | None
     mean_abs_diff_vs_baseline: float | None
     max_rel_diff_vs_baseline: float | None
+    cosine_sim_vs_baseline: float | None
     cuda_graph: bool = False
 
 
@@ -456,10 +457,11 @@ def _prediction_tensors(pred: Any) -> dict[str, torch.Tensor]:
 def _diff_vs_reference(
     reference: dict[str, torch.Tensor],
     candidate: dict[str, torch.Tensor],
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     max_diff = 0.0
     max_rel = 0.0
     total = 0.0
+    cos_total = 0.0
     count = 0
     for key, ref in reference.items():
         cand = candidate[key]
@@ -468,9 +470,22 @@ def _diff_vs_reference(
         denom = ref.abs().clamp_min(1e-6)
         max_rel = max(max_rel, float((diff / denom).max().item()))
         total += float(diff.mean().item())
+
+        ref_flat = ref.flatten().double()
+        cand_flat = cand.flatten().double()
+        ref_norm = ref_flat.norm()
+        cand_norm = cand_flat.norm()
+        if ref_norm.item() == 0.0 and cand_norm.item() == 0.0:
+            cos = 1.0
+        elif ref_norm.item() == 0.0 or cand_norm.item() == 0.0:
+            cos = 0.0
+        else:
+            cos = float(torch.dot(ref_flat, cand_flat).item() / (ref_norm.item() * cand_norm.item()))
+        cos_total += cos
         count += 1
     mean_diff = total / max(count, 1)
-    return max_diff, mean_diff, max_rel
+    mean_cosine = cos_total / max(count, 1)
+    return max_diff, mean_diff, max_rel, mean_cosine
 
 
 def _checkpoint_has_lora(checkpoint_path: Path) -> bool:
@@ -673,14 +688,15 @@ def _run_tier(
     max_diff: float | None = None
     mean_diff: float | None = None
     max_rel: float | None = None
+    cosine_sim: float | None = None
     if baseline_pred is not None:
         with torch.inference_mode():
             pred = model.forward(batch)
         cand = _prediction_tensors(pred)
-        max_diff, mean_diff, max_rel = _diff_vs_reference(baseline_pred, cand)
+        max_diff, mean_diff, max_rel, cosine_sim = _diff_vs_reference(baseline_pred, cand)
         print(
             f"[accuracy] max_abs_diff={max_diff:.6e} mean_abs_diff={mean_diff:.6e} "
-            f"max_rel_diff={max_rel:.6e} vs baseline"
+            f"max_rel_diff={max_rel:.6e} cosine_sim={cosine_sim:.6f} vs baseline"
         )
 
     graph_note = " (cuda-graph)" if graph_captured else ""
@@ -701,6 +717,7 @@ def _run_tier(
         max_abs_diff_vs_baseline=max_diff,
         mean_abs_diff_vs_baseline=mean_diff,
         max_rel_diff_vs_baseline=max_rel,
+        cosine_sim_vs_baseline=cosine_sim,
         cuda_graph=graph_captured,
     )
 
@@ -710,7 +727,7 @@ def _print_summary(results: list[TierResult]) -> None:
     print(f"\n{'=' * 72}\nSummary (baseline = {results[0].key if results else 'n/a'})\n{'=' * 72}")
     header = (
         f"{'tier':<14}{'ms/fwd':>10}{'thrpt':>10}{'peak MB':>10}{'reserved':>10}"
-        f"{'speedup':>9}{'max|Δ|':>12}{'mean|Δ|':>12}{'max rel':>10}"
+        f"{'speedup':>9}{'max|Δ|':>12}{'mean|Δ|':>12}{'max rel':>10}{'cos sim':>10}"
     )
     print(header)
     print("-" * len(header))
@@ -731,6 +748,11 @@ def _print_summary(results: list[TierResult]) -> None:
             if row.max_rel_diff_vs_baseline is not None
             else "   (ref)"
         )
+        cos_d = (
+            f"{row.cosine_sim_vs_baseline:.6f}"
+            if row.cosine_sim_vs_baseline is not None
+            else "   (ref)"
+        )
         print(
             f"{row.key:<14}"
             f"{row.ms_per_forward:>10.3f}"
@@ -741,6 +763,7 @@ def _print_summary(results: list[TierResult]) -> None:
             f"{max_d:>12}"
             f"{mean_d:>12}"
             f"{rel_d:>10}"
+            f"{cos_d:>10}"
         )
 
 
@@ -984,19 +1007,20 @@ def main() -> None:
             f"- cuda_graph_flag: {args.cuda_graph}",
             f"- warmup/repeat: {args.warmup}/{args.repeat}",
             "",
-            "| tier | precision | ms/forward | forwards/s | peak alloc MB | peak reserved MB | speedup vs baseline | cuda graph | max abs diff | mean abs diff |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |",
+            "| tier | precision | ms/forward | forwards/s | peak alloc MB | peak reserved MB | speedup vs baseline | cuda graph | max abs diff | mean abs diff | cosine sim |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
         ]
         baseline_ms = results[0].ms_per_forward
         for row in results:
             speedup = baseline_ms / row.ms_per_forward
             max_d = "" if row.max_abs_diff_vs_baseline is None else f"{row.max_abs_diff_vs_baseline:.6e}"
             mean_d = "" if row.mean_abs_diff_vs_baseline is None else f"{row.mean_abs_diff_vs_baseline:.6e}"
+            cos_d = "" if row.cosine_sim_vs_baseline is None else f"{row.cosine_sim_vs_baseline:.6f}"
             graph = "yes" if row.cuda_graph else "no"
             lines.append(
                 f"| {row.key} | {row.precision} | {row.ms_per_forward:.3f} | "
                 f"{row.forwards_per_sec:.2f} | {row.peak_alloc_mb:.1f} | {row.peak_reserved_mb:.1f} | "
-                f"{speedup:.2f}x | {graph} | {max_d} | {mean_d} |"
+                f"{speedup:.2f}x | {graph} | {max_d} | {mean_d} | {cos_d} |"
             )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"\n[report] {path.resolve()}")

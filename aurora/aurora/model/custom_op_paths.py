@@ -47,17 +47,18 @@ def run_with_encoder_decoder_autocast(
 
 @contextmanager
 def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
-    """Route backbone ``F.linear`` matmuls through BF16 Tensor Core, keep FP32 activations.
+    """Route backbone matmuls through BF16 Tensor Core with a BF16 activation chain.
 
-    Mimics ``torch.autocast`` matmul promotion without wrapping Triton/CuTe ops: each ``F.linear``
-    runs under a narrow BF16 autocast region, then outputs are cast back to the input activation
-    dtype so LayerNorm and other FP32-weight ops stay valid.
+    ``F.linear`` runs under narrow BF16 autocast and keeps BF16 outputs (no per-layer cast
+    back to FP32). ``F.layer_norm`` runs statistics in FP32 and returns BF16 to match the
+    chain — same split as ``torch.autocast`` without wrapping Triton/CuTe custom ops.
     """
     if not enabled:
         yield
         return
 
     _orig_linear = torch.nn.functional.linear
+    _orig_layer_norm = torch.nn.functional.layer_norm
 
     def _bf16_linear(
         input: torch.Tensor,
@@ -69,19 +70,41 @@ def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
             and not torch.is_grad_enabled()
             and input.dtype in _TRITON_ELEM_DTYPES
         ):
-            activation_dtype = input.dtype
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = _orig_linear(input, weight, bias)
-            if out.dtype != activation_dtype:
-                out = out.to(dtype=activation_dtype)
-            return out
+                return _orig_linear(input, weight, bias)
         return _orig_linear(input, weight, bias)
 
+    def _bf16_layer_norm(
+        input: torch.Tensor,
+        normalized_shape: int | list[int] | torch.Size,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        eps: float = 1e-5,
+    ) -> torch.Tensor:
+        if (
+            enabled
+            and input.is_cuda
+            and not torch.is_grad_enabled()
+            and input.dtype == torch.bfloat16
+        ):
+            with torch.autocast(device_type="cuda", enabled=False):
+                out = _orig_layer_norm(
+                    input.float(),
+                    normalized_shape,
+                    weight,
+                    bias,
+                    eps=eps,
+                )
+            return out.to(dtype=torch.bfloat16)
+        return _orig_layer_norm(input, normalized_shape, weight, bias, eps=eps)
+
     torch.nn.functional.linear = _bf16_linear  # type: ignore[method-assign]
+    torch.nn.functional.layer_norm = _bf16_layer_norm  # type: ignore[method-assign]
     try:
         yield
     finally:
         torch.nn.functional.linear = _orig_linear
+        torch.nn.functional.layer_norm = _orig_layer_norm
 
 
 @contextmanager
@@ -201,7 +224,10 @@ def run_backbone_with_dtype_routing(
                 )
             return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
 
-        if backbone_compute_dtype is not None and x.dtype != backbone_compute_dtype:
+        if backbone_matmul_bf16 and not autocast:
+            if x.dtype != torch.bfloat16:
+                x = prepare_backbone_input(x, torch.bfloat16)
+        elif backbone_compute_dtype is not None and x.dtype != backbone_compute_dtype:
             x = prepare_backbone_input(x, backbone_compute_dtype)
 
         x = backbone(
@@ -211,6 +237,8 @@ def run_backbone_with_dtype_routing(
             rollout_step=rollout_step,
         )
 
+        if backbone_matmul_bf16 and not autocast:
+            return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
         if backbone_compute_dtype is not None:
             return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
     return x

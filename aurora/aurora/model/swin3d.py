@@ -327,7 +327,6 @@ class WindowAttention(nn.Module):
             x = rearrange(x, "B H N D -> B N (H D)")
         if x.dtype != activation_dtype:
             x = x.to(dtype=activation_dtype)
-        if isinstance(self.lora_proj, LoRARollout):
             x = self._linear_with_optional_lora_merge(
                 x,
                 self.proj,
