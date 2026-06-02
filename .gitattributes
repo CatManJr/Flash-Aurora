@@ -1,0 +1,2 @@
+# GitHub Linguist: Aurora example notebooks are docs, not core repo code.
+aurora/docs/**/*.ipynb linguist-documentation
