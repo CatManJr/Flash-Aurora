@@ -5,6 +5,9 @@ those portions are licensed under the MIT License (see LICENSE).
 
 Fused LayerNorm (no affine) + FiLM modulation for :class:`AdaptiveLayerNorm` inference.
 Optional fused residual add: ``out = residual + film(ln(x))`` in one kernel.
+
+The ``output_fp32`` path loads BF16 (or FP32) activations, computes in FP32, and
+stores FP32 — avoiding a separate ``tensor.to(float32)`` before the norm boundary.
 """
 
 from __future__ import annotations
@@ -30,14 +33,17 @@ def adaptive_layernorm_film_forward(
     shift: torch.Tensor,
     scale_bias: float,
     eps: float = 1e-5,
+    *,
+    output_fp32: bool = False,
 ) -> torch.Tensor:
     """Match ``AdaptiveLayerNorm.forward`` when ``ln`` has ``elementwise_affine=False``.
 
     Args:
         x: ``(B, L, D)`` float32 or bfloat16 CUDA.
-        scale, shift: ``(B, 1, D)`` same dtype CUDA (broadcast over ``L``).
+        scale, shift: ``(B, 1, D)`` CUDA (typically same dtype as ``x``).
         scale_bias: Added to ``scale`` before multiply (same as module).
         eps: LayerNorm epsilon.
+        output_fp32: If ``True``, write FP32 outputs (LN math still in FP32).
 
     Returns:
         ``(B, L, D)`` tensor.
@@ -48,7 +54,8 @@ def adaptive_layernorm_film_forward(
     if D > _MAX_D:
         raise ValueError(f"adaptive_layernorm_film_forward supports D <= {_MAX_D} for now.")
     assert scale.shape == (B, 1, D) and shift.shape == (B, 1, D)
-    out = torch.empty_like(x)
+    out_dtype = torch.float32 if output_fp32 else x.dtype
+    out = torch.empty(B, L, D, device=x.device, dtype=out_dtype)
     grid = (B * L,)
     _adaln_film_blocked_kernel[grid](
         x,
@@ -62,7 +69,10 @@ def adaptive_layernorm_film_forward(
         scale_bias=float(scale_bias),
         eps=float(eps),
         WITH_RESIDUAL=False,
-        DTYPE=_TRITON_DTYPE[x.dtype],
+        X_DTYPE=_TRITON_DTYPE[x.dtype],
+        RES_DTYPE=_TRITON_DTYPE[x.dtype],
+        MOD_DTYPE=_TRITON_DTYPE[scale.dtype],
+        STORE_FP32=output_fp32,
     )
     return out
 
@@ -74,17 +84,21 @@ def adaptive_layernorm_film_add_residual_forward(
     shift: torch.Tensor,
     scale_bias: float,
     eps: float = 1e-5,
+    *,
+    output_fp32: bool = False,
 ) -> torch.Tensor:
     """``residual + film(ln(x))`` with the same math as :func:`adaptive_layernorm_film_forward`.
 
-    Avoids materializing the intermediate AdaLN output before the residual add.
+    When ``output_fp32=True``, ``residual`` must be FP32 and ``x`` may be BF16/FP32; the
+    result is FP32 (norm boundary for ``bf16_mixed`` backbone without a pre-kernel copy).
 
     Args:
         residual: ``(B, L, D)`` float32 or bfloat16 CUDA (must not alias ``x``).
-        x: ``(B, L, D)`` same dtype CUDA, input to LayerNorm + FiLM.
-        scale, shift: ``(B, 1, D)`` same dtype CUDA.
+        x: ``(B, L, D)`` CUDA, input to LayerNorm + FiLM.
+        scale, shift: ``(B, 1, D)`` CUDA.
         scale_bias: Added to ``scale`` before multiply.
         eps: LayerNorm epsilon.
+        output_fp32: Store FP32 outputs; allows ``residual`` (FP32) and ``x`` (BF16) to differ.
 
     Returns:
         ``(B, L, D)`` tensor.
@@ -93,15 +107,20 @@ def adaptive_layernorm_film_add_residual_forward(
         raise ValueError("adaptive_layernorm_film_add_residual_forward requires CUDA tensors.")
     if residual.dtype not in _SUPPORTED_DTYPES or x.dtype not in _SUPPORTED_DTYPES:
         raise ValueError("adaptive_layernorm_film_add_residual_forward requires float32/bfloat16.")
-    if residual.dtype != x.dtype:
-        raise ValueError("residual and x must have the same dtype.")
+    if not output_fp32 and residual.dtype != x.dtype:
+        raise ValueError("residual and x must have the same dtype unless output_fp32=True.")
+    if output_fp32 and residual.dtype != torch.float32:
+        raise ValueError("output_fp32=True requires residual.dtype == float32.")
     if residual.shape != x.shape:
         raise ValueError("residual and x must have the same shape.")
     B, L, D = x.shape
     if D > _MAX_D:
-        raise ValueError(f"adaptive_layernorm_film_add_residual_forward supports D <= {_MAX_D}.")
+        raise ValueError(
+            f"adaptive_layernorm_film_add_residual_forward supports D <= {_MAX_D}."
+        )
     assert scale.shape == (B, 1, D) and shift.shape == (B, 1, D)
-    out = torch.empty_like(x)
+    out_dtype = torch.float32 if output_fp32 else x.dtype
+    out = torch.empty(B, L, D, device=x.device, dtype=out_dtype)
     grid = (B * L,)
     _adaln_film_blocked_kernel[grid](
         x,
@@ -115,7 +134,10 @@ def adaptive_layernorm_film_add_residual_forward(
         scale_bias=float(scale_bias),
         eps=float(eps),
         WITH_RESIDUAL=True,
-        DTYPE=_TRITON_DTYPE[x.dtype],
+        X_DTYPE=_TRITON_DTYPE[x.dtype],
+        RES_DTYPE=_TRITON_DTYPE[residual.dtype],
+        MOD_DTYPE=_TRITON_DTYPE[scale.dtype],
+        STORE_FP32=output_fp32,
     )
     return out
 
@@ -133,12 +155,16 @@ def _adaln_film_blocked_kernel(
     scale_bias: tl.constexpr,
     eps: tl.constexpr,
     WITH_RESIDUAL: tl.constexpr,
-    DTYPE: tl.constexpr,
+    X_DTYPE: tl.constexpr,
+    RES_DTYPE: tl.constexpr,
+    MOD_DTYPE: tl.constexpr,
+    STORE_FP32: tl.constexpr,
 ):
     """Per (B,L) row: LN + FiLM; optionally add residual from ``residual_ptr``.
 
-    Loads and stores in ``DTYPE`` (float32 or bfloat16); all reductions and
-    arithmetic are performed in float32 for numerical stability.
+    Loads ``x`` / residual / modulation in ``X_DTYPE`` / ``RES_DTYPE`` / ``MOD_DTYPE``;
+    all reductions and arithmetic are in FP32. Stores FP32 when ``STORE_FP32``, else
+    rounds to ``X_DTYPE``.
     """
     row = tl.program_id(0)
     b = row // L
@@ -168,4 +194,7 @@ def _adaln_film_blocked_kernel(
         if WITH_RESIDUAL:
             rv = tl.load(residual_ptr + row * D + offs, mask=mask, other=0.0).to(tl.float32)
             y = y + rv
-        tl.store(out_ptr + row * D + offs, y.to(DTYPE), mask=mask)
+        if STORE_FP32:
+            tl.store(out_ptr + row * D + offs, y, mask=mask)
+        else:
+            tl.store(out_ptr + row * D + offs, y.to(X_DTYPE), mask=mask)

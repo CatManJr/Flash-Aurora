@@ -397,12 +397,14 @@ def _run_ablate_cute(
 def _print_table(
     rows: list[tuple[str, str, float, float, float, float, float, float | None]],
 ) -> None:
+    """Print summary rows sorted by ``ms`` ascending (fastest tier first)."""
+    rows_sorted = sorted(rows, key=lambda r: r[2])
     print(
         f"\n{'tier':<18} {'ms':>8} {'speedup':>8} {'max_abs':>10} {'mean_abs':>10} "
         f"{'max_rel':>10} {'cos_sim':>8}"
     )
     print("-" * 88)
-    for key, _label, ms, speedup, max_abs, mean_abs, max_rel, cos in rows:
+    for key, _label, ms, speedup, max_abs, mean_abs, max_rel, cos in rows_sorted:
         speedup_s = f"{speedup:.2f}x" if speedup is not None else "  base"
         print(
             f"{key:<18} {ms:8.1f} {speedup_s:>8} {max_abs:10.4g} {mean_abs:10.4g} "

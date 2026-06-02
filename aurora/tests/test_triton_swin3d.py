@@ -195,8 +195,60 @@ def test_adaln_forward_add_residual_bf16_activation_output_fp32() -> None:
     x = torch.randn(2, 32, dim, device="cuda", dtype=torch.bfloat16)
     c = torch.randn(2, ctx, device="cuda", dtype=torch.float32)
     with torch.no_grad():
+        shift, scale = m.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
+        x_fp32 = x.float()
+        ref = residual + m.ln(x_fp32) * (m.scale_bias + scale) + shift
         out = m.forward_add_residual(residual, x, c)
     assert out.dtype == torch.float32
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@requires_cuda
+def test_adaln_fp32_out_op_matches_explicit_cast() -> None:
+    from aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
+
+    torch.manual_seed(45)
+    dim = 256
+    residual = torch.randn(2, 48, dim, device="cuda", dtype=torch.float32)
+    x = torch.randn(2, 48, dim, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(2, 1, dim, device="cuda", dtype=torch.bfloat16)
+    shift = torch.randn(2, 1, dim, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        ref = adaptive_layernorm_film_add_residual_forward(
+            residual,
+            x.float(),
+            scale.float(),
+            shift.float(),
+            0.0,
+            1e-5,
+            output_fp32=False,
+        )
+        fused = adaptive_layernorm_film_add_residual_forward(
+            residual,
+            x,
+            scale,
+            shift,
+            0.0,
+            1e-5,
+            output_fp32=True,
+        )
+    assert fused.dtype == torch.float32
+    torch.testing.assert_close(fused, ref, rtol=0, atol=0)
+
+
+@requires_cuda
+def test_adaln_forward_add_residual_matches_reference_fp32_out() -> None:
+    """Fused FP32-out path matches eager residual + forward for all-FP32."""
+    torch.manual_seed(41)
+    dim, ctx = 256, 256
+    m = AdaptiveLayerNorm(dim, ctx, use_triton=True).cuda().eval()
+    residual = torch.randn(2, 64, dim, device="cuda", dtype=torch.float32)
+    x = torch.randn(2, 64, dim, device="cuda", dtype=torch.float32)
+    c = torch.randn(2, ctx, device="cuda", dtype=torch.float32)
+    with torch.no_grad():
+        ref = residual + m(x, c)
+        fused = m.forward_add_residual(residual, x, c)
+    torch.testing.assert_close(fused, ref, rtol=1e-5, atol=1e-5)
 
 
 @requires_cuda
