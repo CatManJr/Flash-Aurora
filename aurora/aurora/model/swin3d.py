@@ -71,7 +71,22 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
-        x = self.fc1(x)
+        from aurora.model.custom_op_paths import (
+            backbone_bf16_matmul_active,
+            backbone_bf16_mlp_matmul_scope,
+        )
+
+        use_bf16_mlp = (
+            backbone_bf16_matmul_active()
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+            and x.dtype in (torch.float32, torch.bfloat16)
+        )
+        if use_bf16_mlp:
+            with backbone_bf16_mlp_matmul_scope():
+                x = self.fc1(x)
+        else:
+            x = self.fc1(x)
         if can_use_triton_gelu(
             x,
             enabled=self.use_triton_gelu,
@@ -84,7 +99,11 @@ class MLP(nn.Module):
         else:
             x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
+        if use_bf16_mlp:
+            with backbone_bf16_mlp_matmul_scope():
+                x = self.fc2(x)
+        else:
+            x = self.fc2(x)
         x = self.drop(x)
         return x
 
@@ -248,19 +267,20 @@ class WindowAttention(nn.Module):
         Returns:
             torch.Tensor: Output of shape `(nW*B, N, C)`.
         """
-        from aurora.model.custom_op_paths import backbone_bf16_matmul_active
+        from aurora.model.custom_op_paths import (
+            backbone_bf16_matmul_active,
+            cast_activation_dtype,
+        )
 
-        bf16_gemm_chain = (
+        bf16_cute_attn = (
             backbone_bf16_matmul_active()
             and self.cute_window_attn_dtype == torch.bfloat16
             and x.is_cuda
             and not torch.is_grad_enabled()
         )
-        # Pre-BF16-hook path: upcast stray BF16 activations before FP32 QKV. With bf16_mixed,
-        # keep FP32/BF16 inputs and let hooked F.linear emit BF16 for CuTe.
-        if x.dtype == torch.bfloat16 and not bf16_gemm_chain:
-            x = x.float()
-        gemm_dtype = torch.bfloat16 if bf16_gemm_chain else x.dtype
+        # MLP-only BF16: QKV/proj stay FP32 (like autocast); cast to BF16 only for CuTe attn.
+        if x.dtype == torch.bfloat16 and not bf16_cute_attn:
+            x = cast_activation_dtype(x, torch.float32)
 
         if isinstance(self.lora_qkv, LoRARollout):
             qkv = self._linear_with_optional_lora_merge(
@@ -349,8 +369,8 @@ class WindowAttention(nn.Module):
             else:
                 x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
             x = rearrange(x, "B H N D -> B N (H D)")
-        if x.dtype != gemm_dtype:
-            x = x.to(dtype=gemm_dtype, non_blocking=True)
+        if bf16_cute_attn and x.dtype == torch.bfloat16:
+            x = cast_activation_dtype(x, torch.float32)
         if isinstance(self.lora_proj, LoRARollout):
             x = self._linear_with_optional_lora_merge(
                 x,

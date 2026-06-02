@@ -435,7 +435,13 @@ def main() -> None:
     parser.add_argument(
         "--compare-hf",
         action="store_true",
-        help="Also run official tol table for fp32 vs HF test-output.pickle",
+        help=(
+            "Also print official tol for fp32 tier vs HF test-output.pickle. "
+            "Informational only: HF gold was generated with Microsoft's reference "
+            "settings (see aurora/tests/test_model.py: model.double(), use_lora=True, "
+            "batch×2), not bench fp32 (use_lora=False, float32 CUDA). "
+            "5/8 on 2t/10u/10v is typical FP32-vs-FP64 drift; use tier-vs-fp32 for preset QA."
+        ),
     )
     parser.add_argument(
         "--no-official-tol",
@@ -540,6 +546,16 @@ def main() -> None:
             )
             tol_rows = _official_tol_rows(hf_ref, baseline)
             _print_official_tol_table("[official tol] fp32 vs HF test-output", tol_rows)
+            passed = sum(1 for r in tol_rows if r[4])
+            if passed < len(tol_rows):
+                print(
+                    "  [note] This run uses inference_precision=fp32, use_lora=False, batch=1. "
+                    "HF pickle is float64 gold from Microsoft's test harness "
+                    "(aurora/tests/test_model.py::test_aurora_small uses model.double() + "
+                    "use_lora=True + batch×2). Slight 2t/10u/10v mean_rel overshoot vs tol "
+                    "does not indicate a broken fp32 preset — compare tiers against fp32 "
+                    "baseline above for kernel/precision QA."
+                )
 
 
 if __name__ == "__main__":

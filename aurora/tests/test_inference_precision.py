@@ -89,6 +89,7 @@ def test_bf16_mixed_preset_uses_explicit_bf16_backbone() -> None:
     assert cfg.backbone_compute_dtype == "float32"
     assert cfg.window_attn_compute_dtype == "bfloat16"
     assert cfg.backbone_matmul_bf16 is True
+    assert cfg.backbone_matmul_tf32 is True
     assert cfg.use_cute_window_attn is True
     assert cfg.autocast_backbone is False
     assert cfg.use_perceiver_flash_attn is False
@@ -159,6 +160,7 @@ def test_aurora_constructor_applies_bf16_mixed_preset() -> None:
     assert model.inference_config is not None
     assert model.inference_config.precision == AuroraInferencePrecision.BF16_MIXED
     assert model.inference_config.backbone_matmul_bf16 is True
+    assert model.inference_config.backbone_matmul_tf32 is True
     assert model.cute_window_attn_dtype == torch.bfloat16
     block = model.backbone.encoder_layers[0].blocks[0]
     assert block.attn.cute_window_attn_dtype == torch.bfloat16
@@ -202,7 +204,7 @@ def test_fast_fp32_backbone_matches_fp32_pytorch_path() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_backbone_bf16_matmul_context_mlp_chain_and_norm_break() -> None:
-    from aurora.model.custom_op_paths import backbone_bf16_matmul_context
+    from aurora.model.custom_op_paths import backbone_matmul_context
     from aurora.model.swin3d import MLP
 
     mlp = MLP(32, hidden_features=64, out_features=16).cuda().float()
@@ -210,7 +212,7 @@ def test_backbone_bf16_matmul_context_mlp_chain_and_norm_break() -> None:
     x = torch.randn(4, 144, 32, device="cuda", dtype=torch.float32)
 
     with torch.inference_mode():
-        with backbone_bf16_matmul_context(enabled=True):
+        with backbone_matmul_context(tf32=True, bf16=True):
             y = mlp(x)
             z = norm(y)
     assert y.dtype == torch.bfloat16
@@ -227,7 +229,7 @@ def test_backbone_bf16_matmul_context_hooks_qkv_linear() -> None:
     with torch.inference_mode():
         with backbone_bf16_matmul_context(enabled=True):
             qkv = linear(x)
-    assert qkv.dtype == torch.bfloat16
+    assert qkv.dtype == torch.float32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

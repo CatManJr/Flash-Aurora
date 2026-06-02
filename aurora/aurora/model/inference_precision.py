@@ -8,9 +8,9 @@ Five named paths:
 4. ``tf32_1x``          — ``fast_fp32`` + TF32 backbone matmuls + CuTe TF32 window attention
 5. ``bf16_mixed``       — ``fast_fp32`` + BF16 backbone matmuls + CuTe BF16 window attention
 
-Custom Triton/CuTe Swin3D paths never run inside ``torch.autocast``. ``bf16_mixed`` routes all
-backbone ``F.linear`` through BF16 Tensor Core (QKV, proj, MLP, patch merge, …) with BF16
-activations between GEMMs; ``F.layer_norm`` uses FP32 statistics on BF16 input (like autocast).
+Custom Triton/CuTe Swin3D paths never run inside ``torch.autocast``. ``bf16_mixed`` uses TF32
+on QKV/proj/patch linears, BF16 on MLP ``fc1→fc2``, CuTe BF16 window attention, and FP32
+LayerNorm stats on MLP output.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ class AuroraInferencePrecision(str, Enum):
     """``fast_fp32`` + TF32 ``F.linear`` matmuls + CuTe TF32 window attention (FP32 activations)."""
 
     BF16_MIXED = "bf16_mixed"
-    """``fast_fp32`` + BF16 backbone ``F.linear`` + FP32 LayerNorm + CuTe BF16 window attention."""
+    """``fast_fp32`` + TF32 QKV/proj + BF16 MLP + CuTe BF16 window attention."""
 
 
 CudaGraphScope = Literal["off", "backbone", "full_gpu"]
@@ -85,9 +85,11 @@ class AuroraInferenceConfig:
                 "Custom Triton/CuTe Swin paths cannot be combined with backbone autocast."
             )
         if self.backbone_matmul_bf16 and self.backbone_matmul_tf32:
-            raise ValueError(
-                "backbone_matmul_bf16 and backbone_matmul_tf32 are mutually exclusive."
-            )
+            if self.precision != AuroraInferencePrecision.BF16_MIXED:
+                raise ValueError(
+                    "backbone_matmul_bf16 and backbone_matmul_tf32 together are only "
+                    "supported for bf16_mixed (MLP BF16 + TF32 QKV/proj)."
+                )
         if self.backbone_matmul_bf16 and self.backbone_compute_dtype != "float32":
             raise ValueError(
                 "backbone_matmul_bf16 requires backbone_compute_dtype='float32' "
@@ -133,8 +135,11 @@ class AuroraInferenceConfig:
         if self.precision == AuroraInferencePrecision.BF16_MIXED:
             if self.autocast_backbone:
                 raise ValueError("BF16_MIXED preset must not use backbone autocast.")
-            if not self.backbone_matmul_bf16 or self.backbone_matmul_tf32:
-                raise ValueError("BF16_MIXED preset requires backbone_matmul_bf16=True and no TF32 matmul.")
+            if not self.backbone_matmul_bf16 or not self.backbone_matmul_tf32:
+                raise ValueError(
+                    "BF16_MIXED preset requires backbone_matmul_bf16=True and "
+                    "backbone_matmul_tf32=True (MLP BF16 + TF32 QKV/proj)."
+                )
             if self.window_attn_compute_dtype != "bfloat16":
                 raise ValueError("BF16_MIXED preset requires CuTe BF16 window attention.")
             if not (self.use_triton_layout and self.use_triton_adaln and self.use_cute_window_attn):
@@ -219,7 +224,7 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
         autocast_backbone=False,
         backbone_compute_dtype="float32",
         backbone_matmul_bf16=True,
-        backbone_matmul_tf32=False,
+        backbone_matmul_tf32=True,
         window_attn_compute_dtype="bfloat16",
         use_triton_layout=True,
         use_triton_adaln=True,

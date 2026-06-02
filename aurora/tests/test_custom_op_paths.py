@@ -52,15 +52,17 @@ def test_can_use_triton_adaln_requires_fp32() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_backbone_bf16_matmul_qkv_linear_emits_bf16() -> None:
-    from aurora.model.custom_op_paths import backbone_bf16_matmul_context
-
-    linear = torch.nn.Linear(32, 96, bias=True).cuda().float()
-    x = torch.randn(4, 144, 32, device="cuda", dtype=torch.float32)
+def test_backbone_bf16_mlp_tf32_hybrid_routing() -> None:
+    from aurora.model.custom_op_paths import backbone_matmul_context
+    from aurora.model.swin3d import MLP
 
     with torch.inference_mode():
-        with backbone_bf16_matmul_context(enabled=True):
-            y = linear(x)
+        with backbone_matmul_context(tf32=True, bf16=True):
+            linear = torch.nn.Linear(32, 96, bias=True).cuda().float()
+            x = torch.randn(4, 144, 32, device="cuda", dtype=torch.float32)
+            assert linear(x).dtype == torch.float32
+            mlp = MLP(32, hidden_features=64, out_features=32).cuda().float()
+            y = mlp(x)
     assert y.dtype == torch.bfloat16
 
 
