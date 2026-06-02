@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from aurora.ops.cute.window_attn_fwd import (
     _CUTE_AVAILABLE,
+    _attention_window_stable,
     _expand_bias_for_sdpa,
     _choose_tile_n,
     _choose_tile_n_tf32,
@@ -67,21 +68,22 @@ def _make_qkv(
     dtype: torch.dtype,
     device: str,
     seed: int = 42,
+    *,
+    activation_scale: float = 0.1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create (q, k, v) with small values to avoid softmax saturation."""
+    """Create (q, k, v); default scale is small, use larger for regression tests."""
     g = torch.Generator(device=device).manual_seed(seed)
     kwargs = dict(dtype=dtype, device=device, generator=g)
-    scale = 0.1
-    q = torch.randn(Bwin, H, N, Dh, **kwargs) * scale
-    k = torch.randn(Bwin, H, N, Dh, **kwargs) * scale
-    v = torch.randn(Bwin, H, N, Dh, **kwargs) * scale
+    q = torch.randn(Bwin, H, N, Dh, **kwargs) * activation_scale
+    k = torch.randn(Bwin, H, N, Dh, **kwargs) * activation_scale
+    v = torch.randn(Bwin, H, N, Dh, **kwargs) * activation_scale
     return q, k, v
 
 
 def _make_bias(nW: int, N: int, device: str, seed: int = 7) -> torch.Tensor:
-    """(nW, N, N) float32 bias simulating a shifted-window mask."""
+    """(nW, N, N) float32 bias simulating a shifted-window mask (-100 like Swin)."""
     bias = torch.zeros(nW, N, N, dtype=torch.float32, device=device)
-    bias[:, N // 2 :, : N // 2] = -1000.0
+    bias[:, N // 2 :, : N // 2] = -100.0
     return bias
 
 
@@ -182,6 +184,104 @@ def test_tf32_output_shape_dtype() -> None:
         out = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32)
     assert out.shape == (Bwin, H, N, Dh)
     assert out.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# Regression: Swin -100 mask + large activations (production-scale logits)
+# ---------------------------------------------------------------------------
+
+_LARGE_ACT_SCALES = (1.0, 4.0, 5.0)
+
+# vs torch SDPA (TF32 matmul allowed) — tight at small logits, looser at production scale
+_TF32_VS_SDPA_MAX_ABS = {1.0: 0.05, 4.0: 0.16, 5.0: 0.26}
+# vs explicit stable softmax — guards mask regression (was O(10) before fix)
+_TF32_VS_STABLE_MAX_ABS = {1.0: 0.05, 4.0: 0.16, 5.0: 0.26}
+_BF16_VS_STABLE_MAX_ABS = {1.0: 0.02, 4.0: 0.8, 5.0: 1.7}
+
+
+@requires_cute
+@pytest.mark.parametrize("activation_scale", _LARGE_ACT_SCALES)
+def test_tf32_swin_mask_large_activations(activation_scale: float) -> None:
+    """CuTe TF32 + Swin -100 mask: no O(10) drift vs SDPA/stable at large logits."""
+    Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
+    q, k, v = _make_qkv(
+        Bwin, H, N, Dh, torch.float32, "cuda", activation_scale=activation_scale
+    )
+    bias = _make_bias(nW, N, "cuda")
+    scale = 1.0 / math.sqrt(Dh)
+    tol_sdpa = _TF32_VS_SDPA_MAX_ABS[activation_scale]
+    tol_stable = _TF32_VS_STABLE_MAX_ABS[activation_scale]
+
+    with torch.no_grad():
+        ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=True)
+        stable = _attention_window_stable(q, k, v, bias, scale, strict_fp32=False)
+        out = window_attn_fwd_cute(
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
+        )
+
+    max_sdpa = (out - ref).abs().max().item()
+    max_stable = (out - stable).abs().max().item()
+    assert max_sdpa < tol_sdpa, (
+        f"vs SDPA activation_scale={activation_scale} max_err={max_sdpa} tol={tol_sdpa}"
+    )
+    assert max_stable < tol_stable, (
+        f"vs stable activation_scale={activation_scale} max_err={max_stable} tol={tol_stable}"
+    )
+
+
+@requires_cute
+@pytest.mark.parametrize("activation_scale", _LARGE_ACT_SCALES)
+def test_tf32_qkvpacked_swin_mask_large_activations(activation_scale: float) -> None:
+    """Production qkvpacked path must match SDPA under large masked logits."""
+    Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
+    q, k, v = _make_qkv(
+        Bwin, H, N, Dh, torch.float32, "cuda", activation_scale=activation_scale
+    )
+    bias = _make_bias(nW, N, "cuda")
+    scale = 1.0 / math.sqrt(Dh)
+
+    qkv = torch.empty(Bwin, N, 3 * H * Dh, device="cuda", dtype=torch.float32)
+    qkv_view = qkv.view(Bwin, N, 3, H, Dh)
+    qkv_view[:, :, 0].copy_(q.permute(0, 2, 1, 3))
+    qkv_view[:, :, 1].copy_(k.permute(0, 2, 1, 3))
+    qkv_view[:, :, 2].copy_(v.permute(0, 2, 1, 3))
+
+    with torch.no_grad():
+        ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=True)
+        out = window_attn_fwd_cute_qkvpacked(
+            qkv, H, bias=bias, scale_qk=scale, output_layout="bnc"
+        )
+
+    tol = _TF32_VS_SDPA_MAX_ABS[activation_scale]
+    max_err = (out - ref.permute(0, 2, 1, 3).reshape(Bwin, N, H * Dh)).abs().max().item()
+    assert max_err < tol, (
+        f"qkvpacked vs SDPA activation_scale={activation_scale} max_err={max_err} tol={tol}"
+    )
+
+
+@requires_cute
+@pytest.mark.parametrize("activation_scale", _LARGE_ACT_SCALES)
+def test_bf16_swin_mask_large_activations(activation_scale: float) -> None:
+    """BF16 CuTe + mask must track FP32 stable (catches mask regression, allows BF16 MMA slack)."""
+    Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
+    q_f, k_f, v_f = _make_qkv(
+        Bwin, H, N, Dh, torch.float32, "cuda", activation_scale=activation_scale
+    )
+    bias = _make_bias(nW, N, "cuda")
+    scale = 1.0 / math.sqrt(Dh)
+    q, k, v = q_f.bfloat16(), k_f.bfloat16(), v_f.bfloat16()
+    tol = _BF16_VS_STABLE_MAX_ABS[activation_scale]
+
+    with torch.no_grad():
+        stable = _attention_window_stable(q_f, k_f, v_f, bias, scale, strict_fp32=False)
+        out = window_attn_fwd_cute(
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.BF16_MIXED
+        )
+
+    max_err = (out.float() - stable).abs().max().item()
+    assert max_err < tol, (
+        f"vs stable activation_scale={activation_scale} max_err={max_err} tol={tol}"
+    )
 
 
 @requires_cute

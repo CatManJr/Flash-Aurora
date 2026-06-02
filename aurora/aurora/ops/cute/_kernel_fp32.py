@@ -36,7 +36,11 @@ try:
         predicate_k,
         to_cute_tensor,
     )
-    from ._window_softmax import WindowOnlineSoftmax
+    from ._window_softmax import (
+        WindowOnlineSoftmax,
+        apply_partial_kv_mask,
+        apply_swin_bias_mask,
+    )
     from ._smem_utils import _choose_tile_n_tf32
 
     @_dataclass(frozen=True)
@@ -418,21 +422,14 @@ class WindowAttnFwdTF32:
 
         if cutlass.const_expr(self.seq_len % self.tile_n != 0 or mBias is not None):
             m_start = m_block * self.tile_m
-            for i in cutlass.range(cute.size(acc_S), unroll_full=True):
-                n_idx = tScS[i][1]
-                if cutlass.const_expr(self.seq_len % self.tile_n != 0):
-                    if n_idx >= seqlen:
-                        acc_S[i] = -Float32.inf
-                if cutlass.const_expr(mBias is not None):
-                    m_idx = m_start + tScS[i][0]
-                    m_valid = m_idx < seqlen
-                    n_valid = n_idx < seqlen
-                    both = m_valid & n_valid
-                    m_safe = m_idx if m_valid else Int32(0)
-                    n_safe = n_idx if n_valid else Int32(0)
-                    acc_S[i] = acc_S[i] + (mBias_w[m_safe, n_safe] if both else Float32(0.0))
+            if cutlass.const_expr(self.seq_len % self.tile_n != 0):
+                apply_partial_kv_mask(acc_S, tScS, Int32(0), seqlen)
+            if cutlass.const_expr(mBias is not None):
+                apply_swin_bias_mask(acc_S, tScS, mBias_w, m_start, Int32(0), seqlen)
 
-        row_scale = softmax.online_softmax(acc_S, is_first=True, check_inf=True)
+        row_scale = softmax.online_softmax(
+            acc_S, is_first=True, use_fastmath=not self.has_bias
+        )
 
         if cutlass.const_expr(self.single_kv_tile):
             self._load_V(
@@ -519,23 +516,16 @@ class WindowAttnFwdTF32:
                 if cutlass.const_expr(self.seq_len % self.tile_n != 0 or mBias is not None):
                     m_start = m_block * self.tile_m
                     n_start = n_block * self.tile_n
-                    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
-                        n_idx = n_start + tScS[i][1]
-                        if cutlass.const_expr(self.seq_len % self.tile_n != 0):
-                            if n_idx >= seqlen:
-                                acc_S[i] = -Float32.inf
-                        if cutlass.const_expr(mBias is not None):
-                            m_idx = m_start + tScS[i][0]
-                            m_valid = m_idx < seqlen
-                            n_valid = n_idx < seqlen
-                            both = m_valid & n_valid
-                            m_safe = m_idx if m_valid else Int32(0)
-                            n_safe = n_idx if n_valid else Int32(0)
-                            acc_S[i] = acc_S[i] + (
-                                mBias_w[m_safe, n_safe] if both else Float32(0.0)
-                            )
+                    if cutlass.const_expr(self.seq_len % self.tile_n != 0):
+                        apply_partial_kv_mask(acc_S, tScS, n_start, seqlen)
+                    if cutlass.const_expr(mBias is not None):
+                        apply_swin_bias_mask(
+                            acc_S, tScS, mBias_w, m_start, n_start, seqlen
+                        )
 
-                row_scale = softmax.online_softmax(acc_S, is_first=False, check_inf=True)
+                row_scale = softmax.online_softmax(
+                    acc_S, is_first=False, use_fastmath=not self.has_bias
+                )
                 softmax.rescale_O(acc_O, row_scale)
 
                 acc_S_bf16 = cute.make_rmem_tensor_like(acc_S, BFloat16)
@@ -551,7 +541,7 @@ class WindowAttnFwdTF32:
                     smem_thr_cp_V,
                 )
 
-        final_row_scale = softmax.finalize()
+        final_row_scale = softmax.finalize(use_fastmath=not self.has_bias)
         softmax.rescale_O(acc_O, final_row_scale)
 
         rO = cute.make_rmem_tensor_like(acc_O, Float32)
@@ -666,7 +656,7 @@ def _get_or_compile_tf32(
     bias_or_none: Optional[torch.Tensor],
 ):
     single_kv = tile_n >= seq_len
-    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "hybrid_pv_bf16_v4")
+    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "hybrid_pv_bf16_v7")
     if compile_key in _tf32_compile_cache:
         return _tf32_compile_cache[compile_key]
 

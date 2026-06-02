@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32
+from cutlass import Float32, Int32
 
 from quack import layout_utils
+
+# Swin shifted-window masks use -100; treat as hard mask (SDPA-equivalent) not a soft offset.
+WINDOW_ATTN_MASK_THRESHOLD = -50.0
+# Large finite sentinel (not -inf) so multi-pass online softmax avoids NaN from -inf - finite.
+WINDOW_ATTN_MASKED_LOGIT = -1.0e4
 
 
 @cute.jit
@@ -41,6 +45,48 @@ def _fadd_reduce_row(x: cute.TensorSSA, init_val: float | Float32 | None = None)
     return x.reduce(cute.ReductionOp.ADD, init_val, 0)
 
 
+@cute.jit
+def apply_partial_kv_mask(
+    acc_S: cute.Tensor,
+    tScS: cute.Tensor,
+    n_start: Int32,
+    seqlen: Int32,
+) -> None:
+    """Zero-out logits for key indices past ``seqlen`` (partial last KV tile)."""
+    neg_inf = -Float32.inf
+    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
+        n_idx = n_start + tScS[i][1]
+        if n_idx >= seqlen:
+            acc_S[i] = neg_inf
+
+
+@cute.jit
+def apply_swin_bias_mask(
+    acc_S: cute.Tensor,
+    tScS: cute.Tensor,
+    mBias_w: cute.Tensor,
+    m_start: Int32,
+    n_start: Int32,
+    seqlen: Int32,
+) -> None:
+    """Apply Swin shifted-window mask: disallowed pairs → large negative, allowed keep matmul."""
+    neg_inf = -Float32.inf
+    masked_logit = Float32(WINDOW_ATTN_MASKED_LOGIT)
+    threshold = Float32(WINDOW_ATTN_MASK_THRESHOLD)
+
+    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
+        n_idx = n_start + tScS[i][1]
+        m_idx = m_start + tScS[i][0]
+        m_valid = m_idx < seqlen
+        n_valid = n_idx < seqlen
+        if m_valid & n_valid:
+            b = mBias_w[m_idx, n_idx]
+            if b < threshold:
+                acc_S[i] = masked_logit
+        else:
+            acc_S[i] = neg_inf
+
+
 @dataclass
 class WindowOnlineSoftmax:
     """Online softmax state for tiled KV; compatible with SDPA scale in log2 domain."""
@@ -65,12 +111,14 @@ class WindowOnlineSoftmax:
         self,
         acc_S: cute.Tensor,
         is_first: cutlass.Constexpr[bool] = False,
-        check_inf: cutlass.Constexpr[bool] = True,
+        use_fastmath: cutlass.Constexpr[bool] = True,
     ) -> cute.Tensor:
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
         row_scale = cute.make_rmem_tensor_like(self.row_max, Float32)
         row_max, row_sum = self.row_max, self.row_sum
         scale_log2 = self.scale_log2
+        neg_inf = -Float32.inf
+        zero = Float32.zero
 
         for r in cutlass.range(cute.size(row_max), unroll_full=True):
             acc_S_row = acc_S_mn[r, None].load()
@@ -83,35 +131,42 @@ class WindowOnlineSoftmax:
             row_max_prev = row_max[r]
             row_max[r] = row_max_cur
 
-            if cutlass.const_expr(check_inf):
-                row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
-
-            if cutlass.const_expr(is_first):
-                row_max_cur_scaled = row_max_cur * scale_log2
-                acc_S_row_exp = cute.math.exp2(
-                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
-                )
-                acc_S_row_sum = _fadd_reduce_row(acc_S_row_exp, init_val=None)
+            if row_max_cur == neg_inf:
+                row_sum[r] = zero
                 row_scale[r] = 1.0
+                acc_S_mn[r, None].store(acc_S_row * zero)
             else:
                 row_max_cur_scaled = row_max_cur * scale_log2
                 acc_S_row_exp = cute.math.exp2(
-                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+                    acc_S_row * scale_log2 - row_max_cur_scaled,
+                    fastmath=use_fastmath,
                 )
-                row_scale[r] = cute.math.exp2(
-                    (row_max_prev - row_max_cur) * scale_log2, fastmath=True
-                )
-                acc_S_row_sum = _fadd_reduce_row(
-                    acc_S_row_exp, init_val=row_sum[r] * row_scale[r]
-                )
+                if cutlass.const_expr(is_first):
+                    acc_S_row_sum = _fadd_reduce_row(acc_S_row_exp, init_val=None)
+                    row_scale[r] = 1.0
+                else:
+                    if row_max_prev == neg_inf:
+                        row_scale[r] = zero
+                    else:
+                        row_scale[r] = cute.math.exp2(
+                            (row_max_prev - row_max_cur) * scale_log2,
+                            fastmath=use_fastmath,
+                        )
+                    acc_S_row_sum = _fadd_reduce_row(
+                        acc_S_row_exp, init_val=row_sum[r] * row_scale[r]
+                    )
 
-            row_sum[r] = acc_S_row_sum
-            acc_S_mn[r, None].store(acc_S_row_exp)
+                row_sum[r] = acc_S_row_sum
+                acc_S_mn[r, None].store(acc_S_row_exp)
 
         return row_scale
 
     @cute.jit
-    def finalize(self, final_scale: Float32 = 1.0) -> cute.Tensor:
+    def finalize(
+        self,
+        final_scale: Float32 = 1.0,
+        use_fastmath: cutlass.Constexpr[bool] = True,
+    ) -> cute.Tensor:
         row_sum, row_max = self.row_sum, self.row_max
         scale_log2 = self.scale_log2
         rs = row_sum.load()
@@ -133,7 +188,8 @@ class WindowOnlineSoftmax:
             ) * final_scale
             row_sum_cur = row_sum[r]
             row_sum[r] = (
-                (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
+                (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=use_fastmath))
+                * LN2
                 if not acc_O_mn_row_is_zero_or_nan
                 else -Float32.inf
             )
