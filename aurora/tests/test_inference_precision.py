@@ -218,6 +218,19 @@ def test_backbone_bf16_matmul_context_mlp_chain_and_norm_break() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_backbone_bf16_matmul_context_hooks_qkv_linear() -> None:
+    from aurora.model.custom_op_paths import backbone_bf16_matmul_context
+
+    linear = torch.nn.Linear(128, 128 * 3, bias=True).cuda().float()
+    x = torch.randn(8, 144, 128, device="cuda", dtype=torch.float32)
+
+    with torch.inference_mode():
+        with backbone_bf16_matmul_context(enabled=True):
+            qkv = linear(x)
+    assert qkv.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_backbone_tf32_matmul_context_enables_tf32_flags() -> None:
     from aurora.model.custom_op_paths import backbone_tf32_matmul_context
 

@@ -23,3 +23,4 @@ profiling/nsight/
 *.qdstrm
 *.qdrep
 profiling/*.json
+profiling/*.md

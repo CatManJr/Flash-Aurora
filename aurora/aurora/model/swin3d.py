@@ -71,19 +71,7 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
-        from aurora.model.custom_op_paths import backbone_bf16_mlp_matmul_active
-
-        use_bf16_gemm_chain = (
-            backbone_bf16_mlp_matmul_active()
-            and x.is_cuda
-            and not torch.is_grad_enabled()
-            and x.dtype in (torch.float32, torch.bfloat16)
-        )
-        if use_bf16_gemm_chain:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                x = self.fc1(x)
-        else:
-            x = self.fc1(x)
+        x = self.fc1(x)
         if can_use_triton_gelu(
             x,
             enabled=self.use_triton_gelu,
@@ -96,11 +84,7 @@ class MLP(nn.Module):
         else:
             x = self.act(x)
         x = self.drop(x)
-        if use_bf16_gemm_chain:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                x = self.fc2(x)
-        else:
-            x = self.fc2(x)
+        x = self.fc2(x)
         x = self.drop(x)
         return x
 
@@ -264,9 +248,19 @@ class WindowAttention(nn.Module):
         Returns:
             torch.Tensor: Output of shape `(nW*B, N, C)`.
         """
-        # Triton AdaLN residual can leave BF16 activations; QKV weights are FP32.
-        if x.dtype == torch.bfloat16:
+        from aurora.model.custom_op_paths import backbone_bf16_matmul_active
+
+        bf16_gemm_chain = (
+            backbone_bf16_matmul_active()
+            and self.cute_window_attn_dtype == torch.bfloat16
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+        )
+        # Pre-BF16-hook path: upcast stray BF16 activations before FP32 QKV. With bf16_mixed,
+        # keep FP32/BF16 inputs and let hooked F.linear emit BF16 for CuTe.
+        if x.dtype == torch.bfloat16 and not bf16_gemm_chain:
             x = x.float()
+        gemm_dtype = torch.bfloat16 if bf16_gemm_chain else x.dtype
 
         if isinstance(self.lora_qkv, LoRARollout):
             qkv = self._linear_with_optional_lora_merge(
@@ -279,7 +273,6 @@ class WindowAttention(nn.Module):
         else:
             qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
         attn_dropout = self.attn_drop if self.training else 0.0
-        activation_dtype = x.dtype
 
         use_cute = can_use_cute_window_attention(
             qkv,
@@ -299,8 +292,14 @@ class WindowAttention(nn.Module):
             from aurora.ops.cute import window_attn_fwd_cute_qkvpacked
 
             if qkv.dtype != self.cute_window_attn_dtype:
-                qkv = qkv.to(dtype=self.cute_window_attn_dtype)
-            bias = None if mask is None else mask.to(dtype=torch.float32, device=qkv.device)
+                qkv = qkv.to(dtype=self.cute_window_attn_dtype, non_blocking=True)
+            bias = None
+            if mask is not None:
+                bias = mask.to(
+                    dtype=torch.float32,
+                    device=qkv.device,
+                    non_blocking=True,
+                )
             if bias is not None and not bias.is_contiguous():
                 bias = bias.contiguous()
             x = window_attn_fwd_cute_qkvpacked(
@@ -317,9 +316,9 @@ class WindowAttention(nn.Module):
 
                 if self.cute_window_attn_dtype == torch.bfloat16 and q.dtype != torch.bfloat16:
                     q, k, v = (
-                        q.to(torch.bfloat16),
-                        k.to(torch.bfloat16),
-                        v.to(torch.bfloat16),
+                        q.to(torch.bfloat16, non_blocking=True),
+                        k.to(torch.bfloat16, non_blocking=True),
+                        v.to(torch.bfloat16, non_blocking=True),
                     )
                 precision = (
                     WinAttnPrecision.BF16_MIXED
@@ -328,7 +327,13 @@ class WindowAttention(nn.Module):
                 )
                 # Bias kept as float32: the CuTeDSL kernel explicitly takes FP32 bias,
                 # and the SDPA fallback path also works with FP32 attn_mask for FP32 Q.
-                bias = None if mask is None else mask.to(dtype=torch.float32, device=q.device)
+                bias = None
+                if mask is not None:
+                    bias = mask.to(
+                        dtype=torch.float32,
+                        device=q.device,
+                        non_blocking=True,
+                    )
                 if bias is not None and not bias.is_contiguous():
                     bias = bias.contiguous()
                 if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
@@ -344,8 +349,8 @@ class WindowAttention(nn.Module):
             else:
                 x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
             x = rearrange(x, "B H N D -> B N (H D)")
-        if x.dtype != activation_dtype:
-            x = x.to(dtype=activation_dtype)
+        if x.dtype != gemm_dtype:
+            x = x.to(dtype=gemm_dtype, non_blocking=True)
         if isinstance(self.lora_proj, LoRARollout):
             x = self._linear_with_optional_lora_merge(
                 x,
@@ -680,7 +685,6 @@ class Swin3DTransformerBlock(nn.Module):
 
         # If the window size is larger than the input resolution, we do not partition windows.
         ws, ss = maybe_adjust_windows(self.window_size, self.shift_size, res)
-
         shortcut = x
         x_5d = x.view(B, C, H, W, D)
 
@@ -743,7 +747,7 @@ class Swin3DTransformerBlock(nn.Module):
             x = x.reshape(B, C * H * W, D)
 
         use_d2_adaln_residual = can_use_triton_adaln(
-            x,
+            shortcut,
             enabled=self.norm1.use_triton,
             training=self.training,
             drop_path_is_identity=isinstance(self.drop_path, nn.Identity),

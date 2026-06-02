@@ -1,9 +1,10 @@
 """Glue between Aurora model forward paths and custom CUDA/Triton/CuTe ops.
 
-Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. ``bf16_mixed`` routes backbone
-``F.linear`` matmuls through BF16 Tensor Core and keeps BF16 activations between consecutive
-GEMMs (e.g. MLP fc1→fc2). ``F.layer_norm`` breaks the chain with FP32 statistics/output (like
-autocast's fp32-safe ops). ``tf32_1x`` keeps FP32 activations with TF32 matmul only.
+Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. ``bf16_mixed`` routes all
+backbone ``F.linear`` matmuls (QKV, proj, MLP, patch merge, …) through BF16 Tensor Core and
+keeps BF16 activations between consecutive GEMMs where LayerNorm does not intervene.
+``F.layer_norm`` breaks the chain with FP32 statistics/output (like autocast's fp32-safe ops).
+``tf32_1x`` keeps FP32 activations with TF32 matmul only.
 """
 
 from __future__ import annotations
@@ -20,14 +21,19 @@ _TRITON_ELEM_DTYPES = frozenset({torch.float32, torch.bfloat16})
 
 _T = TypeVar("_T")
 
-_bf16_mlp_matmul_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "_bf16_mlp_matmul_enabled", default=False
+_bf16_backbone_matmul_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_bf16_backbone_matmul_enabled", default=False
 )
 
 
+def backbone_bf16_matmul_active() -> bool:
+    """True while ``backbone_bf16_matmul_context`` is active (all hooked ``F.linear`` use BF16)."""
+    return _bf16_backbone_matmul_enabled.get()
+
+
 def backbone_bf16_mlp_matmul_active() -> bool:
-    """True while ``backbone_bf16_matmul_context`` is active (MLP fc1→fc2 BF16 GEMM chain)."""
-    return _bf16_mlp_matmul_enabled.get()
+    """Alias of :func:`backbone_bf16_matmul_active` (historical MLP-only name)."""
+    return backbone_bf16_matmul_active()
 
 
 @contextmanager
@@ -58,18 +64,19 @@ def run_with_encoder_decoder_autocast(
 
 @contextmanager
 def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
-    """BF16 matmul for Swin MLP ``fc1→fc2`` only; FP32 elsewhere (plan B).
+    """BF16 Tensor Core for all backbone ``F.linear``; FP32 LayerNorm stats (``bf16_mixed``).
 
-    * MLP (see ``Mlp.forward``): ``fc1``/``fc2`` run under narrow BF16 autocast with BF16
-      activations between them (no per-GEMM FP32 round-trip).
+    * ``F.linear`` (QKV, proj, MLP, patch merge, AdaLN modulation, …): narrow CUDA BF16
+      autocast on FP32/BF16 I/O (weights stay FP32; outputs are typically BF16).
     * ``F.layer_norm`` on BF16 input: FP32 statistics/output (AdaLN / patch norms).
-    * All other ``F.linear`` (QKV, proj, patch merge): unhooked FP32 matmul (P0-style).
+    * Triton AdaLN still requires FP32 activations at its boundary; it upcasts internally.
     """
     if not enabled:
         yield
         return
 
     _orig_layer_norm = torch.nn.functional.layer_norm
+    _orig_linear = torch.nn.functional.linear
 
     def _bf16_layer_norm(
         input: torch.Tensor,
@@ -85,7 +92,7 @@ def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
         ):
             with torch.autocast(device_type="cuda", enabled=False):
                 return _orig_layer_norm(
-                    input.float(),
+                    cast_activation_dtype(input, torch.float32),
                     normalized_shape,
                     weight,
                     bias,
@@ -93,13 +100,30 @@ def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
                 )
         return _orig_layer_norm(input, normalized_shape, weight, bias, eps=eps)
 
-    token = _bf16_mlp_matmul_enabled.set(True)
+    def _bf16_linear(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            input.is_cuda
+            and not torch.is_grad_enabled()
+            and input.dtype in (torch.float32, torch.bfloat16)
+            and weight.dtype in (torch.float32, torch.bfloat16)
+        ):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                return _orig_linear(input, weight, bias)
+        return _orig_linear(input, weight, bias)
+
+    token = _bf16_backbone_matmul_enabled.set(True)
     torch.nn.functional.layer_norm = _bf16_layer_norm  # type: ignore[method-assign]
+    torch.nn.functional.linear = _bf16_linear  # type: ignore[method-assign]
     try:
         yield
     finally:
+        torch.nn.functional.linear = _orig_linear
         torch.nn.functional.layer_norm = _orig_layer_norm
-        _bf16_mlp_matmul_enabled.reset(token)
+        _bf16_backbone_matmul_enabled.reset(token)
 
 
 @contextmanager
@@ -174,18 +198,33 @@ def backbone_dtype_from_name(name: BackboneComputeDtype) -> torch.dtype:
     return torch.float32
 
 
+def cast_activation_dtype(
+    tensor: torch.Tensor,
+    dtype: torch.dtype,
+    *,
+    non_blocking: bool | None = None,
+) -> torch.Tensor:
+    """Cast activations; use async GPU copies for inference FP32/BF16 pairs."""
+    if tensor.dtype == dtype:
+        return tensor
+    if non_blocking is None:
+        non_blocking = (
+            tensor.is_cuda
+            and not torch.is_grad_enabled()
+            and tensor.dtype in _TRITON_ELEM_DTYPES
+            and dtype in _TRITON_ELEM_DTYPES
+        )
+    return tensor.to(dtype=dtype, non_blocking=non_blocking)
+
+
 def prepare_backbone_input(x: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
     """Cast encoder output to the backbone compute dtype when needed."""
-    if x.dtype == compute_dtype:
-        return x
-    return x.to(dtype=compute_dtype)
+    return cast_activation_dtype(x, compute_dtype)
 
 
 def finalize_backbone_output(x: torch.Tensor, *, decoder_dtype: torch.dtype) -> torch.Tensor:
     """Restore decoder input dtype after an explicit BF16 backbone pass."""
-    if x.dtype == decoder_dtype:
-        return x
-    return x.to(dtype=decoder_dtype)
+    return cast_activation_dtype(x, decoder_dtype)
 
 
 def run_backbone_with_dtype_routing(
@@ -246,9 +285,7 @@ def triton_elemwise_dtype_ok(dtype: torch.dtype) -> bool:
 
 def align_activation_dtype(reference: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
     """Cast ``tensor`` to ``reference.dtype`` when custom ops require matching dtypes."""
-    if tensor.dtype == reference.dtype:
-        return tensor
-    return tensor.to(dtype=reference.dtype)
+    return cast_activation_dtype(tensor, reference.dtype)
 
 
 def align_binary_activations(
@@ -263,7 +300,10 @@ def align_binary_activations(
             target = torch.bfloat16
         else:
             target = torch.float32
-        return left.to(dtype=target), right.to(dtype=target)
+        return (
+            cast_activation_dtype(left, target),
+            cast_activation_dtype(right, target),
+        )
     return left, right
 
 
@@ -282,7 +322,7 @@ def can_use_triton_adaln(
     training: bool,
     drop_path_is_identity: bool,
 ) -> bool:
-    """Fused AdaLN requires FP32 activations (norm boundary matches autocast)."""
+    """Fused AdaLN on CUDA FP32 (norm boundary vs ``tf32_1x`` reference; BF16 GEMM upstream)."""
     return (
         enabled
         and not training

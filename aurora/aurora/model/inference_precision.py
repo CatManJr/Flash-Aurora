@@ -8,9 +8,9 @@ Five named paths:
 4. ``tf32_1x``          — ``fast_fp32`` + TF32 backbone matmuls + CuTe TF32 window attention
 5. ``bf16_mixed``       — ``fast_fp32`` + BF16 backbone matmuls + CuTe BF16 window attention
 
-Custom Triton/CuTe Swin3D paths never run inside ``torch.autocast``. ``bf16_mixed`` runs BF16
-Tensor Core only on MLP ``fc1→fc2`` (BF16 activations between them); QKV/proj and AdaLN modulation
-stay FP32. ``F.layer_norm`` on BF16 MLP output uses FP32 statistics (like autocast).
+Custom Triton/CuTe Swin3D paths never run inside ``torch.autocast``. ``bf16_mixed`` routes all
+backbone ``F.linear`` through BF16 Tensor Core (QKV, proj, MLP, patch merge, …) with BF16
+activations between GEMMs; ``F.layer_norm`` uses FP32 statistics on BF16 input (like autocast).
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ class AuroraInferencePrecision(str, Enum):
     """``fast_fp32`` + TF32 ``F.linear`` matmuls + CuTe TF32 window attention (FP32 activations)."""
 
     BF16_MIXED = "bf16_mixed"
-    """``fast_fp32`` + BF16 GEMM chain + FP32 LayerNorm + CuTe BF16 window attention."""
+    """``fast_fp32`` + BF16 backbone ``F.linear`` + FP32 LayerNorm + CuTe BF16 window attention."""
 
 
 CudaGraphScope = Literal["off", "backbone", "full_gpu"]

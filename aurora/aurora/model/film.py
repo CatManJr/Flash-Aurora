@@ -48,12 +48,13 @@ class AdaptiveLayerNorm(nn.Module):
         nn.init.zeros_(self.ln_modulation[-1].bias)
 
     def _use_triton_film(self, x: torch.Tensor) -> bool:
-        """Triton AdaLN is FP32-only (LN stats + output); matches autocast norm boundaries."""
         return self.use_triton and x.is_cuda and x.dtype == torch.float32
 
     @staticmethod
     def _to_triton_fp32(t: torch.Tensor) -> torch.Tensor:
-        return t if t.dtype == torch.float32 else t.float()
+        from aurora.model.custom_op_paths import cast_activation_dtype
+
+        return cast_activation_dtype(t, torch.float32)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -95,14 +96,12 @@ class AdaptiveLayerNorm(nn.Module):
             Tensor of shape ``(B, L, D)``.
         """
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
-        if self.use_triton and residual.is_cuda:
+        if self.use_triton and residual.is_cuda and residual.dtype == torch.float32:
             from aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
-            r = self._to_triton_fp32(residual)
-            a = self._to_triton_fp32(x)
             return adaptive_layernorm_film_add_residual_forward(
-                r,
-                a,
+                residual,
+                self._to_triton_fp32(x),
                 self._to_triton_fp32(scale),
                 self._to_triton_fp32(shift),
                 float(self.scale_bias),
