@@ -1,4 +1,4 @@
-# Design and Implement High-Performance Computing Framework for GFMS: MS Aurora as an example
+# Flash-Aurora: Design and Implement High-Performance Computing Framework for Numerical Field based GFMS
 
 ## Install CuTe DSL & Flash Attention
 
