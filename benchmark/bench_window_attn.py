@@ -1,35 +1,25 @@
 """Benchmark: CuTe window attention vs torch SDPA.
 
-Measures forward-pass latency and TFLOPS for Aurora encoder window shapes.
-
-Paths benchmarked
------------------
-* **BF16_MIXED** — BF16 I/O, FP32 softmax/accum (CuTe) vs BF16 SDPA.
-* **TF32_ACC_FP32** — FP32 I/O, TF32 QK MMA (CuTe) vs torch SDPA with TF32 matmuls
-  (1×TF32 apples-to-apples) and vs strict-FP32 SDPA (quality reference).
-
-Aurora uses window_size=(2, 6, 12) for all encoder and decoder stages.
-The actual N = Wc×Wh×Ww depends on the spatial resolution of the input:
-
-    N=144  (2×6×12)   standard resolution          — single-pass
-    N=288  (2×6×24)   2× spatial resolution        — single-pass / streaming
-    N=576  (2×12×24)  4× spatial resolution        — streaming (multi-pass)
+Sections: compact accuracy summary, unmasked perf (micro + ERA5), masked Swin (-100) ERA5 enc.
 
 Run:
     uv run python benchmark/bench_window_attn.py
+    BENCH_MEASURED=200 uv run python benchmark/bench_window_attn.py  # faster
 """
+
+from __future__ import annotations
 
 import math
 import os
 import statistics
 import sys
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 _BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BENCH_DIR not in sys.path:
     sys.path.insert(0, _BENCH_DIR)
-import _bootstrap  # noqa: F401, E402  — before torch (OMP_NUM_THREADS)
+import _bootstrap  # noqa: F401, E402
 
 import torch
 import torch.nn.functional as F
@@ -43,35 +33,31 @@ from aurora.ops.cute.window_attn_fwd import (
     _CUTE_KERNEL_VERSION,
     WinAttnPrecision,
     window_attn_fwd_cute,
+    _expand_bias_for_sdpa,
 )
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-WARMUP      = 20
-MEASURED    = 1000
-TRIM_FRAC   = 0.05
+WARMUP = int(os.environ.get("BENCH_WARMUP", "20"))
+MEASURED = int(os.environ.get("BENCH_MEASURED", "1000"))
+TRIM_FRAC = 0.05
 
-USE_CUTE_KERNEL = os.environ.get("AURORA_CUTE_WINDOW_ATTN", "1") != "0"
-
-SHAPES = [
-    (16,   8, 144, 64, "N=144 (2×6×12)  H=8"),
-    ( 8,  16, 144, 64, "N=144 (2×6×12)  H=16"),
-    ( 4,  32, 144, 64, "N=144 (2×6×12)  H=32"),
-    ( 8,   8, 288, 64, "N=288 (2×6×24)  H=8   2× spatial"),
-    ( 4,  16, 288, 64, "N=288 (2×6×24)  H=16  2× spatial"),
-    ( 2,  32, 576, 64, "N=576 (2×12×24) H=32  4× spatial  streaming"),
+SHAPES_MICRO = [
+    (16, 8, 144, 64, "N144 H8"),
+    (8, 8, 288, 64, "N288 H8"),
+    (2, 32, 576, 64, "N576 H32 stream"),
 ]
 
-SHAPES_REALISTIC = [
-    (1800,  8, 144, 64, "ERA5 Stage1 enc  Bwin=1800 H=8"),
-    ( 450, 16, 144, 64, "ERA5 Stage2 enc  Bwin=450  H=16"),
-    ( 128, 32, 144, 64, "ERA5 Stage3 enc  Bwin=128  H=32"),
-    ( 128, 32, 144, 64, "ERA5 Stage1 dec  Bwin=128  H=32"),
-    ( 450, 16, 144, 64, "ERA5 Stage2 dec  Bwin=450  H=16"),
-    (1800,  8, 144, 64, "ERA5 Stage3 dec  Bwin=1800 H=8"),
+SHAPES_ERA5 = [
+    (1800, 8, 144, 64, "enc1 1800×8"),
+    (450, 16, 144, 64, "enc2 450×16"),
+    (128, 32, 144, 64, "enc3 128×32"),
 ]
+
+# Swin shifted-window mask (-100); encoder shapes only (production N=144).
+SHAPES_MASKED = SHAPES_ERA5
 
 
 # ---------------------------------------------------------------------------
@@ -82,29 +68,18 @@ def attention_flops(Bwin: int, H: int, N: int, Dh: int) -> int:
     return 4 * Bwin * H * N * N * Dh
 
 
-def tflops(flop: int, elapsed_ms: float) -> float:
-    return flop / elapsed_ms / 1e9
-
-
 @dataclass
 class BenchStats:
-    mean:   float
-    std:    float
-    ci95:   float
-    cv:     float
-    median: float
-    p5:     float
-    p95:    float
+    mean: float
+    ci95: float
 
 
 def bench(fn, warmup: int = WARMUP, measured: int = MEASURED) -> BenchStats:
     start = torch.cuda.Event(enable_timing=True)
-    end   = torch.cuda.Event(enable_timing=True)
-
+    end = torch.cuda.Event(enable_timing=True)
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-
     times = []
     for _ in range(measured):
         start.record()
@@ -112,20 +87,14 @@ def bench(fn, warmup: int = WARMUP, measured: int = MEASURED) -> BenchStats:
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
-
     times.sort()
     n = len(times)
-    median = times[n // 2]
-    p5     = times[int(n * 0.05)]
-    p95    = times[int(n * 0.95)]
     trim = max(1, int(n * TRIM_FRAC))
     core = times[trim : n - trim]
     tmean = statistics.mean(core)
-    tstd  = statistics.stdev(core) if len(core) > 1 else 0.0
-    ci95  = 1.96 * tstd / math.sqrt(len(core))
-    cv    = tstd / tmean * 100 if tmean > 0 else 0.0
-    return BenchStats(mean=tmean, std=tstd, ci95=ci95, cv=cv,
-                      median=median, p5=p5, p95=p95)
+    tstd = statistics.stdev(core) if len(core) > 1 else 0.0
+    ci95 = 1.96 * tstd / math.sqrt(len(core))
+    return BenchStats(mean=tmean, ci95=ci95)
 
 
 def make_qkv(Bwin, H, N, Dh, dtype, device="cuda"):
@@ -139,129 +108,95 @@ def make_qkv(Bwin, H, N, Dh, dtype, device="cuda"):
     )
 
 
-def fp32_sdpa(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    scale: float,
-) -> torch.Tensor:
-    """FP32 SDPA via PyTorch math/mem-efficient backend.
-
-    Note: ``torch.backends.cuda.matmul.allow_tf32`` has NO effect here —
-    SDPA for FP32 inputs uses the mem-efficient or math backend which does
-    not go through ``torch.matmul`` and therefore ignores the TF32 flag.
-    Both ``allow_tf32=True`` and ``allow_tf32=False`` yield identical speed.
-    The fair baseline for our CuTe TF32 kernel is therefore plain FP32 SDPA.
-    """
-    return F.scaled_dot_product_attention(q, k, v, scale=scale)
+def make_swin_bias(nW: int, N: int, device: str = "cuda") -> torch.Tensor:
+    """(nW, N, N) float bias with -100 on upper-right / lower-left blocks (Swin-style)."""
+    bias = torch.zeros(nW, N, N, dtype=torch.float32, device=device)
+    bias[:, N // 2 :, : N // 2] = -100.0
+    return bias
 
 
-def fp32_reference_bf16(q_bf, k_bf, v_bf, scale):
-    return fp32_sdpa(q_bf.float(), k_bf.float(), v_bf.float(), scale).bfloat16()
+def fp32_sdpa(q, k, v, scale, bias: Optional[torch.Tensor] = None):
+    Bwin, H, N, _ = q.shape
+    mask = _expand_bias_for_sdpa(bias, Bwin, H, N) if bias is not None else None
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
 
 
-def _print_accuracy_result(
-    label: str,
-    candidate: torch.Tensor,
-    baseline: torch.Tensor,
-    rtol: float,
-    atol: float,
-) -> bool:
-    out_f = candidate.float()
-    ref_f = baseline.float()
-    abs_err = (out_f - ref_f).abs()
-    max_err = abs_err.max().item()
-    mean_err = abs_err.mean().item()
-    passed = torch.allclose(out_f, ref_f, rtol=rtol, atol=atol)
-    status = "PASS" if passed else "FAIL"
-    print(f"  [{status}] {label}")
-    print(f"         max_abs={max_err:.6e}  mean_abs={mean_err:.6e}  "
-          f"(atol={atol:g}, rtol={rtol:g})")
-    if not passed:
-        frac = (abs_err.reshape(-1) > atol).float().mean().item()
-        print(f"         {frac * 100:.1f}% of elements exceed atol")
-    elif max_err > 0.0:
-        print(f"         bitwise_equal={torch.equal(out_f, ref_f)}")
-    return passed
+def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
+    return (a.float() - b.float()).abs().max().item()
 
 
-def check_accuracy_bf16(Bwin, H, N, Dh, scale, label, rtol=2e-2, atol=2e-2):
-    q, k, v = make_qkv(Bwin, H, N, Dh, torch.bfloat16)
-    with torch.no_grad():
-        out_cute = window_attn_fwd_cute(
-            q, k, v, precision=WinAttnPrecision.BF16_MIXED, scale_qk=scale,
-        )
-        ref = fp32_reference_bf16(q, k, v, scale)
-    return _print_accuracy_result(label, out_cute, ref, rtol, atol)
-
-
-def check_accuracy_tf32(
-    Bwin, H, N, Dh, scale, label, *, rtol=1e-3, atol=1e-3,
-):
+def check_accuracy_batch(
+    shapes: list[tuple[int, int, int, int, str]],
+    *,
+    masked: bool,
+    rtol_bf16: float = 2e-2,
+    atol_bf16: float = 2e-2,
+    rtol_tf32: float = 1e-3,
+    atol_tf32: float = 1e-3,
+) -> tuple[bool, float, float]:
+    """Return (all_pass, worst_bf16_err, worst_tf32_err)."""
+    scale = 1.0 / math.sqrt(64)
+    nW = 1
+    worst_bf, worst_tf = 0.0, 0.0
+    all_ok = True
     if not _CUTE_AVAILABLE:
-        print(f"  [SKIP] {label}  (CuTeDSL not available)")
-        return True
-    q, k, v = make_qkv(Bwin, H, N, Dh, torch.float32)
+        return True, 0.0, 0.0
+
     with torch.no_grad():
-        out_cute = window_attn_fwd_cute(
-            q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32, scale_qk=scale,
-        )
-        ref = fp32_sdpa(q, k, v, scale)
-    return _print_accuracy_result(label, out_cute, ref, rtol, atol)
+        for Bwin, H, N, Dh, _ in shapes:
+            bias = make_swin_bias(nW, N) if masked else None
+            q_bf, k_bf, v_bf = make_qkv(Bwin, H, N, Dh, torch.bfloat16)
+            ref_bf = fp32_sdpa(
+                q_bf.float(), k_bf.float(), v_bf.float(), scale, bias=bias,
+            ).bfloat16()
+            out_bf = window_attn_fwd_cute(
+                q_bf, k_bf, v_bf, bias=bias,
+                precision=WinAttnPrecision.BF16_MIXED, scale_qk=scale,
+            )
+            err_bf = _max_abs(out_bf, ref_bf)
+            worst_bf = max(worst_bf, err_bf)
+            if not torch.allclose(out_bf.float(), ref_bf.float(), rtol=rtol_bf16, atol=atol_bf16):
+                all_ok = False
+
+            q, k, v = make_qkv(Bwin, H, N, Dh, torch.float32)
+            ref_tf = fp32_sdpa(q, k, v, scale, bias=bias)
+            out_tf = window_attn_fwd_cute(
+                q, k, v, bias=bias,
+                precision=WinAttnPrecision.TF32_ACC_FP32, scale_qk=scale,
+            )
+            err_tf = _max_abs(out_tf, ref_tf)
+            worst_tf = max(worst_tf, err_tf)
+            if not torch.allclose(out_tf, ref_tf, rtol=rtol_tf32, atol=atol_tf32):
+                all_ok = False
+    return all_ok, worst_bf, worst_tf
 
 
-_COL_LABEL  = 36
-_COL_N      = 5
-_COL_TILE   = 7
-_COL_PASS   = 5
-_COL_MS     = 11
-_COL_CV     = 5
-_COL_TFLOPS = 8
+_COL_LABEL = 22
+_COL_MS = 8
 
 
-def _perf_header(cute_col: str, baseline_col: str) -> str:
-    col_ms = _COL_MS
-    return (
-        f"{'Shape':<{_COL_LABEL}}"
-        f"{'N':>{_COL_N}}"
-        f"{'tile_n':>{_COL_TILE}}"
-        f"{'pass':>{_COL_PASS}}"
-        f"{cute_col:>{col_ms + 4}}"
-        f"{'cv%':>{_COL_CV}}"
-        f"{'TFLOPS':>{_COL_TFLOPS}}"
-        f"{baseline_col:>{col_ms + 4}}"
-        f"{'cv%':>{_COL_CV}}"
-        f"{'TFLOPS':>{_COL_TFLOPS}}"
-        f"{'speedup':>8}"
+def _print_perf_header(title: str, baseline: str) -> None:
+    print(f"\n{title}")
+    print(
+        f"{'shape':<{_COL_LABEL}}"
+        f"{'cute_ms':>{_COL_MS}}"
+        f"{baseline:>{_COL_MS}}"
+        f"{'vs':>6}"
     )
+    print("-" * (_COL_LABEL + _COL_MS * 2 + 6))
 
 
 def _print_perf_row(
     label: str,
-    N: int,
-    tile_n: int,
-    pass_str: str,
     r_cute: BenchStats,
     r_base: BenchStats,
-    flop: int,
 ) -> None:
-    tf_cute = tflops(flop, r_cute.mean)
-    tf_base = tflops(flop, r_base.mean)
-    speedup = r_base.mean / r_cute.mean
-    cute_str = f"{r_cute.mean:.3f}±{r_cute.ci95:.3f}"
-    base_str = f"{r_base.mean:.3f}±{r_base.ci95:.3f}"
+    vs = r_base.mean / r_cute.mean
     print(
         f"{label:<{_COL_LABEL}}"
-        f"{N:>{_COL_N}}"
-        f"{tile_n:>{_COL_TILE}}"
-        f"{pass_str:>{_COL_PASS}}"
-        f"{cute_str:>{_COL_MS + 4}}"
-        f"{r_cute.cv:>{_COL_CV}.1f}"
-        f"{tf_cute:>{_COL_TFLOPS}.2f}"
-        f"{base_str:>{_COL_MS + 4}}"
-        f"{r_base.cv:>{_COL_CV}.1f}"
-        f"{tf_base:>{_COL_TFLOPS}.2f}"
-        f"{speedup:>8.2f}x"
+        f"{r_cute.mean:>{_COL_MS}.3f}"
+        f"{r_base.mean:>{_COL_MS}.3f}"
+        f"{vs:>6.2f}x"
     )
 
 
@@ -270,156 +205,132 @@ def run_perf_table(
     *,
     title: str,
     dtype: torch.dtype,
-    choose_tile_n: Callable[..., int],
     cute_precision: WinAttnPrecision,
-    make_baseline: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, float], Callable[[], None]],
-    cute_col: str,
     baseline_col: str,
+    make_baseline: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, float, Optional[torch.Tensor]],
+        Callable[[], None],
+    ],
+    bias: Optional[torch.Tensor] = None,
 ) -> None:
-    print()
-    print("=" * 60)
-    print(title)
-    print("=" * 60)
-    hdr = _perf_header(cute_col, baseline_col)
-    print(hdr)
-    print("-" * len(hdr))
-
+    _print_perf_header(title, baseline_col)
+    scale = 1.0 / math.sqrt(64)
     with torch.no_grad():
         for Bwin, H, N, Dh, label in shapes:
             q, k, v = make_qkv(Bwin, H, N, Dh, dtype)
-            flop = attention_flops(Bwin, H, N, Dh)
-            tile_n = choose_tile_n(N, head_dim=Dh)
-            n_pass = math.ceil(N / tile_n)
-            pass_str = "1" if n_pass == 1 else str(n_pass)
-            scale = 1.0 / math.sqrt(Dh)
+            b = bias
+            if bias is not None and bias.shape[-1] != N:
+                b = make_swin_bias(bias.shape[0], N, device=str(q.device))
 
             def run_cute():
                 window_attn_fwd_cute(
-                    q, k, v, precision=cute_precision, scale_qk=scale,
+                    q, k, v, bias=b, precision=cute_precision, scale_qk=scale,
                 )
 
             r_cute = bench(run_cute)
-            r_base = bench(make_baseline(q, k, v, scale))
-            _print_perf_row(label, N, tile_n, pass_str, r_cute, r_base, flop)
+            r_base = bench(make_baseline(q, k, v, scale, b))
+            _print_perf_row(label, r_cute, r_base)
 
 
-def _print_latency_note() -> None:
-    trim_pct = int(TRIM_FRAC * 100)
-    print()
-    print(f"Note: latency = trimmed mean ± 95% CI  "
-          f"(top/bottom {trim_pct}% of {MEASURED} samples discarded).")
-    print(f"      cv% = std/mean×100;  TFLOPS = 4·Bwin·H·N²·Dh / mean_latency.")
-
-
-def main():
+def main() -> None:
     if not torch.cuda.is_available():
         print("CUDA not available — skipping benchmark.")
         return
 
-    device = torch.cuda.current_device()
-    props  = torch.cuda.get_device_properties(device)
-    print(f"GPU : {props.name}  (SM{props.major}{props.minor}, "
-          f"{props.total_memory // 2**20} MB)")
-    print(f"CuTe kernel available : {_CUTE_AVAILABLE}")
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    cute_on = os.environ.get("AURORA_CUTE_WINDOW_ATTN", "1") != "0"
     print(
-        "CuTe GEMM tiles : "
-        f"{'active' if USE_CUTE_KERNEL else 'disabled (stable softmax path)'} "
-        f"(kernel={_CUTE_KERNEL_VERSION}, AURORA_CUTE_WINDOW_ATTN={os.environ.get('AURORA_CUTE_WINDOW_ATTN', '1')})"
+        f"GPU {props.name} SM{props.major}{props.minor} | "
+        f"CuTe={_CUTE_AVAILABLE} kernel={_CUTE_KERNEL_VERSION} "
+        f"cute_attn={cute_on} | measured={MEASURED}"
     )
-    print()
 
-    scale = 1.0 / math.sqrt(64)
+    acc_shapes = SHAPES_MICRO + SHAPES_ERA5
+    ok_nomask, wbf, wtf = check_accuracy_batch(acc_shapes, masked=False)
+    ok_mask, wbf_m, wtf_m = check_accuracy_batch(SHAPES_MASKED, masked=True)
+    tag = lambda ok: "PASS" if ok else "FAIL"
+    print(
+        f"Accuracy vs FP32 SDPA: nomask {tag(ok_nomask)} "
+        f"(max_abs BF16={wbf:.2e} TF32={wtf:.2e}) | "
+        f"masked -100 {tag(ok_mask)} "
+        f"(max_abs BF16={wbf_m:.2e} TF32={wtf_m:.2e})"
+    )
 
-    print("=" * 60)
-    print("Numerical accuracy: CuTe BF16  vs  FP32 SDPA  (baseline)")
-    print("=" * 60)
-    all_passed = True
-    for Bwin, H, N, Dh, label in SHAPES:
-        ok = check_accuracy_bf16(Bwin, H, N, Dh, scale, label)
-        all_passed = all_passed and ok
-    print()
-    print("Overall:", "ALL PASS" if all_passed else "SOME FAILED")
+    def sdpa_bf16(q, k, v, s, bias=None):
+        mask = None
+        if bias is not None:
+            mask = _expand_bias_for_sdpa(
+                bias, q.shape[0], q.shape[1], q.shape[2],
+            ).to(dtype=q.dtype)
+        return lambda: F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=s)
 
-    print()
-    print("=" * 60)
-    print("Numerical accuracy: CuTe TF32  vs  FP32 SDPA baseline")
-    print("  [note] allow_tf32 has NO effect on FP32 SDPA — mem-efficient/math")
-    print("  backend ignores matmul.allow_tf32; both modes yield identical speed.")
-    print("=" * 60)
-    tf32_passed = True
-    if not _CUTE_AVAILABLE:
-        print("  [SKIP] CuTeDSL not available — TF32 kernel not built.")
-    else:
-        for Bwin, H, N, Dh, label in SHAPES:
-            ok = check_accuracy_tf32(Bwin, H, N, Dh, scale, label)
-            tf32_passed = tf32_passed and ok
-        print()
-        print("Overall:", "ALL PASS" if tf32_passed else "SOME FAILED")
+    def sdpa_fp32(q, k, v, s, bias=None):
+        return lambda: fp32_sdpa(q, k, v, s, bias=bias)
 
-    def sdpa_bf16(q, k, v, s):
-        return lambda: F.scaled_dot_product_attention(q, k, v, scale=s)
-
-    def sdpa_fp32(q, k, v, s):
-        # allow_tf32 has no effect on FP32 SDPA (mem-efficient/math backend)
-        return lambda: fp32_sdpa(q, k, v, s)
-
+    # --- Unmasked perf (compact) ---
     run_perf_table(
-        SHAPES,
-        title="Performance: CuTe BF16_MIXED  vs  torch SDPA (BF16)",
+        SHAPES_MICRO,
+        title="No mask — micro shapes (BF16 CuTe vs BF16 SDPA)",
         dtype=torch.bfloat16,
-        choose_tile_n=_choose_tile_n,
         cute_precision=WinAttnPrecision.BF16_MIXED,
+        baseline_col="sdpa_ms",
         make_baseline=sdpa_bf16,
-        cute_col="CuTe mean±ci",
-        baseline_col="SDPA mean±ci",
     )
-    _print_latency_note()
-
     if _CUTE_AVAILABLE:
         run_perf_table(
-            SHAPES,
-            title="Performance: CuTe TF32  vs  FP32 SDPA  (fair — same precision budget)",
+            SHAPES_MICRO,
+            title="No mask — micro shapes (TF32 CuTe vs FP32 SDPA)",
             dtype=torch.float32,
-            choose_tile_n=_choose_tile_n_tf32,
             cute_precision=WinAttnPrecision.TF32_ACC_FP32,
+            baseline_col="sdpa_ms",
             make_baseline=sdpa_fp32,
-            cute_col="CuTe-TF32",
-            baseline_col="SDPA-FP32",
         )
-        _print_latency_note()
-        print("      speedup > 1  → CuTe TF32 kernel faster than PyTorch FP32 SDPA.")
-        print("      Note: allow_tf32 has NO effect on FP32 SDPA (mem-efficient/math backend).")
-    else:
-        print()
-        print("=" * 60)
-        print("Performance: TF32_ACC_FP32  —  SKIPPED (CuTeDSL not available)")
-        print("=" * 60)
 
     run_perf_table(
-        SHAPES_REALISTIC,
-        title="Realistic Aurora shapes: CuTe BF16_MIXED  vs  torch SDPA (BF16)",
+        SHAPES_ERA5,
+        title="No mask — ERA5 windows (BF16)",
         dtype=torch.bfloat16,
-        choose_tile_n=_choose_tile_n,
         cute_precision=WinAttnPrecision.BF16_MIXED,
+        baseline_col="sdpa_ms",
         make_baseline=sdpa_bf16,
-        cute_col="CuTe mean±ci",
-        baseline_col="SDPA mean±ci",
     )
-    _print_latency_note()
-
     if _CUTE_AVAILABLE:
         run_perf_table(
-            SHAPES_REALISTIC,
-            title="Realistic shapes: CuTe TF32  vs  FP32 SDPA",
+            SHAPES_ERA5,
+            title="No mask — ERA5 windows (TF32; SDPA is true FP32 matmul)",
             dtype=torch.float32,
-            choose_tile_n=_choose_tile_n_tf32,
             cute_precision=WinAttnPrecision.TF32_ACC_FP32,
+            baseline_col="sdpa_ms",
             make_baseline=sdpa_fp32,
-            cute_col="CuTe-TF32",
-            baseline_col="SDPA-FP32",
         )
-        _print_latency_note()
-        print("      Note: allow_tf32 has NO effect on FP32 SDPA (mem-efficient/math backend).")
+
+    # --- Masked Swin bias -100 (ERA5 encoder) ---
+    print("\nMasked Swin bias -100 (ERA5 encoder, nW=1)")
+    bias144 = make_swin_bias(1, 144)
+    run_perf_table(
+        SHAPES_MASKED,
+        title="Masked — BF16 CuTe vs BF16 SDPA + attn_mask",
+        dtype=torch.bfloat16,
+        cute_precision=WinAttnPrecision.BF16_MIXED,
+        baseline_col="sdpa_ms",
+        make_baseline=sdpa_bf16,
+        bias=bias144,
+    )
+    if _CUTE_AVAILABLE:
+        run_perf_table(
+            SHAPES_MASKED,
+            title="Masked — TF32 CuTe vs FP32 SDPA + attn_mask",
+            dtype=torch.float32,
+            cute_precision=WinAttnPrecision.TF32_ACC_FP32,
+            baseline_col="sdpa_ms",
+            make_baseline=sdpa_fp32,
+            bias=bias144,
+        )
+
+    print(
+        f"\nLatency: trimmed mean of {MEASURED} runs "
+        f"(drop {int(TRIM_FRAC * 100)}% tails). vs = baseline/cute (>1 faster)."
+    )
 
 
 if __name__ == "__main__":

@@ -38,14 +38,14 @@ Two precision modes:
 
 | Mode | I/O | Matmul | Kernel file |
 |------|-----|--------|-------------|
-| `BF16_MIXED` | BF16 | FP32 accum (`mma.sync.m16n8k16.bf16.bf16.f32`) | `_kernel_bf16.py` (v1), `_kernel_bf16_v2.py` (v2) |
-| `TF32_ACC_FP32` | FP32 Q/K, BF16 V in smem | TF32 (`mma.sync.m16n8k8.tf32.tf32.f32`) | `_kernel_fp32_v2.py` |
+| `BF16_MIXED` | BF16 | FP32 accum (`mma.sync.m16n8k16.bf16.bf16.f32`) | `_kernel_bf16.py` (single-pass + stream) |
+| `TF32_ACC_FP32` | FP32 Q/K, BF16 V in smem | TF32 (`mma.sync.m16n8k8.tf32.tf32.f32`) | `_kernel_fp32.py` |
 
-Dispatch in `window_attn_fwd.py` picks the kernel variant by KV-pass count. Production shapes are all single-pass (`N=144`, `tile_n ≥ N`), so BF16 goes through the simpler 128-thread v1 (`cp.async`). Multi-pass cases (long sequences, streaming) use the 160-thread v2 with a dedicated DMA warp and `PipelineTmaAsync` for K/V prefetch overlap.
+Dispatch in `window_attn_fwd.py` picks the BF16 kernel by KV-pass count: `WindowAttnFwdBf16` (128-thread cp.async) when `tile_n ≥ N`, else `WindowAttnFwdBf16Stream` (160-thread TMA + DMA warp).
 
 For TF32 single-pass we recently fused the host-side `v.to(bfloat16)` into the kernel: V stays FP32 in global memory and converts to BF16 on the gmem→register→smem load. That removed ~27% overhead on large `Bwin` and is the main reason TF32 now pulls ahead of FP32 SDPA by a wide margin.
 
-Other small fixes along the way: `torch.zeros_like` → `torch.empty_like` for output allocation (avoided a memset that was masking kernel gains), and adaptive v1/v2 routing instead of a global env flag.
+Output buffers use `torch.empty_like` (no memset). BF16 single-pass vs stream is chosen from `tile_n` and `seq_len`.
 
 Correctness: 56/56 tests in `test_cute_window_attn.py` pass. Full Swin3D block integration (`bench_swin_block.py`) shows bitwise match against the respective baselines (BF16 OPT vs BF16 PyTorch, TF32 OPT vs FP32 strict SDPA).
 

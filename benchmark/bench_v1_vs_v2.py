@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "aurora"))
 
 from aurora.ops.cute._smem_utils import _choose_tile_n
 from aurora.ops.cute._kernel_bf16 import _get_or_compile_bf16
-from aurora.ops.cute._kernel_bf16_v2 import _get_or_compile_bf16_v2
+from aurora.ops.cute._kernel_bf16 import _get_or_compile_bf16_stream
 
 WARMUP = 30
 MEASURED = 1000
@@ -104,7 +104,7 @@ def run_shape(Bwin, H, N, Dh, label):
         head_dim=Dh, seq_len=N, has_bias=has_bias, tile_m=tile_m, tile_n=tile_n,
         q=q, k=k, v=v, o=out_v1, bias_or_none=None,
     )
-    fn_v2 = _get_or_compile_bf16_v2(
+    fn_v2 = _get_or_compile_bf16_stream(
         head_dim=Dh, seq_len=N, has_bias=has_bias, tile_m=tile_m, tile_n=tile_n,
         q=q, k=k, v=v, o=out_v2, bias_or_none=None,
     )

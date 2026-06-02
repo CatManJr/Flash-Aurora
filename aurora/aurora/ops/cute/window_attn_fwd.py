@@ -1,10 +1,7 @@
-"""Window attention forward: correctness-first stable softmax, optional CuTe, SDPA fallback.
+"""Window attention forward: stable softmax reference + optional CuTe kernels.
 
-Default :func:`window_attn_fwd_cute` follows the same numerics as a typical fused
-window kernel: ``QK^T * scale + bias`` in FP32, row-wise ``max``, ``exp``,
-normalize, then ``@ V``.  Set ``AURORA_CUTE_WINDOW_ATTN=1`` to use the
-experimental v2 CuTeDSL kernels (``_kernel_bf16_v2.py``, ``_kernel_fp32_v2.py``).
-SMEM tile sizes: ``_smem_utils.py``.
+``AURORA_CUTE_WINDOW_ATTN=1`` selects CuTeDSL in ``_kernel_bf16.py`` /
+``_kernel_fp32.py``. Tile sizes: ``_smem_utils.py``.
 """
 import contextlib
 import math
@@ -21,20 +18,17 @@ from ._smem_utils import (  # noqa: F401
     _choose_tile_n_tf32,
     _tf32_hybrid_smem_bytes,
 )
+from ._window_softmax import swin_attn_mask_u8
 
 try:
-    from ._kernel_bf16_v2 import (
-        WindowAttnFwdBf16V2,
-        _get_or_compile_bf16_v2,
+    from ._kernel_bf16 import (
         _CUTE_AVAILABLE,
+        _get_or_compile_bf16,
+        _get_or_compile_bf16_stream,
+        _get_or_compile_bf16_qkvpacked,
     )
-    # v1: simpler 128-thread cp.async BF16 kernel.  Used for the single-pass case
-    # (the dominant N=144 production shape), where v2's dedicated DMA warp has no
-    # prefetch overlap to exploit and only costs MMA throughput.
-    from ._kernel_bf16 import _get_or_compile_bf16, _get_or_compile_bf16_qkvpacked
-    from ._kernel_fp32_v2 import (
-        WindowAttnFwdTF32V2,
-        _get_or_compile_tf32_v2,
+    from ._kernel_fp32 import (
+        _get_or_compile_tf32,
         _get_or_compile_tf32_qkvpacked,
     )
     from cutlass import Float32
@@ -144,7 +138,7 @@ def _attention_window_stable(
 # ---------------------------------------------------------------------------
 
 _ENV_CUTE_WINDOW = "AURORA_CUTE_WINDOW_ATTN"
-_CUTE_KERNEL_VERSION = "v2"
+_CUTE_KERNEL_VERSION = "cute"
 
 
 def _bf16_tile_n(seq_len: int, head_dim: int, tile_m: int, tile_n: Optional[int]) -> int:
@@ -153,22 +147,22 @@ def _bf16_tile_n(seq_len: int, head_dim: int, tile_m: int, tile_n: Optional[int]
     return _choose_tile_n(seq_len, head_dim=head_dim, tile_m=tile_m)
 
 
-def _require_sm120_v2(q: torch.Tensor) -> None:
-    """Fail loudly when the v2 CuTe path is used outside its target architecture."""
+def _require_sm120_cute(q: torch.Tensor) -> None:
+    """CuTe kernels are built for sm_120a; fail on other arches."""
     if not q.is_cuda:
-        raise RuntimeError("Aurora CuTe window attention v2 requires CUDA tensors.")
+        raise RuntimeError("Aurora CuTe window attention requires CUDA tensors.")
 
     major, minor = torch.cuda.get_device_capability(q.device)
     if major * 10 + minor != 120:
         raise RuntimeError(
-            "Aurora CuTe window attention v2 currently targets sm_120 only; "
+            "Aurora CuTe window attention targets sm_120 only; "
             f"got compute capability {major}.{minor}."
         )
 
     cute_arch = os.environ.get("CUTE_DSL_ARCH")
     if cute_arch is not None and cute_arch not in {"sm_120", "sm_120a"}:
         raise RuntimeError(
-            "Aurora CuTe window attention v2 expects CUTE_DSL_ARCH=sm_120 "
+            "Aurora CuTe window attention expects CUTE_DSL_ARCH=sm_120 "
             f"or sm_120a when set; got {cute_arch!r}."
         )
 
@@ -212,19 +206,17 @@ def window_attn_fwd_cute(
     if scale_qk is None:
         scale_qk = 1.0 / math.sqrt(Dh)
 
-    # Use the v2 CuTe GEMM kernel by default; set AURORA_CUTE_WINDOW_ATTN=0 to
-    # explicitly disable it. Missing CuTe support should fail loudly on this path.
     use_cute_kernel = os.environ.get(_ENV_CUTE_WINDOW, "1") != "0"
     if use_cute_kernel and not _CUTE_AVAILABLE:
         raise RuntimeError(
-            "Aurora CuTe window attention v2 is enabled but CuTeDSL is unavailable. "
+            "Aurora CuTe window attention is enabled but CuTeDSL is unavailable. "
             f"Set {_ENV_CUTE_WINDOW}=0 to explicitly use the torch fallback."
         )
     if not use_cute_kernel:
         return _attention_window_stable(
             q, k, v, bias, scale_qk, strict_fp32=False,
         )
-    _require_sm120_v2(q)
+    _require_sm120_cute(q)
 
     if not q.is_contiguous():
         q = q.contiguous()
@@ -234,6 +226,9 @@ def window_attn_fwd_cute(
         v = v.contiguous()
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
+    mask_u8 = swin_attn_mask_u8(bias) if bias is not None else None
+    if mask_u8 is not None and not mask_u8.is_contiguous():
+        mask_u8 = mask_u8.contiguous()
 
     # empty (not zeros): the kernel epilogue writes every output row in [0, N) for
     # every (window, head); M-tile rows beyond seqlen map outside the output's N
@@ -254,32 +249,28 @@ def window_attn_fwd_cute(
             v_run = v
         else:
             v_run = v.to(torch.bfloat16)
-        fn = _get_or_compile_tf32_v2(
+        fn = _get_or_compile_tf32(
             head_dim=Dh, seq_len=N, has_bias=has_bias,
             tile_m=tile_m, tile_n=_tile_n,
-            q=q, k=k, v=v_run, o=out, bias_or_none=bias,
+            q=q, k=k, v=v_run, o=out, bias_or_none=mask_u8,
         )
     else:
         _tile_n = _bf16_tile_n(N, head_dim=Dh, tile_m=tile_m, tile_n=tile_n)
-        # Adaptive kernel selection by KV-pass count:
-        #   single-pass (tile_n >= N): v1 — simpler 128-thread cp.async; a dedicated
-        #     DMA warp gives no prefetch overlap here and only wastes MMA threads.
-        #   multi-pass  (tile_n <  N): v2 — 160-thread heterogeneous TMA pipeline, where
-        #     the DMA warp overlaps K/V prefetch with compute across KV tiles.
+        # tile_n >= N: cp.async; tile_n < N: WindowAttnFwdBf16Stream.
         if _tile_n >= N:
             fn = _get_or_compile_bf16(
                 head_dim=Dh, seq_len=N, has_bias=has_bias,
                 tile_m=tile_m, tile_n=_tile_n,
-                q=q, k=k, v=v, o=out, bias_or_none=bias,
+                q=q, k=k, v=v, o=out, bias_or_none=mask_u8,
             )
         else:
-            fn = _get_or_compile_bf16_v2(
+            fn = _get_or_compile_bf16_stream(
                 head_dim=Dh, seq_len=N, has_bias=has_bias,
                 tile_m=tile_m, tile_n=_tile_n,
-                q=q, k=k, v=v, o=out, bias_or_none=bias,
+                q=q, k=k, v=v, o=out, bias_or_none=mask_u8,
             )
 
-    fn(q, k, v_run, out, bias, scale_log2)
+    fn(q, k, v_run, out, mask_u8, scale_log2)
     return out
 
 
@@ -342,10 +333,13 @@ def window_attn_fwd_cute_qkvpacked(
         if output_layout == "bnc":
             return out.permute(0, 2, 1, 3).reshape(Bwin, N, H * Dh)
         return out
-    _require_sm120_v2(qkv)
+    _require_sm120_cute(qkv)
 
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
+    mask_u8 = swin_attn_mask_u8(bias) if bias is not None else None
+    if mask_u8 is not None and not mask_u8.is_contiguous():
+        mask_u8 = mask_u8.contiguous()
 
     qkv_view = qkv.view(Bwin, N, 3, H, Dh)
     q = qkv_view[:, :, 0].permute(0, 2, 1, 3)
@@ -367,7 +361,7 @@ def window_attn_fwd_cute_qkvpacked(
             fn = _get_or_compile_bf16_qkvpacked(
                 head_dim=Dh, seq_len=N, has_bias=has_bias,
                 tile_m=tile_m, tile_n=_tile_n,
-                q=q, k=k, v=v, o=out_kernel, bias_or_none=bias,
+                q=q, k=k, v=v, o=out_kernel, bias_or_none=mask_u8,
                 output_layout=output_layout,
             )
             v_run = v
@@ -393,11 +387,11 @@ def window_attn_fwd_cute_qkvpacked(
         fn = _get_or_compile_tf32_qkvpacked(
             head_dim=Dh, seq_len=N, has_bias=has_bias,
             tile_m=tile_m, tile_n=_tile_n,
-            q=q, k=k, v=v_compile, o=out_kernel, bias_or_none=bias,
+            q=q, k=k, v=v_compile, o=out_kernel, bias_or_none=mask_u8,
             output_layout=output_layout,
         )
 
-    fn(q, k, v_run, out_kernel, bias, scale_log2)
+    fn(q, k, v_run, out_kernel, mask_u8, scale_log2)
     return out
 
 

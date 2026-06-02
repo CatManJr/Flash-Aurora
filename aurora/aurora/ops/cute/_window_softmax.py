@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
+import torch
+from cutlass import Float32, Int32, Uint8
 
 from quack import layout_utils
 
 # Swin shifted-window masks use -100; treat as hard mask (SDPA-equivalent) not a soft offset.
 WINDOW_ATTN_MASK_THRESHOLD = -50.0
+# Host packs ``(bias < threshold)`` into uint8 before the CuTe path (1 = masked, 0 = allowed).
+WINDOW_ATTN_MASK_U8_DTYPE = torch.uint8
 # Large finite sentinel (not -inf) so multi-pass online softmax avoids NaN from -inf - finite.
 WINDOW_ATTN_MASKED_LOGIT = -1.0e4
 
@@ -85,6 +89,65 @@ def apply_swin_bias_mask(
                 acc_S[i] = masked_logit
         else:
             acc_S[i] = neg_inf
+
+
+@cute.jit
+def apply_swin_bias_mask_smem(
+    acc_S: cute.Tensor,
+    tScS: cute.Tensor,
+    sMask: cute.Tensor,
+    m_start: Int32,
+    n_start: Int32,
+    seqlen: Int32,
+) -> None:
+    """Apply Swin mask from a uint8 tile in SMEM (1 = masked, 0 = allowed)."""
+    neg_inf = -Float32.inf
+    masked_logit = Float32(WINDOW_ATTN_MASKED_LOGIT)
+    zero_u8 = Uint8(0)
+
+    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
+        n_idx = n_start + tScS[i][1]
+        m_idx = m_start + tScS[i][0]
+        m_valid = m_idx < seqlen
+        n_valid = n_idx < seqlen
+        if m_valid & n_valid:
+            lm = m_idx - m_start
+            ln = n_idx - n_start
+            if sMask[lm, ln] != zero_u8:
+                acc_S[i] = masked_logit
+        else:
+            acc_S[i] = neg_inf
+
+
+@cute.jit
+def apply_swin_mask_u8_gmem(
+    acc_S: cute.Tensor,
+    tScS: cute.Tensor,
+    mMask_w: cute.Tensor,
+    m_start: Int32,
+    n_start: Int32,
+    seqlen: Int32,
+) -> None:
+    """Apply uint8 Swin mask from gmem (1 = masked). Used when SMEM mask tile is unavailable."""
+    neg_inf = -Float32.inf
+    masked_logit = Float32(WINDOW_ATTN_MASKED_LOGIT)
+    zero_u8 = Uint8(0)
+
+    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
+        n_idx = n_start + tScS[i][1]
+        m_idx = m_start + tScS[i][0]
+        m_valid = m_idx < seqlen
+        n_valid = n_idx < seqlen
+        if m_valid & n_valid:
+            if mMask_w[m_idx, n_idx] != zero_u8:
+                acc_S[i] = masked_logit
+        else:
+            acc_S[i] = neg_inf
+
+
+def swin_attn_mask_u8(bias: torch.Tensor) -> torch.Tensor:
+    """Pack float Swin bias ``(nW, N, N)`` into uint8 mask for CuTe kernels."""
+    return (bias < WINDOW_ATTN_MASK_THRESHOLD).to(WINDOW_ATTN_MASK_U8_DTYPE)
 
 
 @dataclass

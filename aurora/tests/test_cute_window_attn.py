@@ -613,32 +613,33 @@ class TestChooseTileN:
 
     # ----- BF16 _choose_tile_n -----
 
-    def test_bf16_small_N_fits_in_one_pass_48kb(self) -> None:
-        """N=144 must select tile_n=144 (single-pass) even on 48 KB devices."""
+    def test_bf16_n144_streams_on_48kb_with_mask(self) -> None:
+        """N=144 streams on 48 KB once uint8 mask tile (tile_m×tile_n) is reserved."""
         tile_n = _choose_tile_n(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
-        # sQ=8KB, sK+sV=2×144×64×2B=36KB → 44KB < 48KB
-        assert tile_n == 144
+        assert tile_n < 144
+        smem = 64 * 64 * 2 + 4 * tile_n * 64 * 2 + 64 * tile_n
+        assert smem <= 48 * 1024 // 2
 
     def test_bf16_n288_single_pass_99kb(self) -> None:
         """N=288 must select tile_n=288 (single-pass) on a 99 KB device."""
         tile_n = _choose_tile_n(288, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
-        # sQ=8KB, sK+sV=2×288×64×2B=72KB → 80KB < 99KB
         assert tile_n == 288
+        smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2 + 64 * tile_n
+        assert smem <= 99 * 1024
 
     def test_bf16_n288_streaming_on_48kb(self) -> None:
         """N=288 must stream (tile_n < 288) on a 48 KB device."""
         tile_n = _choose_tile_n(288, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
         assert tile_n < 288
-        # Verify the chosen tile actually fits
-        smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2
-        assert smem <= 48 * 1024
+        smem = 64 * 64 * 2 + 4 * tile_n * 64 * 2 + 64 * tile_n
+        assert smem <= 48 * 1024 // 2
 
     def test_bf16_n576_streaming_99kb(self) -> None:
         """N=576 must stream even on 99 KB (total would be 152 KB)."""
         tile_n = _choose_tile_n(576, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
         assert tile_n < 576
-        smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2
-        assert smem <= 99 * 1024
+        smem = 64 * 64 * 2 + 4 * tile_n * 64 * 2 + 64 * tile_n
+        assert smem <= 99 * 1024 // 2
 
     def test_bf16_tile_n_aligned_to_8(self) -> None:
         """tile_n must be a multiple of 8 (MMA-N dimension)."""
@@ -652,8 +653,11 @@ class TestChooseTileN:
         for N in (8, 32, 64, 144, 288, 576):
             tile_n = _choose_tile_n(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
             assert tile_n <= N, f"tile_n={tile_n} > N={N}"
-            smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2
-            assert smem <= budget, f"SMEM {smem} > budget {budget} for N={N}"
+            stages = 1 if tile_n >= N else 2
+            kv_factor = 2 if stages == 1 else 4
+            smem = 64 * 64 * 2 + kv_factor * tile_n * 64 * 2 + 64 * tile_n
+            cap = budget if stages == 1 else budget // 2
+            assert smem <= cap, f"SMEM {smem} > cap {cap} for N={N}"
 
     # ----- TF32 _choose_tile_n_tf32 -----
 
