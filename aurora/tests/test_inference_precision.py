@@ -201,19 +201,20 @@ def test_fast_fp32_backbone_matches_fp32_pytorch_path() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_backbone_bf16_matmul_context_keeps_bf16_activation_chain() -> None:
+def test_backbone_bf16_matmul_context_mlp_chain_and_norm_break() -> None:
     from aurora.model.custom_op_paths import backbone_bf16_matmul_context
+    from aurora.model.swin3d import MLP
 
-    linear = torch.nn.Linear(32, 16, bias=True).cuda().float()
+    mlp = MLP(32, hidden_features=64, out_features=16).cuda().float()
     norm = torch.nn.LayerNorm(16).cuda().float()
-    x = torch.randn(4, 32, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(4, 144, 32, device="cuda", dtype=torch.float32)
 
     with torch.inference_mode():
         with backbone_bf16_matmul_context(enabled=True):
-            y = linear(x)
+            y = mlp(x)
             z = norm(y)
     assert y.dtype == torch.bfloat16
-    assert z.dtype == torch.bfloat16
+    assert z.dtype == torch.float32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

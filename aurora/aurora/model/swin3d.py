@@ -21,7 +21,6 @@ from einops import rearrange
 from timm.layers import DropPath, to_3tuple
 
 from aurora.model.custom_op_paths import (
-    align_binary_activations,
     can_use_cute_qkvpacked,
     can_use_cute_window_attention,
     can_use_triton_adaln,
@@ -72,7 +71,19 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
-        x = self.fc1(x)
+        from aurora.model.custom_op_paths import backbone_bf16_mlp_matmul_active
+
+        use_bf16_gemm_chain = (
+            backbone_bf16_mlp_matmul_active()
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+            and x.dtype in (torch.float32, torch.bfloat16)
+        )
+        if use_bf16_gemm_chain:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                x = self.fc1(x)
+        else:
+            x = self.fc1(x)
         if can_use_triton_gelu(
             x,
             enabled=self.use_triton_gelu,
@@ -85,7 +96,11 @@ class MLP(nn.Module):
         else:
             x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
+        if use_bf16_gemm_chain:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                x = self.fc2(x)
+        else:
+            x = self.fc2(x)
         x = self.drop(x)
         return x
 
@@ -249,6 +264,10 @@ class WindowAttention(nn.Module):
         Returns:
             torch.Tensor: Output of shape `(nW*B, N, C)`.
         """
+        # Triton AdaLN residual can leave BF16 activations; QKV weights are FP32.
+        if x.dtype == torch.bfloat16:
+            x = x.float()
+
         if isinstance(self.lora_qkv, LoRARollout):
             qkv = self._linear_with_optional_lora_merge(
                 x,
@@ -327,6 +346,7 @@ class WindowAttention(nn.Module):
             x = rearrange(x, "B H N D -> B N (H D)")
         if x.dtype != activation_dtype:
             x = x.to(dtype=activation_dtype)
+        if isinstance(self.lora_proj, LoRARollout):
             x = self._linear_with_optional_lora_merge(
                 x,
                 self.proj,
@@ -729,8 +749,7 @@ class Swin3DTransformerBlock(nn.Module):
             drop_path_is_identity=isinstance(self.drop_path, nn.Identity),
         )
         if use_d2_adaln_residual:
-            residual, activation = align_binary_activations(shortcut, x)
-            x = self.norm1.forward_add_residual(residual, activation, c)
+            x = self.norm1.forward_add_residual(shortcut, x, c)
         else:
             x = shortcut + self.drop_path(self.norm1(x, c))
 
@@ -742,8 +761,7 @@ class Swin3DTransformerBlock(nn.Module):
             drop_path_is_identity=isinstance(self.drop_path, nn.Identity),
         )
         if use_d2_norm2:
-            residual, activation = align_binary_activations(x, h)
-            x = self.norm2.forward_add_residual(residual, activation, c)
+            x = self.norm2.forward_add_residual(x, h, c)
         else:
             x = x + self.drop_path(self.norm2(h, c))
         return x

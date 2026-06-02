@@ -186,6 +186,20 @@ def test_adaptive_layernorm_film_add_residual_op_matches_torch() -> None:
 
 
 @requires_cuda
+def test_adaln_forward_add_residual_bf16_activation_output_fp32() -> None:
+    """MLP may feed BF16; fused AdaLN must still return FP32 for the next block."""
+    torch.manual_seed(40)
+    dim, ctx = 128, 128
+    m = AdaptiveLayerNorm(dim, ctx, use_triton=True).cuda().eval()
+    residual = torch.randn(2, 32, dim, device="cuda", dtype=torch.float32)
+    x = torch.randn(2, 32, dim, device="cuda", dtype=torch.bfloat16)
+    c = torch.randn(2, ctx, device="cuda", dtype=torch.float32)
+    with torch.no_grad():
+        out = m.forward_add_residual(residual, x, c)
+    assert out.dtype == torch.float32
+
+
+@requires_cuda
 def test_adaln_forward_add_residual_matches_reference() -> None:
     """Fused residual+AdaLN matches residual + forward (D2)."""
     torch.manual_seed(41)

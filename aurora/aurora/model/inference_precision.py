@@ -3,14 +3,14 @@
 Five named paths:
 
 1. ``fp32``             — PyTorch FP32 (Swin + native Perceiver)
-2. ``pytorch_autocast`` — PyTorch backbone BF16 autocast (no custom Swin kernels)
+2. ``pytorch_autocast`` — PyTorch backbone BF16 autocast (no custom kernels)
 3. ``fast_fp32``        — Triton layout + AdaLN (PyTorch GELU) + native Perceiver
 4. ``tf32_1x``          — ``fast_fp32`` + TF32 backbone matmuls + CuTe TF32 window attention
 5. ``bf16_mixed``       — ``fast_fp32`` + BF16 backbone matmuls + CuTe BF16 window attention
 
-Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. ``bf16_mixed`` keeps FP32
-activations between ops and routes only ``F.linear`` matmuls through BF16 (like autocast matmul
-promotion), so LayerNorm and Triton fusions stay dtype-safe.
+Custom Triton/CuTe Swin3D paths never run inside ``torch.autocast``. ``bf16_mixed`` runs BF16
+Tensor Core only on MLP ``fc1→fc2`` (BF16 activations between them); QKV/proj and AdaLN modulation
+stay FP32. ``F.layer_norm`` on BF16 MLP output uses FP32 statistics (like autocast).
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ class AuroraInferencePrecision(str, Enum):
     """``fast_fp32`` + TF32 ``F.linear`` matmuls + CuTe TF32 window attention (FP32 activations)."""
 
     BF16_MIXED = "bf16_mixed"
-    """``fast_fp32`` + BF16 ``F.linear`` matmuls + CuTe BF16 window attention (FP32 activations)."""
+    """``fast_fp32`` + BF16 GEMM chain + FP32 LayerNorm + CuTe BF16 window attention."""
 
 
 CudaGraphScope = Literal["off", "backbone", "full_gpu"]

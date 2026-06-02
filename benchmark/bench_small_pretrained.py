@@ -47,10 +47,10 @@ _OUTPUT_NAME = "aurora-0.25-small-pretrained-test-output.pickle"
 
 _DEFAULT_TIERS: tuple[tuple[str, str], ...] = (
     ("fp32", "PyTorch FP32"),
-    ("pytorch_autocast", "PyTorch backbone BF16 autocast"),
     ("fast_fp32", "Triton layout + AdaLN + PyTorch GELU"),
     ("tf32_1x", "fast_fp32 + TF32 matmul + CuTe TF32 attn"),
     ("bf16_mixed", "fast_fp32 + BF16 backbone + CuTe BF16 attn"),
+    ("pytorch_autocast", "PyTorch backbone BF16 autocast"),
 )
 
 # Same relative mean error gates as aurora/tests/test_model.py::test_aurora_small

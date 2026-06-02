@@ -47,6 +47,14 @@ class AdaptiveLayerNorm(nn.Module):
         nn.init.zeros_(self.ln_modulation[-1].weight)
         nn.init.zeros_(self.ln_modulation[-1].bias)
 
+    def _use_triton_film(self, x: torch.Tensor) -> bool:
+        """Triton AdaLN is FP32-only (LN stats + output); matches autocast norm boundaries."""
+        return self.use_triton and x.is_cuda and x.dtype == torch.float32
+
+    @staticmethod
+    def _to_triton_fp32(t: torch.Tensor) -> torch.Tensor:
+        return t if t.dtype == torch.float32 else t.float()
+
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
@@ -58,11 +66,15 @@ class AdaptiveLayerNorm(nn.Module):
             torch.Tensor: Output tensor of shape `(B, L, D)`.
         """
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
-        if self.use_triton and x.is_cuda and x.dtype in (torch.float32, torch.bfloat16):
+        if self._use_triton_film(x):
             from aurora.ops.triton_adaln import adaptive_layernorm_film_forward
 
             return adaptive_layernorm_film_forward(
-                x, scale, shift, float(self.scale_bias), float(self.ln.eps)
+                x,
+                self._to_triton_fp32(scale),
+                self._to_triton_fp32(shift),
+                float(self.scale_bias),
+                float(self.ln.eps),
             )
         return self.ln(x) * (self.scale_bias + scale) + shift
 
@@ -83,12 +95,17 @@ class AdaptiveLayerNorm(nn.Module):
             Tensor of shape ``(B, L, D)``.
         """
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
-        if self.use_triton and x.is_cuda and x.dtype in (torch.float32, torch.bfloat16):
-            from aurora.model.custom_op_paths import align_binary_activations
+        if self.use_triton and residual.is_cuda:
             from aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
-            residual, activation = align_binary_activations(residual, x)
+            r = self._to_triton_fp32(residual)
+            a = self._to_triton_fp32(x)
             return adaptive_layernorm_film_add_residual_forward(
-                residual, activation, scale, shift, float(self.scale_bias), float(self.ln.eps)
+                r,
+                a,
+                self._to_triton_fp32(scale),
+                self._to_triton_fp32(shift),
+                float(self.scale_bias),
+                float(self.ln.eps),
             )
         return residual + self.ln(x) * (self.scale_bias + scale) + shift
