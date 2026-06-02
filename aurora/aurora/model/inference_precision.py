@@ -5,10 +5,12 @@ Five named paths:
 1. ``fp32``             — PyTorch FP32 (Swin + native Perceiver)
 2. ``pytorch_autocast`` — PyTorch backbone BF16 autocast (no custom Swin kernels)
 3. ``fast_fp32``        — Triton Swin fusions + native Perceiver
-4. ``tf32_1x``          — ``fast_fp32`` + CuTe 1×TF32 window attention
-5. ``bf16_mixed``       — ``fast_fp32`` + explicit BF16 backbone (CuTe attn + BF16 matmuls)
+4. ``tf32_1x``          — ``fast_fp32`` + TF32 backbone matmuls + CuTe TF32 window attention
+5. ``bf16_mixed``       — ``fast_fp32`` + BF16 backbone matmuls + CuTe BF16 window attention
 
-Custom Triton/CuTe Swin paths never run inside ``torch.autocast``.
+Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. ``bf16_mixed`` keeps FP32
+activations between ops and routes only ``F.linear`` matmuls through BF16 (like autocast matmul
+promotion), so LayerNorm and Triton fusions stay dtype-safe.
 """
 
 from __future__ import annotations
@@ -34,10 +36,10 @@ class AuroraInferencePrecision(str, Enum):
     """Triton Swin fusions (FP32) + native Perceiver."""
 
     TF32_1X = "tf32_1x"
-    """``fast_fp32`` + CuTe 1×TF32 window attention."""
+    """``fast_fp32`` + TF32 ``F.linear`` matmuls + CuTe TF32 window attention (FP32 activations)."""
 
     BF16_MIXED = "bf16_mixed"
-    """``fast_fp32`` + explicit BF16 backbone (CuTe attn + BF16 ``F.linear`` matmuls)."""
+    """``fast_fp32`` + BF16 ``F.linear`` matmuls + CuTe BF16 window attention (FP32 activations)."""
 
 
 CudaGraphScope = Literal["off", "backbone", "full_gpu"]
@@ -52,6 +54,8 @@ class AuroraInferenceConfig:
     autocast_backbone: bool
     backbone_compute_dtype: BackboneComputeDtype
     backbone_matmul_bf16: bool
+    backbone_matmul_tf32: bool
+    window_attn_compute_dtype: BackboneComputeDtype
     use_triton_layout: bool
     use_triton_adaln: bool
     use_triton_mlp: bool
@@ -80,32 +84,44 @@ class AuroraInferenceConfig:
             raise ValueError(
                 "Custom Triton/CuTe Swin paths cannot be combined with backbone autocast."
             )
-        if self.backbone_matmul_bf16 and self.backbone_compute_dtype != "bfloat16":
+        if self.backbone_matmul_bf16 and self.backbone_matmul_tf32:
             raise ValueError(
-                "backbone_matmul_bf16 requires backbone_compute_dtype='bfloat16'."
+                "backbone_matmul_bf16 and backbone_matmul_tf32 are mutually exclusive."
+            )
+        if self.backbone_matmul_bf16 and self.backbone_compute_dtype != "float32":
+            raise ValueError(
+                "backbone_matmul_bf16 requires backbone_compute_dtype='float32' "
+                "(FP32 activation chain; matmuls alone run BF16)."
+            )
+        if self.backbone_matmul_tf32 and self.backbone_compute_dtype != "float32":
+            raise ValueError(
+                "backbone_matmul_tf32 requires backbone_compute_dtype='float32' "
+                "(FP32 activation chain; matmuls alone run TF32)."
             )
         if self.precision == AuroraInferencePrecision.FP32:
             if uses_custom_swin or self.autocast_backbone or self.use_perceiver_flash_attn:
                 raise ValueError("FP32 preset must not enable Triton/CuTe/autocast/Perceiver FA.")
-            if self.autocast_encoder_decoder or self.backbone_matmul_bf16:
-                raise ValueError("FP32 preset must not enable encoder/decoder autocast or BF16 matmul.")
+            if self.autocast_encoder_decoder or self.backbone_matmul_bf16 or self.backbone_matmul_tf32:
+                raise ValueError("FP32 preset must not enable encoder/decoder autocast or approximate matmul.")
         if self.precision == AuroraInferencePrecision.PYTORCH_AUTOCAST:
             if uses_custom_swin or self.use_perceiver_flash_attn:
                 raise ValueError("PYTORCH_AUTOCAST preset must not enable Triton/CuTe/Perceiver FA.")
-            if self.autocast_encoder_decoder or self.backbone_matmul_bf16:
-                raise ValueError("PYTORCH_AUTOCAST preset must not enable encoder/decoder autocast or BF16 matmul.")
+            if self.autocast_encoder_decoder or self.backbone_matmul_bf16 or self.backbone_matmul_tf32:
+                raise ValueError("PYTORCH_AUTOCAST preset must not enable encoder/decoder autocast or approximate matmul.")
             if not self.autocast_backbone:
                 raise ValueError("PYTORCH_AUTOCAST preset requires autocast_backbone=True.")
         if self.precision == AuroraInferencePrecision.FAST_FP32:
-            if self.autocast_backbone or self.use_cute_window_attn or self.backbone_matmul_bf16:
-                raise ValueError("FAST_FP32 preset requires autocast off, CuTe off, and BF16 matmul off.")
+            if self.autocast_backbone or self.use_cute_window_attn or self.backbone_matmul_bf16 or self.backbone_matmul_tf32:
+                raise ValueError("FAST_FP32 preset requires autocast off, CuTe off, and approximate matmul off.")
             if not (self.use_triton_layout and self.use_triton_adaln and self.use_triton_mlp):
                 raise ValueError("FAST_FP32 preset requires all Triton Swin fusions enabled.")
             if self.use_perceiver_flash_attn or self.autocast_encoder_decoder:
                 raise ValueError("FAST_FP32 preset requires native Perceiver (no FA, no E/D autocast).")
         if self.precision == AuroraInferencePrecision.TF32_1X:
             if self.autocast_backbone or self.backbone_compute_dtype != "float32" or self.backbone_matmul_bf16:
-                raise ValueError("TF32_1X preset requires FP32 backbone compute and matmul.")
+                raise ValueError("TF32_1X preset requires FP32 backbone compute and no BF16 matmul.")
+            if not self.backbone_matmul_tf32:
+                raise ValueError("TF32_1X preset requires backbone_matmul_tf32=True.")
             if not (
                 self.use_triton_layout
                 and self.use_triton_adaln
@@ -116,10 +132,12 @@ class AuroraInferenceConfig:
             if self.use_perceiver_flash_attn or self.autocast_encoder_decoder:
                 raise ValueError("TF32_1X preset requires native Perceiver (no FA, no E/D autocast).")
         if self.precision == AuroraInferencePrecision.BF16_MIXED:
-            if self.autocast_backbone or self.backbone_compute_dtype != "bfloat16":
-                raise ValueError("BF16_MIXED preset requires explicit BF16 backbone compute.")
-            if not self.backbone_matmul_bf16:
-                raise ValueError("BF16_MIXED preset requires backbone_matmul_bf16=True.")
+            if self.autocast_backbone:
+                raise ValueError("BF16_MIXED preset must not use backbone autocast.")
+            if not self.backbone_matmul_bf16 or self.backbone_matmul_tf32:
+                raise ValueError("BF16_MIXED preset requires backbone_matmul_bf16=True and no TF32 matmul.")
+            if self.window_attn_compute_dtype != "bfloat16":
+                raise ValueError("BF16_MIXED preset requires CuTe BF16 window attention.")
             if not (
                 self.use_triton_layout
                 and self.use_triton_adaln
@@ -137,6 +155,8 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
         autocast_backbone=False,
         backbone_compute_dtype="float32",
         backbone_matmul_bf16=False,
+        backbone_matmul_tf32=False,
+        window_attn_compute_dtype="float32",
         use_triton_layout=False,
         use_triton_adaln=False,
         use_triton_mlp=False,
@@ -152,6 +172,8 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
         autocast_backbone=True,
         backbone_compute_dtype="float32",
         backbone_matmul_bf16=False,
+        backbone_matmul_tf32=False,
+        window_attn_compute_dtype="float32",
         use_triton_layout=False,
         use_triton_adaln=False,
         use_triton_mlp=False,
@@ -167,6 +189,8 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
         autocast_backbone=False,
         backbone_compute_dtype="float32",
         backbone_matmul_bf16=False,
+        backbone_matmul_tf32=False,
+        window_attn_compute_dtype="float32",
         use_triton_layout=True,
         use_triton_adaln=True,
         use_triton_mlp=True,
@@ -182,6 +206,8 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
         autocast_backbone=False,
         backbone_compute_dtype="float32",
         backbone_matmul_bf16=False,
+        backbone_matmul_tf32=True,
+        window_attn_compute_dtype="float32",
         use_triton_layout=True,
         use_triton_adaln=True,
         use_triton_mlp=True,
@@ -195,8 +221,10 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
     AuroraInferencePrecision.BF16_MIXED: AuroraInferenceConfig(
         precision=AuroraInferencePrecision.BF16_MIXED,
         autocast_backbone=False,
-        backbone_compute_dtype="bfloat16",
+        backbone_compute_dtype="float32",
         backbone_matmul_bf16=True,
+        backbone_matmul_tf32=False,
+        window_attn_compute_dtype="bfloat16",
         use_triton_layout=True,
         use_triton_adaln=True,
         use_triton_mlp=True,
@@ -266,6 +294,8 @@ def apply_inference_config(
         "autocast": cfg.autocast_backbone,
         "backbone_compute_dtype": cfg.backbone_compute_dtype,
         "backbone_matmul_bf16": cfg.backbone_matmul_bf16,
+        "backbone_matmul_tf32": cfg.backbone_matmul_tf32,
+        "window_attn_compute_dtype": cfg.window_attn_compute_dtype,
         "use_triton_layout": cfg.use_triton_layout,
         "use_triton_adaln": cfg.use_triton_adaln,
         "use_triton_mlp": cfg.use_triton_mlp,

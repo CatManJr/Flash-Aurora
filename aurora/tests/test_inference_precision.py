@@ -76,6 +76,8 @@ def test_tf32_1x_preset_adds_cute() -> None:
     assert cfg.use_cute_window_attn is True
     assert cfg.backbone_compute_dtype == "float32"
     assert cfg.backbone_matmul_bf16 is False
+    assert cfg.backbone_matmul_tf32 is True
+    assert cfg.window_attn_compute_dtype == "float32"
     assert cfg.use_perceiver_flash_attn is False
     assert cfg.cuda_graph_scope == "backbone"
 
@@ -83,7 +85,8 @@ def test_tf32_1x_preset_adds_cute() -> None:
 def test_bf16_mixed_preset_uses_explicit_bf16_backbone() -> None:
     cfg = resolve_inference_config("bf16_mixed")
     assert cfg is not None
-    assert cfg.backbone_compute_dtype == "bfloat16"
+    assert cfg.backbone_compute_dtype == "float32"
+    assert cfg.window_attn_compute_dtype == "bfloat16"
     assert cfg.backbone_matmul_bf16 is True
     assert cfg.use_cute_window_attn is True
     assert cfg.autocast_backbone is False
@@ -98,6 +101,8 @@ def test_custom_ops_cannot_combine_with_autocast() -> None:
         autocast_backbone=True,
         backbone_compute_dtype="float32",
         backbone_matmul_bf16=False,
+        backbone_matmul_tf32=False,
+        window_attn_compute_dtype="float32",
         use_triton_layout=True,
         use_triton_adaln=True,
         use_triton_mlp=True,
@@ -117,6 +122,8 @@ def test_apply_inference_config_expands_constructor_kwargs() -> None:
         "autocast": False,
         "backbone_compute_dtype": "float32",
         "backbone_matmul_bf16": False,
+        "backbone_matmul_tf32": False,
+        "window_attn_compute_dtype": "float32",
         "use_triton_layout": True,
         "use_triton_adaln": True,
         "use_triton_mlp": True,
@@ -138,6 +145,7 @@ def test_aurora_constructor_applies_tf32_1x_preset() -> None:
     model = AuroraSmallPretrained(use_lora=False, inference_precision="tf32_1x")
     assert model.inference_config is not None
     assert model.inference_config.precision == AuroraInferencePrecision.TF32_1X
+    assert model.inference_config.backbone_matmul_tf32 is True
     block = model.backbone.encoder_layers[0].blocks[0]
     assert block.use_triton_layout is True
     assert block.attn.use_cute_window_attn is True
@@ -165,4 +173,15 @@ def test_backbone_bf16_matmul_context_routes_linear_to_bf16() -> None:
     with torch.inference_mode():
         with backbone_bf16_matmul_context(enabled=True):
             y = linear(x)
-    assert y.dtype == torch.bfloat16
+    assert y.dtype == torch.float32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_backbone_tf32_matmul_context_enables_tf32_flags() -> None:
+    from aurora.model.custom_op_paths import backbone_tf32_matmul_context
+
+    with torch.inference_mode():
+        with backbone_tf32_matmul_context(enabled=True):
+            assert torch.get_float32_matmul_precision() == "high"
+            assert torch.backends.cuda.matmul.allow_tf32 is True
+    # Restored after context (default may vary; just ensure no exception on enter/exit).

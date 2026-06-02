@@ -140,6 +140,7 @@ class CudaGraphAuroraBackboneRunner:
         autocast: bool = False,
         backbone_compute_dtype: torch.dtype | None = None,
         backbone_matmul_bf16: bool = False,
+        backbone_matmul_tf32: bool = False,
         warmup_iters: int = 3,
     ) -> None:
         if not x.is_cuda:
@@ -153,6 +154,7 @@ class CudaGraphAuroraBackboneRunner:
         self.autocast = autocast
         self.backbone_compute_dtype = backbone_compute_dtype
         self.backbone_matmul_bf16 = backbone_matmul_bf16
+        self.backbone_matmul_tf32 = backbone_matmul_tf32
         self.graph = torch.cuda.CUDAGraph()
 
         self.static_x.copy_(x)
@@ -180,6 +182,7 @@ class CudaGraphAuroraBackboneRunner:
                 autocast=self.autocast,
                 backbone_compute_dtype=self.backbone_compute_dtype,
                 backbone_matmul_bf16=self.backbone_matmul_bf16,
+                backbone_matmul_tf32=self.backbone_matmul_tf32,
                 lead_time=self.lead_time,
                 patch_res=self.patch_res,
                 rollout_step=self.rollout_step,
@@ -303,10 +306,16 @@ def build_aurora_cuda_graph_runner(
         inf = getattr(model, "inference_config", None)
         backbone_compute_dtype = None
         backbone_matmul_bf16 = False
+        backbone_matmul_tf32 = False
         if inf is not None and not autocast_backbone:
-            if inf.backbone_compute_dtype == "bfloat16":
+            if (
+                inf.backbone_compute_dtype == "bfloat16"
+                and not inf.backbone_matmul_bf16
+                and not inf.backbone_matmul_tf32
+            ):
                 backbone_compute_dtype = model.cute_window_attn_dtype
             backbone_matmul_bf16 = inf.backbone_matmul_bf16
+            backbone_matmul_tf32 = inf.backbone_matmul_tf32
         return CudaGraphAuroraBackboneRunner(
             model.backbone,
             backbone_input,
@@ -316,6 +325,7 @@ def build_aurora_cuda_graph_runner(
             autocast=autocast_backbone,
             backbone_compute_dtype=backbone_compute_dtype,
             backbone_matmul_bf16=backbone_matmul_bf16,
+            backbone_matmul_tf32=backbone_matmul_tf32,
             warmup_iters=warmup_iters,
         )
     if scope == "full_gpu":

@@ -243,6 +243,7 @@ class Aurora(torch.nn.Module):
             preset_kwargs = apply_inference_config(inference_precision)
             autocast = preset_kwargs["autocast"]
             backbone_compute_dtype_name = preset_kwargs["backbone_compute_dtype"]
+            window_attn_compute_dtype_name = preset_kwargs["window_attn_compute_dtype"]
             use_triton_layout = preset_kwargs["use_triton_layout"]
             use_triton_adaln = preset_kwargs["use_triton_adaln"]
             use_triton_mlp = preset_kwargs["use_triton_mlp"]
@@ -252,11 +253,12 @@ class Aurora(torch.nn.Module):
             autocast_encoder_decoder = preset_kwargs["autocast_encoder_decoder"]
         else:
             backbone_compute_dtype_name = "float32"
+            window_attn_compute_dtype_name = "float32"
             autocast_encoder_decoder = False
 
         from aurora.model.custom_op_paths import backbone_dtype_from_name
 
-        self.cute_window_attn_dtype = backbone_dtype_from_name(backbone_compute_dtype_name)
+        self.cute_window_attn_dtype = backbone_dtype_from_name(window_attn_compute_dtype_name)
 
         self.surf_vars = surf_vars
         self.atmos_vars = atmos_vars
@@ -512,10 +514,14 @@ class Aurora(torch.nn.Module):
 
         backbone_compute_dtype = None
         backbone_matmul_bf16 = False
+        backbone_matmul_tf32 = False
         if self.inference_config is not None:
             backbone_matmul_bf16 = self.inference_config.backbone_matmul_bf16
+            backbone_matmul_tf32 = self.inference_config.backbone_matmul_tf32
             if (
                 not self.autocast
+                and not backbone_matmul_bf16
+                and not backbone_matmul_tf32
                 and self.inference_config.backbone_compute_dtype == "bfloat16"
             ):
                 backbone_compute_dtype = self.cute_window_attn_dtype
@@ -526,6 +532,7 @@ class Aurora(torch.nn.Module):
             autocast=self.autocast,
             backbone_compute_dtype=backbone_compute_dtype,
             backbone_matmul_bf16=backbone_matmul_bf16,
+            backbone_matmul_tf32=backbone_matmul_tf32,
             lead_time=lead_time,
             patch_res=patch_res,
             rollout_step=rollout_step,

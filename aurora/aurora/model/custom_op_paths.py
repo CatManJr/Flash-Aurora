@@ -1,9 +1,8 @@
 """Glue between Aurora model forward paths and custom CUDA/Triton/CuTe ops.
 
-Custom kernels declare supported I/O dtypes; inference presets keep custom Swin paths
-outside ``torch.autocast``. The ``bf16_mixed`` preset casts activations at the backbone
-boundary and routes backbone ``F.linear`` matmuls through BF16 (Tensor Core), mimicking
-autocast coverage without wrapping custom kernels in ``torch.autocast``.
+Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. ``bf16_mixed`` / ``tf32_1x`` keep
+FP32 activations between ops and route only backbone ``F.linear`` matmuls through BF16 or TF32
+Tensor Core (mirroring autocast matmul promotion), so LayerNorm and Triton fusions stay dtype-safe.
 """
 
 from __future__ import annotations
@@ -48,11 +47,11 @@ def run_with_encoder_decoder_autocast(
 
 @contextmanager
 def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
-    """Route backbone ``F.linear`` matmuls through BF16 on CUDA inference (Tensor Core).
+    """Route backbone ``F.linear`` matmuls through BF16 Tensor Core, keep FP32 activations.
 
-    Patches ``torch.nn.functional.linear`` for the duration of a backbone forward so QKV,
-    projection, MLP, and patch-merge linears match ``pytorch_autocast`` matmul coverage while
-    Triton/CuTe custom ops stay outside ``torch.autocast``.
+    Mimics ``torch.autocast`` matmul promotion without wrapping Triton/CuTe ops: each ``F.linear``
+    runs under a narrow BF16 autocast region, then outputs are cast back to the input activation
+    dtype so LayerNorm and other FP32-weight ops stay valid.
     """
     if not enabled:
         yield
@@ -70,13 +69,12 @@ def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
             and not torch.is_grad_enabled()
             and input.dtype in _TRITON_ELEM_DTYPES
         ):
-            matmul_dtype = torch.bfloat16
-            if input.dtype != matmul_dtype:
-                input = input.to(matmul_dtype)
-            weight = weight.to(device=input.device, dtype=matmul_dtype)
-            if bias is not None:
-                bias = bias.to(device=input.device, dtype=matmul_dtype)
-            return _orig_linear(input, weight, bias)
+            activation_dtype = input.dtype
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = _orig_linear(input, weight, bias)
+            if out.dtype != activation_dtype:
+                out = out.to(dtype=activation_dtype)
+            return out
         return _orig_linear(input, weight, bias)
 
     torch.nn.functional.linear = _bf16_linear  # type: ignore[method-assign]
@@ -84,6 +82,72 @@ def backbone_bf16_matmul_context(*, enabled: bool) -> Iterator[None]:
         yield
     finally:
         torch.nn.functional.linear = _orig_linear
+
+
+@contextmanager
+def backbone_tf32_matmul_context(*, enabled: bool) -> Iterator[None]:
+    """Route backbone ``F.linear`` / ``addmm`` matmuls through TF32 Tensor Core, FP32 I/O.
+
+    Enables ``float32_matmul_precision='high'`` and CUDA TF32 flags for the backbone forward.
+    Each ``F.linear`` call is additionally wrapped so matmul flags apply even if outer code
+    changed global settings. Activations stay FP32 (LayerNorm-safe).
+    """
+    if not enabled:
+        yield
+        return
+
+    prev_precision = torch.get_float32_matmul_precision()
+    prev_cuda_tf32 = torch.backends.cuda.matmul.allow_tf32
+    prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+
+    def _enable_tf32_flags() -> None:
+        torch.set_float32_matmul_precision("high")
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+    _enable_tf32_flags()
+
+    _orig_linear = torch.nn.functional.linear
+
+    def _tf32_linear(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            input.is_cuda
+            and not torch.is_grad_enabled()
+            and input.dtype == torch.float32
+            and weight.dtype == torch.float32
+        ):
+            _enable_tf32_flags()
+            return _orig_linear(input, weight, bias)
+        return _orig_linear(input, weight, bias)
+
+    torch.nn.functional.linear = _tf32_linear  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        torch.nn.functional.linear = _orig_linear
+        torch.set_float32_matmul_precision(prev_precision)
+        torch.backends.cuda.matmul.allow_tf32 = prev_cuda_tf32
+        torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+
+@contextmanager
+def backbone_matmul_context(*, tf32: bool = False, bf16: bool = False) -> Iterator[None]:
+    """Exactly one of ``tf32`` or ``bf16`` may be enabled for backbone matmul routing."""
+    if tf32 and bf16:
+        raise ValueError("backbone_matmul_context: tf32 and bf16 are mutually exclusive.")
+    if bf16:
+        with backbone_bf16_matmul_context(enabled=True):
+            yield
+    elif tf32:
+        with backbone_tf32_matmul_context(enabled=True):
+            yield
+    else:
+        yield
 
 
 def backbone_dtype_from_name(name: BackboneComputeDtype) -> torch.dtype:
@@ -113,13 +177,14 @@ def run_backbone_with_dtype_routing(
     autocast: bool,
     backbone_compute_dtype: torch.dtype | None = None,
     backbone_matmul_bf16: bool = False,
+    backbone_matmul_tf32: bool = False,
     lead_time: Any,
     patch_res: tuple[int, int, int],
     rollout_step: int,
 ) -> torch.Tensor:
     """Shared backbone entry for eager forward and CUDA graph capture."""
     decoder_dtype = x.dtype
-    with backbone_bf16_matmul_context(enabled=backbone_matmul_bf16):
+    with backbone_matmul_context(tf32=backbone_matmul_tf32, bf16=backbone_matmul_bf16):
         if autocast:
             if torch.cuda.is_available():
                 device_type = "cuda"

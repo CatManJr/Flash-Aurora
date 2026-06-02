@@ -7,8 +7,8 @@ Tiers (accuracy reference = ``fp32``):
 
 1. ``fp32``             — PyTorch FP32
 2. ``pytorch_autocast`` — PyTorch backbone BF16 autocast
-3. ``fast_fp32``        — Triton Swin + native Perceiver
-4. ``tf32_1x``          — ``fast_fp32`` + CuTe 1×TF32 window attention
+3. ``fast_fp32``        — Triton layout + native Perceiver
+4. ``tf32_1x``          — ``fast_fp32`` + TF32 backbone matmuls + CuTe TF32 window attention
 5. ``bf16_mixed``       — ``fast_fp32`` + explicit BF16 backbone (CuTe attn + BF16 matmuls)
 
 All tiers use native Perceiver (PyTorch SDPA). Each tier rebuilds
@@ -91,7 +91,7 @@ _BENCH_TIERS: tuple[tuple[str, str, str], ...] = (
     ("fp32", "fp32", "PyTorch FP32"),
     ("pytorch_autocast", "pytorch_autocast", "PyTorch backbone BF16 autocast"),
     ("fast_fp32", "fast_fp32", "Triton Swin + native Perceiver"),
-    ("tf32_1x", "tf32_1x", "fast_fp32 + CuTe 1×TF32 attention"),
+    ("tf32_1x", "tf32_1x", "fast_fp32 + TF32 backbone matmuls + CuTe TF32 attn"),
     ("bf16_mixed", "bf16_mixed", "fast_fp32 + explicit BF16 backbone (CuTe + matmuls)"),
 )
 
