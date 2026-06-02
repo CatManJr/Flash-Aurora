@@ -264,7 +264,7 @@ def test_swin3d_backbone_triton_matches_reference() -> None:
         window_size=(2, 6, 12),
         use_lora=True,
         lora_mode="single",
-        use_triton_mlp=True,
+        use_triton_mlp=False,
     )
     b_triton = Swin3DTransformerBackbone(
         **kwargs,
@@ -313,7 +313,7 @@ def test_swin3d_lora_merged_inference_matches_reference(
         lora_steps=4,
         use_triton_layout=True,
         use_triton_adaln=True,
-        use_triton_mlp=True,
+        use_triton_mlp=False,
     )
     b_merge = Swin3DTransformerBackbone(
         **kwargs,

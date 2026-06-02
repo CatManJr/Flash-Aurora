@@ -63,7 +63,8 @@ def test_fast_fp32_preset_is_triton_with_native_perceiver() -> None:
     cfg = resolve_inference_config("fast_fp32")
     assert cfg is not None
     assert cfg.use_triton_layout is True
-    assert cfg.use_triton_mlp is True
+    assert cfg.use_triton_adaln is True
+    assert cfg.use_triton_mlp is False
     assert cfg.use_cute_window_attn is False
     assert cfg.use_perceiver_flash_attn is False
     assert cfg.autocast_encoder_decoder is False
@@ -126,7 +127,7 @@ def test_apply_inference_config_expands_constructor_kwargs() -> None:
         "window_attn_compute_dtype": "float32",
         "use_triton_layout": True,
         "use_triton_adaln": True,
-        "use_triton_mlp": True,
+        "use_triton_mlp": False,
         "use_cute_window_attn": False,
         "use_triton_perceiver_ln_fusion": False,
         "use_perceiver_flash_attn": False,
@@ -161,6 +162,42 @@ def test_aurora_constructor_applies_bf16_mixed_preset() -> None:
     assert model.cute_window_attn_dtype == torch.bfloat16
     block = model.backbone.encoder_layers[0].blocks[0]
     assert block.attn.cute_window_attn_dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fast_fp32_backbone_matches_fp32_pytorch_path() -> None:
+    """Triton layout+AdaLN with PyTorch GELU should match pure PyTorch backbone."""
+    from datetime import timedelta
+
+    from aurora.model.swin3d import Swin3DTransformerBackbone
+
+    torch.manual_seed(0)
+    kwargs = dict(
+        embed_dim=128,
+        encoder_depths=(2, 2),
+        encoder_num_heads=(4, 8),
+        decoder_depths=(2, 2),
+        decoder_num_heads=(8, 4),
+        window_size=(2, 4, 4),
+        use_lora=False,
+    )
+    b_fast = Swin3DTransformerBackbone(
+        **kwargs,
+        use_triton_layout=True,
+        use_triton_adaln=True,
+        use_triton_mlp=False,
+    ).cuda().eval()
+    b_ref = Swin3DTransformerBackbone(**kwargs).cuda().eval()
+    b_ref.load_state_dict(b_fast.state_dict())
+
+    C, H, W = 4, 16, 32
+    L = C * H * W
+    x = torch.randn(1, L, 128, device="cuda", dtype=torch.float32)
+    lead = timedelta(hours=6)
+    with torch.inference_mode():
+        y_fast = b_fast(x, lead_time=lead, rollout_step=0, patch_res=(C, H, W))
+        y_ref = b_ref(x, lead_time=lead, rollout_step=0, patch_res=(C, H, W))
+    torch.testing.assert_close(y_fast, y_ref, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

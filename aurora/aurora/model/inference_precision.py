@@ -4,7 +4,7 @@ Five named paths:
 
 1. ``fp32``             — PyTorch FP32 (Swin + native Perceiver)
 2. ``pytorch_autocast`` — PyTorch backbone BF16 autocast (no custom Swin kernels)
-3. ``fast_fp32``        — Triton Swin fusions + native Perceiver
+3. ``fast_fp32``        — Triton layout + AdaLN (PyTorch GELU) + native Perceiver
 4. ``tf32_1x``          — ``fast_fp32`` + TF32 backbone matmuls + CuTe TF32 window attention
 5. ``bf16_mixed``       — ``fast_fp32`` + BF16 backbone matmuls + CuTe BF16 window attention
 
@@ -33,7 +33,7 @@ class AuroraInferencePrecision(str, Enum):
     """PyTorch backbone BF16 autocast; no Triton/CuTe Swin kernels."""
 
     FAST_FP32 = "fast_fp32"
-    """Triton Swin fusions (FP32) + native Perceiver."""
+    """Triton layout + AdaLN (PyTorch GELU, FP32) + native Perceiver."""
 
     TF32_1X = "tf32_1x"
     """``fast_fp32`` + TF32 ``F.linear`` matmuls + CuTe TF32 window attention (FP32 activations)."""
@@ -113,8 +113,10 @@ class AuroraInferenceConfig:
         if self.precision == AuroraInferencePrecision.FAST_FP32:
             if self.autocast_backbone or self.use_cute_window_attn or self.backbone_matmul_bf16 or self.backbone_matmul_tf32:
                 raise ValueError("FAST_FP32 preset requires autocast off, CuTe off, and approximate matmul off.")
-            if not (self.use_triton_layout and self.use_triton_adaln and self.use_triton_mlp):
-                raise ValueError("FAST_FP32 preset requires all Triton Swin fusions enabled.")
+            if not (self.use_triton_layout and self.use_triton_adaln):
+                raise ValueError("FAST_FP32 preset requires Triton layout and AdaLN.")
+            if self.use_triton_mlp:
+                raise ValueError("FAST_FP32 preset must use PyTorch GELU (use_triton_mlp=False).")
             if self.use_perceiver_flash_attn or self.autocast_encoder_decoder:
                 raise ValueError("FAST_FP32 preset requires native Perceiver (no FA, no E/D autocast).")
         if self.precision == AuroraInferencePrecision.TF32_1X:
@@ -122,13 +124,10 @@ class AuroraInferenceConfig:
                 raise ValueError("TF32_1X preset requires FP32 backbone compute and no BF16 matmul.")
             if not self.backbone_matmul_tf32:
                 raise ValueError("TF32_1X preset requires backbone_matmul_tf32=True.")
-            if not (
-                self.use_triton_layout
-                and self.use_triton_adaln
-                and self.use_triton_mlp
-                and self.use_cute_window_attn
-            ):
-                raise ValueError("TF32_1X preset requires Triton Swin + CuTe.")
+            if not (self.use_triton_layout and self.use_triton_adaln and self.use_cute_window_attn):
+                raise ValueError("TF32_1X preset requires Triton layout/AdaLN + CuTe.")
+            if self.use_triton_mlp:
+                raise ValueError("TF32_1X preset must use PyTorch GELU (use_triton_mlp=False).")
             if self.use_perceiver_flash_attn or self.autocast_encoder_decoder:
                 raise ValueError("TF32_1X preset requires native Perceiver (no FA, no E/D autocast).")
         if self.precision == AuroraInferencePrecision.BF16_MIXED:
@@ -138,13 +137,10 @@ class AuroraInferenceConfig:
                 raise ValueError("BF16_MIXED preset requires backbone_matmul_bf16=True and no TF32 matmul.")
             if self.window_attn_compute_dtype != "bfloat16":
                 raise ValueError("BF16_MIXED preset requires CuTe BF16 window attention.")
-            if not (
-                self.use_triton_layout
-                and self.use_triton_adaln
-                and self.use_triton_mlp
-                and self.use_cute_window_attn
-            ):
-                raise ValueError("BF16_MIXED preset requires Triton Swin + CuTe.")
+            if not (self.use_triton_layout and self.use_triton_adaln and self.use_cute_window_attn):
+                raise ValueError("BF16_MIXED preset requires Triton layout/AdaLN + CuTe.")
+            if self.use_triton_mlp:
+                raise ValueError("BF16_MIXED preset must use PyTorch GELU (use_triton_mlp=False).")
             if self.use_perceiver_flash_attn or self.autocast_encoder_decoder:
                 raise ValueError("BF16_MIXED preset requires native Perceiver (no FA, no E/D autocast).")
 
@@ -193,7 +189,7 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
         window_attn_compute_dtype="float32",
         use_triton_layout=True,
         use_triton_adaln=True,
-        use_triton_mlp=True,
+        use_triton_mlp=False,
         use_cute_window_attn=False,
         use_triton_perceiver_ln_fusion=False,
         use_perceiver_flash_attn=False,
@@ -210,7 +206,7 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
         window_attn_compute_dtype="float32",
         use_triton_layout=True,
         use_triton_adaln=True,
-        use_triton_mlp=True,
+        use_triton_mlp=False,
         use_cute_window_attn=True,
         use_triton_perceiver_ln_fusion=False,
         use_perceiver_flash_attn=False,
@@ -227,7 +223,7 @@ _PRESETS: dict[AuroraInferencePrecision, AuroraInferenceConfig] = {
         window_attn_compute_dtype="bfloat16",
         use_triton_layout=True,
         use_triton_adaln=True,
-        use_triton_mlp=True,
+        use_triton_mlp=False,
         use_cute_window_attn=True,
         use_triton_perceiver_ln_fusion=False,
         use_perceiver_flash_attn=False,
