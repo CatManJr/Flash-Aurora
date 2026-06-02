@@ -2,12 +2,20 @@
 
 WindowAttnFwdBf16: 128-thread cp.async, single KV tile (typical N=144).
 WindowAttnFwdBf16Stream: 160-thread TMA path when tile_n < seq_len.
-uint8 Swin mask: smem on single pass, gmem on stream.
+uint8 Swin mask read directly from gmem (L2-resident) in both kernels.
 """
 import math
+import os
 from typing import Optional
 
 import torch
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 try:
     import cuda.bindings.driver as cuda  # noqa: F401
@@ -15,9 +23,7 @@ try:
     import cutlass
     import cutlass.cute as cute
     import cutlass.pipeline as pipeline
-    import cutlass.utils as cutlass_utils
-    import cutlass.utils.hopper_helpers as sm90_utils
-    from cutlass import Constexpr, Float32, BFloat16, Int32, Int64, Uint8
+    from cutlass import Constexpr, Float32, BFloat16, Int32, Int64
     from cutlass.cute.nvgpu import cpasync, warp
     from cutlass.cutlass_dsl import BaseDSL
 
@@ -37,10 +43,14 @@ try:
     from ._window_softmax import (
         WindowOnlineSoftmax,
         apply_partial_kv_mask,
-        apply_swin_bias_mask_smem,
         apply_swin_mask_u8_gmem,
     )
     from ._smem_utils import _choose_tile_n
+    from ._blackwell_load import (
+        make_kv_mainloop_pipeline,
+        make_kv_tma_smem_layouts,
+        make_tma_atom_and_tensor,
+    )
 
     _CUTE_AVAILABLE = True
     _bf16_compile_cache: dict = {}
@@ -156,19 +166,11 @@ class WindowAttnFwdBf16:
         sK_struct = cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(sK_layout)], 1024]
         sV_struct = cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(sV_layout)], 1024]
 
-        sMask_layout = cute.make_ordered_layout(
-            (self.tile_m, self.tile_n), order=(1, 0)
-        )
-        sMask_struct = cute.struct.Align[
-            cute.struct.MemRange[Uint8, cute.cosize(sMask_layout)], 1024
-        ]
-
         @cute.struct
         class SharedStorage:
             sQ: sQ_struct
             sK: sK_struct
             sV: sV_struct
-            sMask: sMask_struct
 
         self.kernel(
             mQ_t,
@@ -244,10 +246,6 @@ class WindowAttnFwdBf16:
         sK = storage.sK.get_tensor(sK_layout)
         sV = storage.sV.get_tensor(sV_layout)
         sVt = layout_utils.transpose_view(sV)
-        sMask_layout = cute.make_ordered_layout(
-            (self.tile_m, self.tile_n), order=(1, 0)
-        )
-        sMask = storage.sMask.get_tensor(sMask_layout)
 
         gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
         gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
@@ -394,18 +392,11 @@ class WindowAttnFwdBf16:
             if cutlass.const_expr(self.seq_len % self.tile_n != 0):
                 apply_partial_kv_mask(acc_S, tScS, Int32(0), seqlen)
             if cutlass.const_expr(mBias is not None):
-                if cutlass.const_expr(self.single_kv_tile):
-                    self._load_mask_tile(
-                        mBias, win_id, sMask, m_block, Int32(0), seqlen,
-                    )
-                    cute.arch.sync_threads()
-                    apply_swin_bias_mask_smem(
-                        acc_S, tScS, sMask, m_start, Int32(0), seqlen
-                    )
-                else:
-                    apply_swin_mask_u8_gmem(
-                        acc_S, tScS, mMask_w, m_start, Int32(0), seqlen
-                    )
+                apply_swin_mask_u8_gmem(
+                    acc_S, tScS, mMask_w, m_start, Int32(0), seqlen,
+                    n_always_valid=self.single_kv_tile,
+                    rows_all_valid=(m_start + self.tile_m <= seqlen),
+                )
 
         row_scale = softmax.online_softmax(
             acc_S, is_first=True, use_fastmath=self.single_kv_tile
@@ -539,32 +530,6 @@ class WindowAttnFwdBf16:
                 )
 
     @cute.jit
-    def _load_mask_tile(
-        self,
-        mMask: cute.Tensor,
-        win_id: Int32,
-        sMask: cute.Tensor,
-        m_block: Int32,
-        n_block: Int32,
-        seqlen: Int32,
-    ) -> None:
-        m_start = m_block * self.tile_m
-        n_start = n_block * self.tile_n
-        tidx, _, _ = cute.arch.thread_idx()
-        mMask_w = mMask[win_id, None, None]
-        total = self.tile_m * self.tile_n
-        masked_oob = Uint8(1)
-        for i in cutlass.range(tidx, total, self.num_threads):
-            lm = i // self.tile_n
-            ln = i % self.tile_n
-            m_idx = m_start + lm
-            n_idx = n_start + ln
-            if (m_idx < seqlen) & (n_idx < seqlen):
-                sMask[lm, ln] = mMask_w[m_idx, n_idx]
-            else:
-                sMask[lm, ln] = masked_oob
-
-    @cute.jit
     def _load_K(
         self,
         gmem_tiled_copy_K: cute.TiledCopy,
@@ -648,7 +613,7 @@ def _get_or_compile_bf16(
     o: torch.Tensor,
     bias_or_none: Optional[torch.Tensor],
 ):
-    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, "mask_smem_u8_v8")
+    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, "bf16_cpasync")
     if compile_key in _bf16_compile_cache:
         return _bf16_compile_cache[compile_key]
 
@@ -702,7 +667,7 @@ def _get_or_compile_bf16_qkvpacked(
     """
     compile_key = (
         head_dim, seq_len, has_bias, tile_m, tile_n,
-        output_layout, "qkvpacked_strided_v3",
+        output_layout, "bf16_qkvpacked",
     )
     if compile_key in _bf16_qkvpacked_compile_cache:
         return _bf16_qkvpacked_compile_cache[compile_key]
@@ -749,8 +714,11 @@ class WindowAttnFwdBf16Stream:
     _SM120_DMA_WARPS: int = 1
     _SM120_THREADS: int = (_SM120_MMA_WARPS + _SM120_DMA_WARPS) * 32   # 160
     _SM120_MMA_ATOM_LAYOUT: tuple[int, int, int] = (2, 2, 1)
-    _SM120_LOAD_REGS: int = 40
-    _SM120_MMA_REGS: int = 232
+    # Warp-specialization register split (setmaxregister). Tunable via env for
+    # sm120 sweeps; DMA warp only issues TMA so it can shed registers to let the
+    # MMA warps (and thus occupancy) grow. Defaults are the validated baseline.
+    _SM120_LOAD_REGS: int = _env_int("AURORA_SM120_LOAD_REGS", 40)
+    _SM120_MMA_REGS: int = _env_int("AURORA_SM120_MMA_REGS", 232)
 
     def __init__(
         self,
@@ -826,18 +794,9 @@ class WindowAttnFwdBf16Stream:
 
         sQ_layout = cute.tile_to_shape(sQK_atom, (self.tile_m, self.tile_hdim), (0, 1))
         sO_layout = cute.tile_to_shape(sV_atom, (self.tile_m, self.tile_hdim), (0, 1))
-        sm120_tma_tiler = (self.tile_m, self.tile_n, self.tile_hdim)
-        sK_tma_layout = sm90_utils.make_smem_layout_b(
-            cutlass_utils.LayoutEnum.from_tensor(mK_t),
-            sm120_tma_tiler,
-            BFloat16,
-            num_stages,
-        )
-        sV_tma_layout = sm90_utils.make_smem_layout_b(
-            cutlass_utils.LayoutEnum.from_tensor(mV_t),
-            sm120_tma_tiler,
-            BFloat16,
-            num_stages,
+        sK_tma_layout, sV_tma_layout = make_kv_tma_smem_layouts(
+            mK_t, mV_t, self.tile_m, self.tile_n, self.tile_hdim,
+            BFloat16, num_stages,
         )
 
         _mma_op = warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))
@@ -871,10 +830,10 @@ class WindowAttnFwdBf16Stream:
         gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_async, _tv(_sQK_dim1), vQKV)
         gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_store, _tv(_sV_dim1), vQKV)
 
-        tma_atom_K, tma_tensor_K = self._make_tma_atom_and_tensor(
+        tma_atom_K, tma_tensor_K = make_tma_atom_and_tensor(
             mK_t, sK_tma_layout, (self.tile_n, self.tile_hdim)
         )
-        tma_atom_V, tma_tensor_V = self._make_tma_atom_and_tensor(
+        tma_atom_V, tma_tensor_V = make_tma_atom_and_tensor(
             mV_t, sV_tma_layout, (self.tile_n, self.tile_hdim)
         )
 
@@ -924,20 +883,6 @@ class WindowAttnFwdBf16Stream:
             stream=stream,
         )
 
-    @staticmethod
-    def _make_tma_atom_and_tensor(
-        tensor: cute.Tensor,
-        smem_layout_staged: cute.ComposedLayout,
-        smem_tile: tuple[int, int],
-    ) -> tuple[cute.CopyAtom, cute.Tensor]:
-        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
-        return cute.nvgpu.cpasync.make_tiled_tma_atom(
-            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
-            tensor,
-            smem_layout,
-            smem_tile,
-        )
-
     @cute.kernel
     def kernel(
         self,
@@ -982,18 +927,13 @@ class WindowAttnFwdBf16Stream:
         storage = smem.allocate(SharedStorage)
 
         # Combined K+V byte-count drives the TMA transaction barrier.
-        tma_copy_bytes = cute.size_in_bytes(
-            BFloat16, cute.slice_(sK_tma_layout, (None, None, 0))
-        ) + cute.size_in_bytes(BFloat16, cute.slice_(sV_tma_layout, (None, None, 0)))
-        mainloop_pipeline = pipeline.PipelineTmaAsync.create(
-            num_stages=self.num_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self._SM120_MMA_WARPS
-            ),
-            tx_count=tma_copy_bytes,
-            barrier_storage=storage.mainloop_pipeline_array_ptr.data_ptr(),
-            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+        mainloop_pipeline = make_kv_mainloop_pipeline(
+            self.num_stages,
+            self._SM120_MMA_WARPS,
+            sK_tma_layout,
+            sV_tma_layout,
+            storage.mainloop_pipeline_array_ptr.data_ptr(),
+            BFloat16,
         )
         pipeline.sync(barrier_id=1)
 
@@ -1171,7 +1111,9 @@ class WindowAttnFwdBf16Stream:
                     apply_partial_kv_mask(acc_S, tScS, Int32(0), seqlen)
                 if cutlass.const_expr(mBias is not None):
                     apply_swin_mask_u8_gmem(
-                        acc_S, tScS, mMask_w, m_start, Int32(0), seqlen
+                        acc_S, tScS, mMask_w, m_start, Int32(0), seqlen,
+                        n_always_valid=self.single_kv_tile,
+                        rows_all_valid=(m_start + self.tile_m <= seqlen),
                     )
 
             softmax.online_softmax(
@@ -1293,7 +1235,11 @@ def _get_or_compile_bf16_stream(
     o: torch.Tensor,
     bias_or_none: Optional[torch.Tensor],
 ):
-    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, "stream_mask_u8_v8")
+    compile_key = (
+        head_dim, seq_len, has_bias, tile_m, tile_n, "bf16_stream",
+        WindowAttnFwdBf16Stream._SM120_LOAD_REGS,
+        WindowAttnFwdBf16Stream._SM120_MMA_REGS,
+    )
     if compile_key in _bf16_stream_compile_cache:
         return _bf16_stream_compile_cache[compile_key]
 

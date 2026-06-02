@@ -613,32 +613,32 @@ class TestChooseTileN:
 
     # ----- BF16 _choose_tile_n -----
 
-    def test_bf16_n144_streams_on_48kb_with_mask(self) -> None:
-        """N=144 streams on 48 KB once uint8 mask tile (tile_m×tile_n) is reserved."""
+    def test_bf16_n144_single_pass_on_48kb(self) -> None:
+        """N=144 single-pass on 48 KB (mask is uint8 in gmem, not SMEM)."""
         tile_n = _choose_tile_n(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
-        assert tile_n < 144
-        smem = 64 * 64 * 2 + 4 * tile_n * 64 * 2 + 64 * tile_n
-        assert smem <= 48 * 1024 // 2
+        assert tile_n == 144
+        smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2
+        assert smem <= 48 * 1024
 
     def test_bf16_n288_single_pass_99kb(self) -> None:
         """N=288 must select tile_n=288 (single-pass) on a 99 KB device."""
         tile_n = _choose_tile_n(288, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
         assert tile_n == 288
-        smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2 + 64 * tile_n
+        smem = 64 * 64 * 2 + 2 * tile_n * 64 * 2
         assert smem <= 99 * 1024
 
     def test_bf16_n288_streaming_on_48kb(self) -> None:
         """N=288 must stream (tile_n < 288) on a 48 KB device."""
         tile_n = _choose_tile_n(288, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
         assert tile_n < 288
-        smem = 64 * 64 * 2 + 4 * tile_n * 64 * 2 + 64 * tile_n
+        smem = 64 * 64 * 2 + 4 * tile_n * 64 * 2
         assert smem <= 48 * 1024 // 2
 
     def test_bf16_n576_streaming_99kb(self) -> None:
         """N=576 must stream even on 99 KB (total would be 152 KB)."""
         tile_n = _choose_tile_n(576, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
         assert tile_n < 576
-        smem = 64 * 64 * 2 + 4 * tile_n * 64 * 2 + 64 * tile_n
+        smem = 64 * 64 * 2 + 4 * tile_n * 64 * 2
         assert smem <= 99 * 1024 // 2
 
     def test_bf16_tile_n_aligned_to_8(self) -> None:
@@ -655,7 +655,7 @@ class TestChooseTileN:
             assert tile_n <= N, f"tile_n={tile_n} > N={N}"
             stages = 1 if tile_n >= N else 2
             kv_factor = 2 if stages == 1 else 4
-            smem = 64 * 64 * 2 + kv_factor * tile_n * 64 * 2 + 64 * tile_n
+            smem = 64 * 64 * 2 + kv_factor * tile_n * 64 * 2
             cap = budget if stages == 1 else budget // 2
             assert smem <= cap, f"SMEM {smem} > cap {cap} for N={N}"
 

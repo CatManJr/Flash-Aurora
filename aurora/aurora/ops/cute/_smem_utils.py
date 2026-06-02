@@ -75,10 +75,9 @@ def _choose_tile_n(
 
     sQ_bytes     = tile_m * head_dim * 2
     kv_row_bytes = head_dim * 2
-    mask_row_bytes = tile_m
 
-    # Largest tile_n that fits in the full budget (includes uint8 mask tile in SMEM).
-    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // (2 * kv_row_bytes + mask_row_bytes)
+    # Largest tile_n that fits in the full budget (mask is uint8 in gmem, not SMEM).
+    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // (2 * kv_row_bytes)
     max_tile_n_full = max((max_tile_n_full // 16) * 16, 16)
 
     if seq_len <= max_tile_n_full:
@@ -87,11 +86,8 @@ def _choose_tile_n(
         return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
 
     # Multi-pass: use half the budget, with 2-stage K+V double-buffer.
-    # sQ(1) + sK(2) + sV(2) + mask tile ≤ budget/2.
     half_budget    = smem_budget_bytes // 2
-    max_tile_n_half = max(
-        (half_budget - sQ_bytes) // (4 * kv_row_bytes + mask_row_bytes), 0
-    )
+    max_tile_n_half = max((half_budget - sQ_bytes) // (4 * kv_row_bytes), 0)
     max_tile_n_half = max((max_tile_n_half // 16) * 16, 16)
     capped = min(seq_len, max_tile_n_half)
     return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
@@ -105,13 +101,15 @@ def _tf32_hybrid_smem_bytes(
     *,
     include_mask_tile: bool = True,
 ) -> int:
-    """Bytes for TF32 hybrid kernel SMEM: FP32 ``sQ``/``sK``, BF16 ``sV``, optional uint8 mask tile."""
-    mask_bytes = tile_m * tile_n if include_mask_tile else 0
+    """Bytes for TF32 hybrid kernel SMEM: FP32 ``sQ``/``sK``, BF16 ``sV``.
+
+    ``include_mask_tile`` is ignored (uint8 Swin mask is read from gmem).
+    """
+    del include_mask_tile
     return (
         tile_m * head_dim * 4
         + tile_n * head_dim * 4 * num_stages
         + tile_n * head_dim * 2 * num_stages
-        + mask_bytes
     )
 
 
@@ -136,14 +134,10 @@ def _choose_tile_n_tf32(
         smem_budget_bytes = _get_smem_budget_bytes()
 
     sQ_bytes = tile_m * head_dim * 4
-    # Per tile_n row: one FP32 K tile + one BF16 V tile (per stage).
-    # Reserve one (tile_m × tile_n) uint8 Swin mask tile in SMEM (_kernel_fp32.py).
-    mask_row_bytes = tile_m
-
     kv_single = head_dim * 6
     kv_stream = head_dim * 12
 
-    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // (kv_single + mask_row_bytes)
+    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // kv_single
     max_tile_n_full = max((max_tile_n_full // 16) * 16, 16)
 
     if seq_len <= max_tile_n_full:
@@ -151,7 +145,7 @@ def _choose_tile_n_tf32(
         return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
 
     half_budget = smem_budget_bytes // 2
-    max_tile_n_half = max((half_budget - sQ_bytes) // (kv_stream + mask_row_bytes), 0)
+    max_tile_n_half = max((half_budget - sQ_bytes) // kv_stream, 0)
     max_tile_n_half = max((max_tile_n_half // 16) * 16, 16)
     capped = min(seq_len, max_tile_n_half)
     return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)

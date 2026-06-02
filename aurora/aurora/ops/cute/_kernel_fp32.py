@@ -1,7 +1,7 @@
 """TF32 window attention (CuTeDSL, SM80+).
 
 TF32 QK MMA; FP32 softmax; BF16 V in smem. Direct O epilogue to gmem.
-uint8 Swin mask: smem on single KV tile, gmem when streaming.
+uint8 Swin mask read directly from gmem (L2-resident).
 """
 import math
 from dataclasses import dataclass as _dataclass
@@ -14,7 +14,7 @@ try:
 
     import cutlass
     import cutlass.cute as cute
-    from cutlass import BFloat16, Constexpr, Float32, TFloat32, Int32, Uint8
+    from cutlass import BFloat16, Constexpr, Float32, TFloat32, Int32
     from cutlass.cute.nvgpu import cpasync, warp
     from cutlass.cutlass_dsl import BaseDSL
 
@@ -39,7 +39,6 @@ try:
     from ._window_softmax import (
         WindowOnlineSoftmax,
         apply_partial_kv_mask,
-        apply_swin_bias_mask_smem,
         apply_swin_mask_u8_gmem,
     )
     from ._smem_utils import _choose_tile_n_tf32
@@ -206,19 +205,11 @@ class WindowAttnFwdTF32:
         sK_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(sK_layout)], 1024]
         sV_struct = cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(sV_layout)], 1024]
 
-        sMask_layout = cute.make_ordered_layout(
-            (self.tile_m, self.tile_n), order=(1, 0)
-        )
-        sMask_struct = cute.struct.Align[
-            cute.struct.MemRange[Uint8, cute.cosize(sMask_layout)], 1024
-        ]
-
         @cute.struct
         class SharedStorage:
             sQ: sQ_struct
             sK: sK_struct
             sV: sV_struct
-            sMask: sMask_struct
 
         self.kernel(
             mQ_t,
@@ -295,10 +286,6 @@ class WindowAttnFwdTF32:
         sK = storage.sK.get_tensor(sK_layout)
         sV = storage.sV.get_tensor(sV_layout)
         sVt = layout_utils.transpose_view(sV)
-        sMask_layout = cute.make_ordered_layout(
-            (self.tile_m, self.tile_n), order=(1, 0)
-        )
-        sMask = storage.sMask.get_tensor(sMask_layout)
 
         gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
         gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
@@ -461,18 +448,11 @@ class WindowAttnFwdTF32:
             if cutlass.const_expr(self.seq_len % self.tile_n != 0):
                 apply_partial_kv_mask(acc_S, tScS, Int32(0), seqlen)
             if cutlass.const_expr(mBias is not None):
-                if cutlass.const_expr(self.single_kv_tile):
-                    self._load_mask_tile(
-                        mBias, win_id, sMask, m_block, Int32(0), seqlen,
-                    )
-                    cute.arch.sync_threads()
-                    apply_swin_bias_mask_smem(
-                        acc_S, tScS, sMask, m_start, Int32(0), seqlen
-                    )
-                else:
-                    apply_swin_mask_u8_gmem(
-                        acc_S, tScS, mMask_w, m_start, Int32(0), seqlen
-                    )
+                apply_swin_mask_u8_gmem(
+                    acc_S, tScS, mMask_w, m_start, Int32(0), seqlen,
+                    n_always_valid=self.single_kv_tile,
+                    rows_all_valid=(m_start + self.tile_m <= seqlen),
+                )
 
         row_scale = softmax.online_softmax(
             acc_S, is_first=True, use_fastmath=self.single_kv_tile
@@ -622,33 +602,6 @@ class WindowAttnFwdTF32:
                 )
 
     @cute.jit
-    def _load_mask_tile(
-        self,
-        mMask: cute.Tensor,
-        win_id: Int32,
-        sMask: cute.Tensor,
-        m_block: Int32,
-        n_block: Int32,
-        seqlen: Int32,
-    ) -> None:
-        """Cooperative gmem→smem load of one uint8 Swin mask tile (tiled, coalesced)."""
-        m_start = m_block * self.tile_m
-        n_start = n_block * self.tile_n
-        tidx, _, _ = cute.arch.thread_idx()
-        mMask_w = mMask[win_id, None, None]
-        total = self.tile_m * self.tile_n
-        masked_oob = Uint8(1)
-        for i in cutlass.range(tidx, total, self.num_threads):
-            lm = i // self.tile_n
-            ln = i % self.tile_n
-            m_idx = m_start + lm
-            n_idx = n_start + ln
-            if (m_idx < seqlen) & (n_idx < seqlen):
-                sMask[lm, ln] = mMask_w[m_idx, n_idx]
-            else:
-                sMask[lm, ln] = masked_oob
-
-    @cute.jit
     def _load_K(
         self,
         gmem_tiled_copy_K: cute.TiledCopy,
@@ -728,7 +681,7 @@ def _get_or_compile_tf32(
     bias_or_none: Optional[torch.Tensor],
 ):
     single_kv = tile_n >= seq_len
-    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "hybrid_pv_mask_u8_v8")
+    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "tf32_hybrid")
     if compile_key in _tf32_compile_cache:
         return _tf32_compile_cache[compile_key]
 
@@ -779,7 +732,7 @@ def _get_or_compile_tf32_qkvpacked(
     single_kv = tile_n >= seq_len
     compile_key = (
         head_dim, seq_len, has_bias, tile_m, tile_n, single_kv,
-        output_layout, "qkvpacked_strided_mask_u8_v8",
+        output_layout, "tf32_qkvpacked",
     )
     if compile_key in _tf32_qkvpacked_compile_cache:
         return _tf32_qkvpacked_compile_cache[compile_key]

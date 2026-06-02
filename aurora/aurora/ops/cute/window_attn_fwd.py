@@ -138,7 +138,31 @@ def _attention_window_stable(
 # ---------------------------------------------------------------------------
 
 _ENV_CUTE_WINDOW = "AURORA_CUTE_WINDOW_ATTN"
+# Single-pass BF16 (tile_n >= N, e.g. production N=144) routing.
+# Default OFF: the 128-thread cp.async kernel beats the TMA Stream kernel here.
+# With a single KV tile there is nothing for the dedicated DMA warp to prefetch,
+# so its warp-specialization (idle warp + extra mbarrier syncs) is pure overhead.
+# Empirically (sm_120a, ERA5 enc): nomask ties (~0.73ms), masked Stream is ~8%
+# slower (1.03ms vs 0.95ms cp.async) even after register/mask tuning. The TMA
+# pipeline only pays off for multi-pass (tile_n < N), which always uses Stream.
+# Set AURORA_BF16_STREAM_SINGLE_PASS=1 to force Stream for A/B comparison.
+_ENV_BF16_STREAM_SINGLE = "AURORA_BF16_STREAM_SINGLE_PASS"
 _CUTE_KERNEL_VERSION = "cute"
+
+
+def _bf16_stream_single_pass_enabled() -> bool:
+    return os.environ.get(_ENV_BF16_STREAM_SINGLE, "0") != "0"
+
+
+def _best_tile_m(is_bf16: bool, has_bias: bool) -> int:
+    """Optimal tile_m for single-pass N=144 on sm_120a (benchmark/_sweep_tile_m.py).
+
+    BF16  → 64 always (tile_m=128 is ~2.2x slower when masked).
+    TF32  → 64 when masked (Swin SW-MSA blocks); 128 when unmasked (W-MSA blocks).
+    """
+    if is_bf16:
+        return 64
+    return 64 if has_bias else 128
 
 
 def _bf16_tile_n(seq_len: int, head_dim: int, tile_m: int, tile_n: Optional[int]) -> int:
@@ -256,15 +280,22 @@ def window_attn_fwd_cute(
         )
     else:
         _tile_n = _bf16_tile_n(N, head_dim=Dh, tile_m=tile_m, tile_n=tile_n)
-        # tile_n >= N: cp.async; tile_n < N: WindowAttnFwdBf16Stream.
-        if _tile_n >= N:
-            fn = _get_or_compile_bf16(
+        # Multi-pass (tile_n < N) always uses the TMA Stream kernel. Single-pass
+        # (tile_n >= N, e.g. production N=144) uses the 128-thread cp.async kernel
+        # by default — it beats Stream when there is only one KV tile (nothing for
+        # the DMA warp to prefetch). Set AURORA_BF16_STREAM_SINGLE_PASS=1 to force
+        # Stream on SM120 + Dh=64 for A/B comparison.
+        use_stream = _tile_n < N or (
+            _bf16_stream_single_pass_enabled() and Dh == 64
+        )
+        if use_stream:
+            fn = _get_or_compile_bf16_stream(
                 head_dim=Dh, seq_len=N, has_bias=has_bias,
                 tile_m=tile_m, tile_n=_tile_n,
                 q=q, k=k, v=v, o=out, bias_or_none=mask_u8,
             )
         else:
-            fn = _get_or_compile_bf16_stream(
+            fn = _get_or_compile_bf16(
                 head_dim=Dh, seq_len=N, has_bias=has_bias,
                 tile_m=tile_m, tile_n=_tile_n,
                 q=q, k=k, v=v, o=out, bias_or_none=mask_u8,
@@ -280,7 +311,7 @@ def window_attn_fwd_cute_qkvpacked(
     bias: Optional[torch.Tensor] = None,
     *,
     scale_qk: Optional[float] = None,
-    tile_m: int = 64,
+    tile_m: Optional[int] = None,
     tile_n: Optional[int] = None,
     output_layout: str = "bhnd",
 ) -> torch.Tensor:
@@ -354,6 +385,8 @@ def window_attn_fwd_cute_qkvpacked(
     scale_log2 = Float32(math.log2(math.e) * scale_qk)
     has_bias = bias is not None
     is_bf16 = qkv.dtype == torch.bfloat16
+    if tile_m is None:
+        tile_m = _best_tile_m(is_bf16, has_bias)
 
     if is_bf16:
         _tile_n = _bf16_tile_n(N, head_dim=Dh, tile_m=tile_m, tile_n=tile_n)
@@ -460,11 +493,13 @@ def window_attn_dispatch(
             if q.dtype == torch.bfloat16
             else WinAttnPrecision.TF32_ACC_FP32
         )
+        has_bias = bias is not None
+        is_bf16 = q.dtype == torch.bfloat16
         return window_attn_fwd_cute(
             q, k, v, bias,
             scale_qk=scale_qk,
             precision=precision,
-            tile_m= 128 if q.dtype == torch.bfloat16 else 64, # manully tuned on Pro 6000 Blackwell GPU
+            tile_m=_best_tile_m(is_bf16, has_bias),
             tile_n=tile_n,
         )
 

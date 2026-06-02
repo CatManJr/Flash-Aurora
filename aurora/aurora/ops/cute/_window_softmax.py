@@ -92,34 +92,6 @@ def apply_swin_bias_mask(
 
 
 @cute.jit
-def apply_swin_bias_mask_smem(
-    acc_S: cute.Tensor,
-    tScS: cute.Tensor,
-    sMask: cute.Tensor,
-    m_start: Int32,
-    n_start: Int32,
-    seqlen: Int32,
-) -> None:
-    """Apply Swin mask from a uint8 tile in SMEM (1 = masked, 0 = allowed)."""
-    neg_inf = -Float32.inf
-    masked_logit = Float32(WINDOW_ATTN_MASKED_LOGIT)
-    zero_u8 = Uint8(0)
-
-    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
-        n_idx = n_start + tScS[i][1]
-        m_idx = m_start + tScS[i][0]
-        m_valid = m_idx < seqlen
-        n_valid = n_idx < seqlen
-        if m_valid & n_valid:
-            lm = m_idx - m_start
-            ln = n_idx - n_start
-            if sMask[lm, ln] != zero_u8:
-                acc_S[i] = masked_logit
-        else:
-            acc_S[i] = neg_inf
-
-
-@cute.jit
 def apply_swin_mask_u8_gmem(
     acc_S: cute.Tensor,
     tScS: cute.Tensor,
@@ -127,22 +99,43 @@ def apply_swin_mask_u8_gmem(
     m_start: Int32,
     n_start: Int32,
     seqlen: Int32,
+    n_always_valid: cutlass.Constexpr[bool] = False,
+    rows_all_valid: bool = False,
 ) -> None:
-    """Apply uint8 Swin mask from gmem (1 = masked). Used when SMEM mask tile is unavailable."""
+    """Apply uint8 Swin mask from gmem (1 = masked, 0 = allowed).
+
+    The packed mask ``(N, N)`` is shared across all (window, head) CTAs, so the
+    1-byte loads stay L2-resident. ``n_always_valid`` drops the column bound
+    check for single-pass (``tile_n == seqlen``). ``rows_all_valid`` is a runtime
+    predicate: when the whole m-block lies within ``seqlen`` (every m-block except
+    the partial last one), the per-element row-bounds branch is skipped entirely.
+    """
     neg_inf = -Float32.inf
     masked_logit = Float32(WINDOW_ATTN_MASKED_LOGIT)
     zero_u8 = Uint8(0)
 
-    for i in cutlass.range(cute.size(acc_S), unroll_full=True):
-        n_idx = n_start + tScS[i][1]
-        m_idx = m_start + tScS[i][0]
-        m_valid = m_idx < seqlen
-        n_valid = n_idx < seqlen
-        if m_valid & n_valid:
-            if mMask_w[m_idx, n_idx] != zero_u8:
-                acc_S[i] = masked_logit
+    if cutlass.const_expr(n_always_valid):
+        if rows_all_valid:
+            for i in cutlass.range(cute.size(acc_S), unroll_full=True):
+                if mMask_w[m_start + tScS[i][0], n_start + tScS[i][1]] != zero_u8:
+                    acc_S[i] = masked_logit
         else:
-            acc_S[i] = neg_inf
+            for i in cutlass.range(cute.size(acc_S), unroll_full=True):
+                m_idx = m_start + tScS[i][0]
+                if m_idx < seqlen:
+                    if mMask_w[m_idx, n_start + tScS[i][1]] != zero_u8:
+                        acc_S[i] = masked_logit
+                else:
+                    acc_S[i] = neg_inf
+    else:
+        for i in cutlass.range(cute.size(acc_S), unroll_full=True):
+            n_idx = n_start + tScS[i][1]
+            m_idx = m_start + tScS[i][0]
+            if (m_idx < seqlen) & (n_idx < seqlen):
+                if mMask_w[m_idx, n_idx] != zero_u8:
+                    acc_S[i] = masked_logit
+            else:
+                acc_S[i] = neg_inf
 
 
 def swin_attn_mask_u8(bias: torch.Tensor) -> torch.Tensor:
