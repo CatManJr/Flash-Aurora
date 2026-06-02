@@ -223,10 +223,27 @@ def _print_official_tol_table(title: str, rows: list[tuple[str, float, float, fl
     print(f"  summary: {passed}/{len(rows)} variables within official tolerance")
 
 
-def _build_model(precision: str, checkpoint: Path, device: torch.device) -> Any:
+def _set_cute_window_attn(model: Any, enabled: bool) -> None:
+    """Toggle CuTe window attention without changing matmul / Triton preset hooks."""
+    backbone = model.backbone
+    backbone.use_cute_window_attn = enabled
+    for module in backbone.modules():
+        if hasattr(module, "use_cute_window_attn"):
+            module.use_cute_window_attn = enabled
+
+
+def _build_model(
+    precision: str,
+    checkpoint: Path,
+    device: torch.device,
+    *,
+    use_cute_window_attn: bool | None = None,
+) -> Any:
     from aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(use_lora=False, inference_precision=precision)
+    if use_cute_window_attn is not None:
+        _set_cute_window_attn(model, use_cute_window_attn)
     model.load_checkpoint_local(str(checkpoint), strict=True)
     model.eval()
     return model.to(device)
@@ -276,13 +293,105 @@ def _run_tier(
     device: torch.device,
     warmup: int,
     repeat: int,
+    use_cute_window_attn: bool | None = None,
 ) -> tuple[dict[str, torch.Tensor], float]:
-    model = _build_model(precision, checkpoint, device)
+    model = _build_model(
+        precision,
+        checkpoint,
+        device,
+        use_cute_window_attn=use_cute_window_attn,
+    )
     try:
         pred, ms_per = _time_forward(model, batch, warmup=warmup, repeat=repeat, device=device)
         return _prediction_tensors(pred), ms_per
     finally:
         _purge_gpu(model)
+
+
+def _run_ablate_cute(
+    *,
+    checkpoint: Path,
+    batch: Any,
+    device: torch.device,
+    warmup: int,
+    repeat: int,
+) -> None:
+    """Isolate pooled / per-var max_abs: CuTe DSL vs PyTorch SDPA (same Triton + matmul preset)."""
+    cases: list[tuple[str, str, bool | None]] = [
+        ("fp32", "fp32 baseline", None),
+        ("pytorch_autocast", "PyTorch autocast + SDPA", None),
+        ("tf32_1x", "TF32 + Triton + CuTe attn", None),
+        ("tf32_1x", "TF32 + Triton + SDPA (no CuTe)", False),
+        ("bf16_mixed", "BF16 MLP + Triton + CuTe attn", None),
+        ("bf16_mixed", "BF16 MLP + Triton + SDPA (no CuTe)", False),
+    ]
+    baseline_key = "fp32"
+    baseline_ms: float | None = None
+    baseline: dict[str, torch.Tensor] | None = None
+    all_preds: dict[str, dict[str, torch.Tensor]] = {}
+    rows: list[tuple[str, str, float, float, float, float, float, float | None]] = []
+
+    print()
+    print("=" * 60)
+    print("CuTe ablation: same preset, toggle window attention only")
+    print("=" * 60)
+
+    for precision, label, use_cute in cases:
+        tier_key = precision if use_cute is None else f"{precision}{'_cute' if use_cute else '_sdpa'}"
+        display = label
+        print(f"[run] {display}...", flush=True)
+        pred, ms_per = _run_tier(
+            precision=precision,
+            checkpoint=checkpoint,
+            batch=batch,
+            device=device,
+            warmup=warmup,
+            repeat=repeat,
+            use_cute_window_attn=use_cute,
+        )
+        all_preds[tier_key] = pred
+        print(f"[run] {display} e2e forward={ms_per:.1f} ms", flush=True)
+        if tier_key == baseline_key:
+            baseline = pred
+            baseline_ms = ms_per
+            rows.append((tier_key, display, ms_per, None, 0.0, 0.0, 0.0, 1.0))
+            continue
+        assert baseline is not None and baseline_ms is not None
+        max_abs, mean_abs, max_rel, cos = _diff_vs_reference(baseline, pred)
+        rows.append(
+            (tier_key, display, ms_per, baseline_ms / ms_per, max_abs, mean_abs, max_rel, cos)
+        )
+
+    _print_table(rows)
+
+    assert baseline is not None
+    print()
+    print("Per-variable max_abs vs fp32")
+    print("-" * 60)
+    print(f"  {'tier':<22} {'msl':>10} {'2t':>10} {'10u':>10} {'10v':>10} {'max_all':>10}")
+    for tier_key in (
+        "pytorch_autocast",
+        "tf32_1x",
+        "tf32_1x_sdpa",
+        "bf16_mixed",
+        "bf16_mixed_sdpa",
+    ):
+        if tier_key not in all_preds:
+            continue
+        tol_rows = _official_tol_rows(baseline, all_preds[tier_key])
+        by_name = {name: max_abs for name, _mr, _tol, max_abs, _ok in tol_rows}
+        pooled_max = max(by_name.values()) if by_name else float("nan")
+        print(
+            f"  {tier_key:<22} "
+            f"{by_name.get('msl', float('nan')):10.4g} "
+            f"{by_name.get('2t', float('nan')):10.4g} "
+            f"{by_name.get('10u', float('nan')):10.4g} "
+            f"{by_name.get('10v', float('nan')):10.4g} "
+            f"{pooled_max:10.4g}"
+        )
+
+    print()
+    print("Interpretation: if *_sdpa max_abs ~ autocast and *_cute ~ 93, outlier is CuTe DSL.")
 
 
 def _print_table(
@@ -333,6 +442,14 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=1, help="Warmup forwards before timing (default: 1)")
     parser.add_argument("--repeat", type=int, default=3, help="Timed forwards per tier (default: 3)")
+    parser.add_argument(
+        "--ablate-cute",
+        action="store_true",
+        help=(
+            "Compare tf32_1x / bf16_mixed with CuTe window attn on vs off (SDPA); "
+            "print per-variable max_abs vs fp32"
+        ),
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -351,6 +468,16 @@ def main() -> None:
     print(f"[config] checkpoint={checkpoint}")
     print(f"[config] data_dir={data_dir}")
     print(f"[config] timing warmup={args.warmup} repeat={args.repeat}")
+
+    if args.ablate_cute:
+        _run_ablate_cute(
+            checkpoint=checkpoint,
+            batch=batch,
+            device=device,
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
+        return
 
     tier_labels = dict(_DEFAULT_TIERS)
     unknown = [t for t in args.tiers if t not in tier_labels]
