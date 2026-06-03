@@ -1,7 +1,16 @@
-"""TF32 window attention (CuTeDSL, SM80+).
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+
+TF32 window attention (CuTeDSL, SM80+).
 
 TF32 QK MMA; FP32 softmax; BF16 V in smem. Direct O epilogue to gmem.
 uint8 Swin mask read directly from gmem (L2-resident).
+
+References:
+- flash-attn ``flash_attn/cute/flash_fwd.py`` (Tri Dao) — FMHA mainloop / masking layout.
+- :mod:`aurora.ops.cute._cute_local`, :mod:`aurora.ops.cute._window_softmax` (see those modules).
 """
 import math
 from dataclasses import dataclass as _dataclass

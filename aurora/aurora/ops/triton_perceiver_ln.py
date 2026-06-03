@@ -1,11 +1,15 @@
 """Copyright (c) Catman Jr. Licensed under the MIT license.
 
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+
 Triton fused LayerNorm (affine) + optional residual add over the last dimension.
 
 Matches ``nn.LayerNorm(D)`` with ``elementwise_affine=True`` for tensors ``(B, L, D)``.
 Fuses ``layer_norm(x) + residual`` for :class:`~aurora.model.perceiver.PerceiverResampler``.
 
-Supported: CUDA, ``float16``, ``bfloat16``, ``float32``.
+References:
+- flash-attn ``flash_attn/ops/triton/layer_norm.py`` — row-wise Triton norm patterns (Tri Dao).
 """
 
 from __future__ import annotations

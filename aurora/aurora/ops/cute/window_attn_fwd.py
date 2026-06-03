@@ -1,7 +1,15 @@
-"""Window attention forward: stable softmax reference + optional CuTe kernels.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+
+Window attention forward: stable softmax reference + optional CuTe kernels.
 
 ``AURORA_CUTE_WINDOW_ATTN=1`` selects CuTeDSL in ``_kernel_bf16.py`` /
 ``_kernel_fp32.py``. Tile sizes: ``_smem_utils.py``.
+
+References:
+- flash-attn ``flash_attn/cute/interface.py`` — dispatch / compile-cache patterns (Tri Dao).
 """
 import contextlib
 import math

@@ -3,7 +3,7 @@
 This file includes modifications and original contributions by Catman Jr.;
 those portions are licensed under the MIT License (see LICENSE).
 
-Custom CUDA kernels and Triton ops for Aurora inference.
+Custom Triton and CuTeDSL ops for Aurora inference (see subpackages for third-party references).
 """
 
 from aurora.ops.triton_adaln import (

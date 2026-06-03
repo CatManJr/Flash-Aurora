@@ -1,4 +1,9 @@
-"""Shared-memory budget helpers for window attention CuTeDSL kernels.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+
+Shared-memory budget helpers for window attention CuTeDSL kernels.
 """
 from typing import Optional
 

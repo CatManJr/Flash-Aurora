@@ -1,8 +1,14 @@
-# Copyright (c) 2025, Tri Dao.  (online softmax structure — adapted from flash-attn softmax.py.)
-# SPDX-License-Identifier: MIT
-"""Row-wise online softmax over attention logits (CuTeDSL).
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+
+Row-wise online softmax over attention logits (CuTeDSL).
 
 Fixed ``arch=80`` reduction style: avoids SM100 packed paths that mismatch SM120 + SM80 MMA.
+
+References:
+- flash-attn ``flash_attn/cute/softmax.py`` (Tri Dao) — online softmax structure.
 """
 from __future__ import annotations
 

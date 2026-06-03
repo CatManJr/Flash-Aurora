@@ -125,6 +125,15 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
+        from aurora.model.custom_op_paths import can_use_fused_mlp_ffn
+
+        drop_p = float(self.net[3].p) if isinstance(self.net[3], nn.Dropout) else 0.0
+        if can_use_fused_mlp_ffn(x, training=self.training, drop_p=drop_p):
+            from aurora.ops.triton_mlp_ffn import mlp_ffn_forward
+
+            fc1, fc2 = self.net[0], self.net[2]
+            y = mlp_ffn_forward(x, fc1.weight, fc1.bias, fc2.weight, fc2.bias)
+            return self.net[3](y) if drop_p > 0.0 else y
         return self.net(x)
 
 

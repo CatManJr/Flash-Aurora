@@ -1,14 +1,17 @@
-"""Shared Blackwell GeForce (sm_120a) TMA + pipeline load helpers.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
 
-Extracted from the BF16 Stream kernel so the TMA K/V load recipe — sm90/Hopper
-swizzled SMEM layouts, bulk-tensor TMA atoms, and the ``PipelineTmaAsync``
-mainloop barrier — lives in one place. These mirror the data-movement stack in
-``cutlass/examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py`` and are
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+
+Shared Blackwell GeForce (sm_120a) TMA + pipeline load helpers.
+
+Extracted from the BF16 Stream kernel so the TMA K/V load recipe lives in one place.
 dtype-generic so any precision (BF16 today, others later) can reuse them.
 
-All helpers are thin wrappers over CuTe DSL APIs and inline cleanly into both
-``@cute.jit`` host trace (layout/atom construction) and ``@cute.kernel`` device
-bodies (pipeline creation).
+References:
+- CUTLASS ``cutlass/examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py`` —
+  TMA atoms, swizzled SMEM layouts, ``PipelineTmaAsync`` mainloop.
+- CUTLASS ``cutlass.utils.hopper_helpers`` — SM90 bulk-tensor helpers.
 """
 from __future__ import annotations
 
