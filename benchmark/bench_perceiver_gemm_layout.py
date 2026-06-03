@@ -160,8 +160,7 @@ def _run_microbenches(
     w_kv = attn.to_kv.weight
     w_o = attn.to_out.weight
     w1, w2 = mlp.net[0].weight, mlp.net[2].weight
-    with torch.inference_mode():
-        hidden = F.gelu(F.linear(lat2, w1), approximate="none")
+    hidden = F.gelu(F.linear(lat2, w1), approximate="none").detach()
 
     cases: list[tuple[str, Callable[[], None]]] = [
         ("to_q  nested", lambda: F.linear(latents, w_q)),
