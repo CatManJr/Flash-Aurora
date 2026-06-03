@@ -61,11 +61,11 @@ class FourierExpansion(nn.Module):
             torch.Tensor: Fourier series-style expansion of `x` of shape `(..., n, d)`.
         """
         # If the input is not within the configured range, the embedding might be ambiguous!
-        in_range = torch.logical_and(self.lower <= x.abs(), torch.all(x.abs() <= self.upper))
-        in_range_or_zero = torch.all(
-            torch.logical_or(in_range, x == 0)
-        )  # Allow zeros to pass through.
-        if self.assert_range:
+        if self.assert_range and not torch.is_inference_mode_enabled():
+            in_range = torch.logical_and(self.lower <= x.abs(), torch.all(x.abs() <= self.upper))
+            in_range_or_zero = torch.all(
+                torch.logical_or(in_range, x == 0)
+            )  # Allow zeros to pass through.
             capturing = (
                 torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
             )
@@ -124,7 +124,7 @@ kilometers."""
 lead_time_expansion = FourierExpansion(1 / 60, 24 * 7 * 3)
 """:class:`.FourierExpansion`: Fourier expansion for the lead time encoding in hours."""
 
-levels_expansion = FourierExpansion(0.01, 1e5)
+levels_expansion = FourierExpansion(0.01, 1e5, assert_range=False)
 """:class:`.FourierExpansion`: Fourier expansion for the pressure level encoding in hPa."""
 
 absolute_time_expansion = FourierExpansion(1, 24 * 365.25, assert_range=False)

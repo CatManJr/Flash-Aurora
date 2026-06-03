@@ -149,7 +149,40 @@ class Perceiver3DDecoder(nn.Module):
 
         self.atmos_levels_embed = nn.Linear(embed_dim, embed_dim)
 
+        self.register_buffer("_cached_levels_embed", torch.empty(0), persistent=False)
+        self._cached_levels_embed_key: tuple | None = None
+
         self.apply(init_weights)
+
+    def _levels_embed(
+        self,
+        atmos_levels: tuple[int | float, ...],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Fourier + linear embed for pressure levels; cached in inference for fixed levels."""
+        key = (tuple(float(v) for v in atmos_levels), device.type, device.index, dtype)
+        if (
+            torch.is_inference_mode_enabled()
+            and self._cached_levels_embed_key == key
+            and self._cached_levels_embed.numel() > 0
+            and self._cached_levels_embed.device == device
+            and self._cached_levels_embed.dtype == dtype
+        ):
+            return self._cached_levels_embed
+
+        from aurora.model.inference_tensors import cached_constant_tensor
+
+        atmos_levels_encode = levels_expansion(
+            cached_constant_tensor(atmos_levels, device=device, dtype=torch.float32),
+            self.embed_dim,
+        ).to(dtype=dtype)
+        levels_embed = self.atmos_levels_embed(atmos_levels_encode)  # (C_A, D)
+        if torch.is_inference_mode_enabled():
+            self._cached_levels_embed_key = key
+            self._cached_levels_embed = levels_embed
+        return levels_embed
 
     def deaggregate_levels(
         self,
@@ -230,14 +263,10 @@ class Perceiver3DDecoder(nn.Module):
         surf_preds = unpatchify(x_surf, len(surf_vars), H, W, self.patch_size)
         surf_preds = surf_preds.squeeze(2)  # (B, V_S, H, W)
 
-        # Embed the atmospheric levels.
-        from aurora.model.inference_tensors import cached_constant_tensor
-
-        atmos_levels_encode = levels_expansion(
-            cached_constant_tensor(atmos_levels, device=x.device, dtype=torch.float32),
-            self.embed_dim,
-        ).to(dtype=x.dtype)
-        levels_embed = self.atmos_levels_embed(atmos_levels_encode)  # (C_A, D)
+        # Embed the atmospheric levels (cached when ``atmos_levels`` are fixed at inference).
+        levels_embed = self._levels_embed(
+            atmos_levels, device=x.device, dtype=x.dtype
+        )  # (C_A, D)
 
         # De-aggregate the hidden levels into the physical levels.
         levels_embed = levels_embed.expand(B, x.size(1), -1, -1)
