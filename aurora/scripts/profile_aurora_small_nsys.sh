@@ -5,7 +5,7 @@
 #   - cudaProfilerStart/Stop + nsys --capture-range=cudaProfilerApi so the timeline is
 #     dominated by forward, not Python import / dlopen
 #
-# Requires: nsys on PATH, GPU, HF cache for checkpoint.
+# Requires: nsys (PATH or bundled under /opt/nvidia/nsight-compute/...), GPU, checkpoint.
 #
 # Usage (from repo root):
 #   ./aurora/scripts/profile_aurora_small_nsys.sh
@@ -13,6 +13,8 @@
 #
 # Override defaults:
 #   NSYS_WARMUP=24 NSIGHT_OUT_DIR=/tmp/nsight ./aurora/scripts/profile_aurora_small_nsys.sh
+#   INFERENCE_PRECISION=bf16_mixed CUTE_DSL_ARCH=sm_120a ./aurora/scripts/profile_aurora_small_nsys.sh
+#   ./aurora/scripts/profile_aurora_nsys_pair.sh   # bf16_mixed + tf32_1x with NVTX
 #
 # Disable CUDA profiler API capture (full process timeline, more import noise):
 #   NSYS_CAPTURE_API=0 ./aurora/scripts/profile_aurora_small_nsys.sh
@@ -23,27 +25,33 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_nsys_path.sh
+source "$SCRIPT_DIR/_nsys_path.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 OUT_DIR="${NSIGHT_OUT_DIR:-$REPO_ROOT/profiling/nsight}"
 mkdir -p "$OUT_DIR"
-STAMP="$(date +%Y%m%d_%H%M%S)"
-OUT_BASE="$OUT_DIR/aurora_small_${STAMP}"
 
 # Steady-state oriented defaults (override with env).
 WARMUP="${NSYS_WARMUP:-16}"
 REPEAT="${NSYS_REPEAT:-1}"
 NSYS_CAPTURE_API="${NSYS_CAPTURE_API:-1}"
-
-if ! command -v nsys &>/dev/null; then
-  echo "nsys not found. Install NVIDIA Nsight Systems and ensure it is on PATH." >&2
-  exit 1
+INFERENCE_PRECISION="${INFERENCE_PRECISION:-bf16_mixed}"
+STAMP="${NSYS_STAMP:-$(date +%Y%m%d_%H%M%S)}"
+if [[ -n "${NSYS_OUT_BASE:-}" ]]; then
+  OUT_BASE="${NSYS_OUT_BASE}"
+else
+  OUT_BASE="$OUT_DIR/aurora_${INFERENCE_PRECISION}_${STAMP}"
 fi
+export AURORA_NVTX="${AURORA_NVTX:-1}"
+AURORA_HF_LOCAL_DIR="${AURORA_HF_LOCAL_DIR:-/root/autodl-tmp/aurora}"
+export AURORA_HF_LOCAL_DIR
 
+echo "[nsys] using: ${NSYS_BIN}"
 echo "[nsys] output base: ${OUT_BASE}"
 echo "[nsys] repo root: ${REPO_ROOT}"
-echo "[nsys] warmup=${WARMUP} repeat=${REPEAT} capture_cuda_profiler_api=${NSYS_CAPTURE_API}"
+echo "[nsys] warmup=${WARMUP} repeat=${REPEAT} capture_cuda_profiler_api=${NSYS_CAPTURE_API} inference_precision=${INFERENCE_PRECISION} AURORA_NVTX=${AURORA_NVTX}"
 
 NSYS_ARGS=(
   profile
@@ -63,13 +71,20 @@ PY_ARGS=(
   --warmup "${WARMUP}"
   --no-torch-profiler
   --cudnn-benchmark
+  --inference-precision "${INFERENCE_PRECISION}"
 )
 
 if [[ "${NSYS_CAPTURE_API}" == "1" ]]; then
   PY_ARGS+=(--cuda-profiler-api)
 fi
 
-nsys "${NSYS_ARGS[@]}" "${PY_ARGS[@]}" "$@"
+if [[ "${CUDA_GRAPH:-0}" == "1" ]]; then
+  PY_ARGS+=(--cuda-graph)
+  WARMUP=$((WARMUP + 4))
+  echo "[nsys] CUDA_GRAPH=1 → --cuda-graph backbone replay, warmup=${WARMUP}"
+fi
+
+"${NSYS_BIN}" "${NSYS_ARGS[@]}" "${PY_ARGS[@]}" "$@"
 
 echo ""
 echo "Report: ${OUT_BASE}.nsys-rep"

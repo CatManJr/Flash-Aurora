@@ -33,6 +33,7 @@ from aurora.model.inference_precision import (
     apply_inference_config,
     resolve_inference_config,
 )
+from aurora.model.nvtx import nvtx_range
 from aurora.model.lora import LoRAMode
 from aurora.model.swin3d import Swin3DTransformerBackbone
 from aurora.model.workspace_pool import InferenceWorkspacePool
@@ -559,15 +560,25 @@ class Aurora(torch.nn.Module):
             elif self._cuda_graph_scope == "backbone":
                 from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
 
-                with torch.inference_mode():
-                    x = run_with_encoder_decoder_autocast(
-                        self.encoder,
-                        transformed_batch,
-                        enabled=self.autocast_encoder_decoder,
-                        lead_time=self.timestep,
-                    )
-                if runner.can_replay(x, rollout_step):
-                    x = runner(x, rollout_step=rollout_step)
+                with nvtx_range("aurora::encoder"):
+                    with torch.inference_mode():
+                        x = run_with_encoder_decoder_autocast(
+                            self.encoder,
+                            transformed_batch,
+                            enabled=self.autocast_encoder_decoder,
+                            lead_time=self.timestep,
+                        )
+                with nvtx_range("aurora::backbone"):
+                    if runner.can_replay(x, rollout_step):
+                        x = runner(x, rollout_step=rollout_step)
+                    else:
+                        x = self._run_backbone(
+                            x,
+                            lead_time=self.timestep,
+                            patch_res=patch_res,
+                            rollout_step=rollout_step,
+                        )
+                with nvtx_range("aurora::decoder"):
                     with torch.inference_mode():
                         pred = run_with_encoder_decoder_autocast(
                             self.decoder,
@@ -577,32 +588,35 @@ class Aurora(torch.nn.Module):
                             lead_time=self.timestep,
                             patch_res=patch_res,
                         )
-                    return self._finish_prediction(batch, pred)
+                return self._finish_prediction(batch, pred)
 
         from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
 
-        x = run_with_encoder_decoder_autocast(
-            self.encoder,
-            transformed_batch,
-            enabled=self.autocast_encoder_decoder,
-            lead_time=self.timestep,
-        )
+        with nvtx_range("aurora::encoder"):
+            x = run_with_encoder_decoder_autocast(
+                self.encoder,
+                transformed_batch,
+                enabled=self.autocast_encoder_decoder,
+                lead_time=self.timestep,
+            )
 
-        x = self._run_backbone(
-            x,
-            lead_time=self.timestep,
-            patch_res=patch_res,
-            rollout_step=batch.metadata.rollout_step,
-        )
+        with nvtx_range("aurora::backbone"):
+            x = self._run_backbone(
+                x,
+                lead_time=self.timestep,
+                patch_res=patch_res,
+                rollout_step=batch.metadata.rollout_step,
+            )
 
-        pred = run_with_encoder_decoder_autocast(
-            self.decoder,
-            x,
-            batch,
-            enabled=self.autocast_encoder_decoder,
-            lead_time=self.timestep,
-            patch_res=patch_res,
-        )
+        with nvtx_range("aurora::decoder"):
+            pred = run_with_encoder_decoder_autocast(
+                self.decoder,
+                x,
+                batch,
+                enabled=self.autocast_encoder_decoder,
+                lead_time=self.timestep,
+                patch_res=patch_res,
+            )
 
         return self._finish_prediction(batch, pred)
 

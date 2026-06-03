@@ -188,11 +188,22 @@ def main() -> None:
         action="store_true",
         help="Time Swin backbone only (encoder run once outside timed loop).",
     )
-    parser.add_argument("--trace-out", type=Path, default=None)
+    parser.add_argument(
+        "--trace-out",
+        type=Path,
+        default=None,
+        help="Chrome trace JSON for Perfetto (default: profiling/aurora_perfetto_<scope>.json).",
+    )
     parser.add_argument("--report-out", type=Path, default=None)
+    parser.add_argument(
+        "--with-stack",
+        action="store_true",
+        help="Record Python stacks in the trace (larger file, better Perfetto drill-down).",
+    )
     args = parser.parse_args()
 
     import torch
+    from torch.autograd.profiler import record_function
     from torch.profiler import ProfilerActivity, profile
 
     from aurora import AuroraSmallPretrained
@@ -232,14 +243,46 @@ def main() -> None:
         with torch.inference_mode():
             if args.backbone_only:
                 assert patch_res is not None and backbone_x is not None
-                _ = model._run_backbone(
-                    backbone_x,
-                    lead_time=model.timestep,
-                    patch_res=patch_res,
-                    rollout_step=rollout_step,
-                )
+                with record_function("aurora::backbone"):
+                    _ = model._run_backbone(
+                        backbone_x,
+                        lead_time=model.timestep,
+                        patch_res=patch_res,
+                        rollout_step=rollout_step,
+                    )
             else:
-                _ = model.forward(batch)
+                with record_function("aurora::forward"):
+                    with record_function("aurora::prepare_batch"):
+                        enc_batch, transformed, pr = model._prepare_encoder_batch(batch)
+                    with record_function("aurora::encoder"):
+                        from aurora.model.custom_op_paths import (
+                            run_with_encoder_decoder_autocast,
+                        )
+
+                        x = run_with_encoder_decoder_autocast(
+                            model.encoder,
+                            transformed,
+                            enabled=model.autocast_encoder_decoder,
+                            lead_time=model.timestep,
+                        )
+                    with record_function("aurora::backbone"):
+                        x = model._run_backbone(
+                            x,
+                            lead_time=model.timestep,
+                            patch_res=pr,
+                            rollout_step=batch.metadata.rollout_step,
+                        )
+                    with record_function("aurora::decoder"):
+                        pred = run_with_encoder_decoder_autocast(
+                            model.decoder,
+                            x,
+                            enc_batch,
+                            enabled=model.autocast_encoder_decoder,
+                            lead_time=model.timestep,
+                            patch_res=pr,
+                        )
+                    with record_function("aurora::finish_prediction"):
+                        _ = model._finish_prediction(enc_batch, pred)
 
     scope = "backbone" if args.backbone_only else "full_e2e"
     print(f"[config] tier={args.tier} scope={scope} warmup={args.warmup} repeat={args.repeat}")
@@ -259,21 +302,33 @@ def main() -> None:
     ms_forward = ev0.elapsed_time(ev1) / args.repeat
     wall_us = ms_forward * 1e3
 
+    if args.trace_out is None:
+        scope_tag = "backbone" if args.backbone_only else "full"
+        args.trace_out = _REPO / "profiling" / f"aurora_perfetto_{scope_tag}.json"
+
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
     with profile(
         activities=activities,
         record_shapes=False,
         profile_memory=False,
-        with_stack=False,
+        with_stack=args.with_stack,
     ) as prof:
         for _ in range(args.repeat):
             run_once()
         torch.cuda.synchronize()
 
-    if args.trace_out is not None:
-        args.trace_out.parent.mkdir(parents=True, exist_ok=True)
-        prof.export_chrome_trace(str(args.trace_out))
-        print(f"[trace] {args.trace_out.resolve()}  (chrome://tracing or https://ui.perfetto.dev)")
+    args.trace_out.parent.mkdir(parents=True, exist_ok=True)
+    prof.export_chrome_trace(str(args.trace_out))
+    trace_path = args.trace_out.resolve()
+    size_mb = trace_path.stat().st_size / (1024 * 1024)
+    print(f"\n=== Perfetto trace ===")
+    print(f"  file: {trace_path}  ({size_mb:.1f} MB)")
+    print(f"  1. Open https://ui.perfetto.dev")
+    print(f"  2. Open trace file → pick the JSON above")
+    print(f"  3. Timeline: search tracks `aurora::` (encoder / backbone / decoder)")
+    print(f"  4. GPU: expand `cuda` / `gpu` rows; empty gaps = launch/sync bubbles")
+    if size_mb > 80:
+        print(f"  tip: trace is large; next run add `--backbone-only` or drop `--with-stack`")
 
     kineto = prof.profiler.kineto_results
     events = list(kineto.events()) if kineto is not None else []

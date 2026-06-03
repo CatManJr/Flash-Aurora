@@ -189,11 +189,13 @@ class CudaGraphAuroraBackboneRunner:
             )
 
     def can_replay(self, x: torch.Tensor, rollout_step: int) -> bool:
+        # Backbone capture fixes ``rollout_step`` in the graph. Replay is valid across rollout
+        # steps when LoRA is step-invariant (``lora_mode='single'``) and AdaLN does not use step.
+        del rollout_step
         return (
             x.shape == self.static_x.shape
             and x.dtype == self.static_x.dtype
             and x.device == self.static_x.device
-            and rollout_step == self.rollout_step
         )
 
     def __call__(self, x: torch.Tensor, *, rollout_step: int) -> torch.Tensor:

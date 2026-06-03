@@ -11,9 +11,13 @@
 #   ./aurora/scripts/nsys_export_csv.sh profiling/nsight/aurora_small_YYYYMMDD_HHMMSS.nsys-rep
 #   ./aurora/scripts/nsys_export_csv.sh path/to/foo.nsys-rep /tmp/csv_out
 #
-# Requires: nsys on PATH.
+# Requires: nsys (PATH or Nsight Compute bundle).
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_nsys_path.sh
+source "$SCRIPT_DIR/_nsys_path.sh"
 
 if [[ $# -lt 1 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
   echo "Usage: $0 <capture.nsys-rep> [output-directory]" >&2
@@ -29,11 +33,6 @@ fi
 OUT_DIR="$(realpath "${2:-$(dirname "$REP")}")"
 mkdir -p "$OUT_DIR"
 
-if ! command -v nsys &>/dev/null; then
-  echo "nsys not found. Install NVIDIA Nsight Systems." >&2
-  exit 1
-fi
-
 BASE="$(basename "$REP" .nsys-rep)"
 PREFIX="${OUT_DIR}/${BASE}"
 
@@ -44,7 +43,7 @@ echo "[nsys_export_csv] output: $OUT_DIR"
 # Use cwd + `--output .` so nsys names files from the capture basename.
 (
   cd "$OUT_DIR"
-  nsys stats --force-export=true \
+  "${NSYS_BIN}" stats --force-export=true \
     --report cuda_api_sum \
     --report cuda_api_gpu_sum \
     --report cuda_gpu_kern_sum \

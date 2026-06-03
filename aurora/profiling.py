@@ -71,28 +71,36 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
+def _hf_data_path(filename: str) -> str:
+    """Resolve Aurora HF assets from a local dir (offline) or Hugging Face Hub."""
+    local_dir = os.environ.get("AURORA_HF_LOCAL_DIR", "").strip()
+    if local_dir:
+        path = os.path.join(local_dir, filename)
+        if os.path.isfile(path):
+            return path
+        raise FileNotFoundError(
+            f"AURORA_HF_LOCAL_DIR={local_dir!r} but missing file: {path}"
+        )
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id="microsoft/aurora", filename=filename)
+
+
 def _load_batch_from_hf() -> Any:
     import numpy as np
     import torch
-    from huggingface_hub import hf_hub_download
 
     from aurora import Batch, Metadata
     from aurora.batch import interpolate_numpy
 
-    path = hf_hub_download(
-        repo_id="microsoft/aurora",
-        filename="aurora-0.25-small-pretrained-test-input.pickle",
-    )
+    path = _hf_data_path("aurora-0.25-small-pretrained-test-input.pickle")
     # Pickled NumPy arrays may trigger numpy.core deprecation noise on NumPy 2.x.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         with open(path, "rb") as f:
             test_input = pickle.load(f)
 
-    path = hf_hub_download(
-        repo_id="microsoft/aurora",
-        filename="aurora-0.25-static.pickle",
-    )
+    path = _hf_data_path("aurora-0.25-static.pickle")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         with open(path, "rb") as f:
@@ -458,7 +466,7 @@ def _probe_max_batch(
 
 
 def _aurora_model_kwargs(args: argparse.Namespace) -> dict[str, Any]:
-    from aurora.model.inference_precision import apply_inference_config, resolve_inference_config
+    from aurora.model.inference_precision import resolve_inference_config
     from aurora.model.workspace_pool import InferenceWorkspacePool
 
     pool_kw = {"workspace_pool": InferenceWorkspacePool()} if args.use_workspace_pool else {}
@@ -478,10 +486,8 @@ def _aurora_model_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             print(
                 "[warn] --inference-precision overrides scattered --use-triton-* flags."
             )
-        preset = apply_inference_config(args.inference_precision)
         return {
             **base,
-            **preset,
             "inference_precision": args.inference_precision,
         }
     return {
@@ -945,7 +951,8 @@ def main() -> None:
     print(
         f"[config] batch_size={batch_size}{stress_note}, synthetic={args.synthetic}, "
         f"repeat={args.repeat}, rollout_steps={args.rollout_steps}, forward_only={args.forward_only}, "
-        f"cuda_profiler_api={args.cuda_profiler_api}, cudnn_benchmark={args.cudnn_benchmark}"
+        f"cuda_profiler_api={args.cuda_profiler_api}, cudnn_benchmark={args.cudnn_benchmark}, "
+        f"cuda_graph={args.cuda_graph}"
         + (
             f", synthetic_h={args.synthetic_h}, synthetic_w={args.synthetic_w}"
             if args.synthetic
