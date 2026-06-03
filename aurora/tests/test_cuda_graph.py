@@ -31,9 +31,9 @@ def _smoke_batch(*, batch_size: int = 1, h: int = 32, w: int = 64) -> "Batch":
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-    reason="CuTe tf32_1x preset targets recent NVIDIA GPUs",
+    reason="CuTe tf32 preset targets recent NVIDIA GPUs",
 )
-def test_backbone_cuda_graph_capture_tf32_1x() -> None:
+def test_backbone_cuda_graph_capture_tf32() -> None:
     from aurora.model.aurora import AuroraSmallPretrained
     from aurora.model.checkpoint_local import resolve_checkpoint_path
     from aurora.model.inference_tensors import clear_constant_tensor_cache
@@ -45,7 +45,7 @@ def test_backbone_cuda_graph_capture_tf32_1x() -> None:
         allow_hub_download=False,
     )
     batch = _smoke_batch()
-    model = AuroraSmallPretrained(use_lora=False, inference_precision="tf32_1x")
+    model = AuroraSmallPretrained(use_lora=False, inference_precision="tf32")
     model.load_checkpoint_local(str(ckpt), strict=False)
     model.eval().cuda()
 

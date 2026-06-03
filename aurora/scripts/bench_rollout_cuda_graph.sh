@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Compare multi-step rollout with/without backbone CUDA graph (bf16_mixed or tf32_1x).
+# Compare multi-step rollout with/without backbone CUDA graph (bf16_mixed, bf16, or tf32).
 #
 # Usage (repo root):
 #   export CUTE_DSL_ARCH=sm_120a
 #   ./aurora/scripts/bench_rollout_cuda_graph.sh
-#   ROLLOUT_STEPS=6 INFERENCE_PRECISION=tf32_1x ./aurora/scripts/bench_rollout_cuda_graph.sh
+#   ROLLOUT_STEPS=6 INFERENCE_PRECISION=tf32 ./aurora/scripts/bench_rollout_cuda_graph.sh
 
 set -euo pipefail
 

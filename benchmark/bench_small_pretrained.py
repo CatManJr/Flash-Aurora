@@ -48,8 +48,9 @@ _OUTPUT_NAME = "aurora-0.25-small-pretrained-test-output.pickle"
 _DEFAULT_TIERS: tuple[tuple[str, str], ...] = (
     ("fp32", "PyTorch FP32"),
     ("fast_fp32", "Triton layout + AdaLN + PyTorch GELU"),
-    ("tf32_1x", "fast_fp32 + TF32 matmul + CuTe TF32 attn"),
-    ("bf16_mixed", "fast_fp32 + BF16 backbone + CuTe BF16 attn"),
+    ("tf32", "fast_fp32 + TF32 matmul + CuTe TF32 attn"),
+    ("bf16_mixed", "hybrid: TF32 QKV/proj + BF16 MLP + CuTe BF16 attn"),
+    ("bf16", "full backbone BF16 linears + CuTe BF16 attn"),
     ("pytorch_autocast", "PyTorch backbone BF16 autocast"),
 )
 
@@ -320,8 +321,8 @@ def _run_ablate_cute(
     cases: list[tuple[str, str, bool | None]] = [
         ("fp32", "fp32 baseline", None),
         ("pytorch_autocast", "PyTorch autocast + SDPA", None),
-        ("tf32_1x", "TF32 + Triton + CuTe attn", None),
-        ("tf32_1x", "TF32 + Triton + SDPA (no CuTe)", False),
+        ("tf32", "TF32 + Triton + CuTe attn", None),
+        ("tf32", "TF32 + Triton + SDPA (no CuTe)", False),
         ("bf16_mixed", "BF16 MLP + Triton + CuTe attn", None),
         ("bf16_mixed", "BF16 MLP + Triton + SDPA (no CuTe)", False),
     ]
@@ -371,8 +372,8 @@ def _run_ablate_cute(
     print(f"  {'tier':<22} {'msl':>10} {'2t':>10} {'10u':>10} {'10v':>10} {'max_all':>10}")
     for tier_key in (
         "pytorch_autocast",
-        "tf32_1x",
-        "tf32_1x_sdpa",
+        "tf32",
+        "tf32_sdpa",
         "bf16_mixed",
         "bf16_mixed_sdpa",
     ):
@@ -454,7 +455,7 @@ def main() -> None:
         "--ablate-cute",
         action="store_true",
         help=(
-            "Compare tf32_1x / bf16_mixed with CuTe window attn on vs off (SDPA); "
+            "Compare tf32 / bf16_mixed with CuTe window attn on vs off (SDPA); "
             "print per-variable max_abs vs fp32"
         ),
     )

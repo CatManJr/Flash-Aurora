@@ -14,7 +14,7 @@
 # Override defaults:
 #   NSYS_WARMUP=24 NSIGHT_OUT_DIR=/tmp/nsight ./aurora/scripts/profile_aurora_small_nsys.sh
 #   INFERENCE_PRECISION=bf16_mixed CUTE_DSL_ARCH=sm_120a ./aurora/scripts/profile_aurora_small_nsys.sh
-#   ./aurora/scripts/profile_aurora_nsys_pair.sh   # bf16_mixed + tf32_1x with NVTX
+#   ./aurora/scripts/profile_aurora_nsys_pair.sh   # bf16_mixed + tf32 with NVTX
 #
 # Disable CUDA profiler API capture (full process timeline, more import noise):
 #   NSYS_CAPTURE_API=0 ./aurora/scripts/profile_aurora_small_nsys.sh

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
-
 import pytest
 
 import torch
@@ -25,19 +23,18 @@ from aurora.model.inference_precision import (
         ("fp32", AuroraInferencePrecision.FP32),
         ("pytorch_autocast", AuroraInferencePrecision.PYTORCH_AUTOCAST),
         ("fast_fp32", AuroraInferencePrecision.FAST_FP32),
-        ("tf32_1x", AuroraInferencePrecision.TF32_1X),
+        ("tf32", AuroraInferencePrecision.TF32),
         ("bf16_mixed", AuroraInferencePrecision.BF16_MIXED),
+        ("bf16", AuroraInferencePrecision.BF16),
     ],
 )
 def test_parse_inference_precision(raw: str, expected: AuroraInferencePrecision) -> None:
     assert parse_inference_precision(raw) == expected
 
 
-def test_full_bf16_alias_maps_to_bf16_mixed() -> None:
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        assert parse_inference_precision("full_bf16") == AuroraInferencePrecision.BF16_MIXED
-    assert any("full_bf16 is deprecated" in str(w.message) for w in caught)
+def test_unknown_precision_raises() -> None:
+    with pytest.raises(ValueError, match="Unknown inference precision"):
+        parse_inference_precision("tf32_1x")
 
 
 def test_fp32_preset_is_strict_pytorch() -> None:
@@ -80,8 +77,8 @@ def test_fast_fp32_preset_is_triton_with_native_perceiver() -> None:
     assert cfg.backbone_matmul_bf16 is False
 
 
-def test_tf32_1x_preset_adds_cute() -> None:
-    cfg = resolve_inference_config("tf32_1x")
+def test_tf32_preset_adds_cute() -> None:
+    cfg = resolve_inference_config("tf32")
     assert cfg is not None
     assert cfg.kernel_profile == "tf32_backbone"
     assert cfg.backbone_matmul_level == BackboneMatmulLevel.TF32
@@ -95,15 +92,26 @@ def test_tf32_1x_preset_adds_cute() -> None:
     assert cfg.cuda_graph_scope == "backbone"
 
 
-def test_bf16_mixed_preset_uses_explicit_bf16_backbone() -> None:
+def test_bf16_mixed_preset_is_hybrid_tf32_plus_mlp_bf16() -> None:
     cfg = resolve_inference_config("bf16_mixed")
     assert cfg is not None
     assert cfg.kernel_profile == "bf16_mixed_backbone"
     assert cfg.backbone_matmul_level == BackboneMatmulLevel.BF16_MIXED
+    assert cfg.backbone_matmul_bf16 is True
+    assert cfg.backbone_matmul_tf32 is True
+    assert cfg.window_attn_compute_dtype == "bfloat16"
+    assert cfg.use_cute_window_attn is True
+
+
+def test_bf16_preset_is_full_bf16_linears() -> None:
+    cfg = resolve_inference_config("bf16")
+    assert cfg is not None
+    assert cfg.kernel_profile == "bf16_mixed_backbone"
+    assert cfg.backbone_matmul_level == BackboneMatmulLevel.BF16
     assert cfg.backbone_compute_dtype == "float32"
     assert cfg.window_attn_compute_dtype == "bfloat16"
     assert cfg.backbone_matmul_bf16 is True
-    assert cfg.backbone_matmul_tf32 is True
+    assert cfg.backbone_matmul_tf32 is False
     assert cfg.use_cute_window_attn is True
     assert cfg.autocast_backbone is False
     assert cfg.use_perceiver_flash_attn is False
@@ -121,8 +129,8 @@ def test_fast_fp32_plus_tensor_core_modifier() -> None:
     assert cfg.use_cute_window_attn is False
 
 
-def test_tf32_1x_plus_no_tensor_core_modifier() -> None:
-    cfg = resolve_inference_config("tf32_1x+no_tensor_core")
+def test_tf32_plus_no_tensor_core_modifier() -> None:
+    cfg = resolve_inference_config("tf32+no_tensor_core")
     assert cfg is not None
     assert cfg.backbone_matmul_level == BackboneMatmulLevel.TF32
     assert cfg.encoder_decoder_use_tensor_core is False
@@ -153,7 +161,7 @@ def test_encoder_decoder_use_tensor_core_kwarg_override() -> None:
 
 def test_custom_ops_cannot_combine_with_autocast() -> None:
     cfg = build_inference_config(
-        precision=AuroraInferencePrecision.TF32_1X,
+        precision=AuroraInferencePrecision.TF32,
         kernel_profile="tf32_backbone",
         backbone_matmul_level=BackboneMatmulLevel.TF32,
         encoder_decoder_use_tensor_core=False,
@@ -188,12 +196,12 @@ def test_fp32_rejects_cuda_graph_enable() -> None:
         resolve_inference_config("fp32", enable_cuda_graph=True)
 
 
-def test_aurora_constructor_applies_tf32_1x_preset() -> None:
+def test_aurora_constructor_applies_tf32_preset() -> None:
     from aurora.model.aurora import AuroraSmallPretrained
 
-    model = AuroraSmallPretrained(use_lora=False, inference_precision="tf32_1x")
+    model = AuroraSmallPretrained(use_lora=False, inference_precision="tf32")
     assert model.inference_config is not None
-    assert model.inference_config.precision == AuroraInferencePrecision.TF32_1X
+    assert model.inference_config.precision == AuroraInferencePrecision.TF32
     assert model.inference_config.backbone_matmul_level == BackboneMatmulLevel.TF32
     assert model.inference_config.backbone_matmul_tf32 is True
     assert model.encoder_decoder_use_tensor_core is True
@@ -211,10 +219,21 @@ def test_aurora_constructor_applies_bf16_mixed_preset() -> None:
     assert model.inference_config.backbone_matmul_level == BackboneMatmulLevel.BF16_MIXED
     assert model.inference_config.backbone_matmul_bf16 is True
     assert model.inference_config.backbone_matmul_tf32 is True
-    assert model.encoder_decoder_use_tensor_core is True
-    assert model.cute_window_attn_dtype == torch.bfloat16
     block = model.backbone.encoder_layers[0].blocks[0]
     assert block.attn.cute_window_attn_dtype == torch.bfloat16
+
+
+def test_aurora_constructor_applies_bf16_preset() -> None:
+    from aurora.model.aurora import AuroraSmallPretrained
+
+    model = AuroraSmallPretrained(use_lora=False, inference_precision="bf16")
+    assert model.inference_config is not None
+    assert model.inference_config.precision == AuroraInferencePrecision.BF16
+    assert model.inference_config.backbone_matmul_level == BackboneMatmulLevel.BF16
+    assert model.inference_config.backbone_matmul_bf16 is True
+    assert model.inference_config.backbone_matmul_tf32 is False
+    assert model.encoder_decoder_use_tensor_core is True
+    assert model.cute_window_attn_dtype == torch.bfloat16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -227,17 +246,6 @@ def test_encoder_decoder_routing_enables_tf32_flags() -> None:
 
     with torch.inference_mode():
         run_with_encoder_decoder_routing(_noop, use_tensor_core=True)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_encoder_decoder_routing_matmul_tf32_alias() -> None:
-    from aurora.model.custom_op_paths import run_with_encoder_decoder_routing
-
-    def _noop() -> None:
-        assert torch.backends.cuda.matmul.allow_tf32 is True
-
-    with torch.inference_mode():
-        run_with_encoder_decoder_routing(_noop, matmul_tf32=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -294,7 +302,20 @@ def test_backbone_bf16_matmul_context_mlp_chain_and_norm_break() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_backbone_bf16_matmul_context_hooks_qkv_linear() -> None:
+def test_backbone_bf16_hybrid_hooks_qkv_linear_fp32() -> None:
+    from aurora.model.custom_op_paths import backbone_matmul_context
+
+    linear = torch.nn.Linear(128, 128 * 3, bias=True).cuda().float()
+    x = torch.randn(8, 144, 128, device="cuda", dtype=torch.float32)
+
+    with torch.inference_mode():
+        with backbone_matmul_context(tf32=True, bf16=True):
+            qkv = linear(x)
+    assert qkv.dtype == torch.float32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_backbone_bf16_hooks_qkv_linear_bf16() -> None:
     from aurora.model.custom_op_paths import backbone_bf16_matmul_context
 
     linear = torch.nn.Linear(128, 128 * 3, bias=True).cuda().float()
@@ -303,7 +324,7 @@ def test_backbone_bf16_matmul_context_hooks_qkv_linear() -> None:
     with torch.inference_mode():
         with backbone_bf16_matmul_context(enabled=True):
             qkv = linear(x)
-    assert qkv.dtype == torch.float32
+    assert qkv.dtype == torch.bfloat16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -9,7 +9,7 @@ Swin encoder/decoder stage in the backbone.
 Examples::
 
     uv run python benchmark/bench_backbone_error_accum.py
-    uv run python benchmark/bench_backbone_error_accum.py --tier tf32_1x
+    uv run python benchmark/bench_backbone_error_accum.py --tier tf32
     uv run python benchmark/bench_backbone_error_accum.py --tier bf16_mixed --per-block
 """
 

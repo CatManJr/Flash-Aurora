@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile ``tf32_1x`` vs ``bf16_mixed`` on AuroraSmallPretrained (400×800).
+"""Profile ``tf32`` vs ``bf16_mixed`` on AuroraSmallPretrained (400×800).
 
 Default scope is **Swin backbone only**: encoder runs once to build tokens; the timed
 loop is ``_run_backbone`` only. Perceiver (encoder/decoder) is identical across
@@ -12,7 +12,7 @@ Example::
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/profile_precision_tiers.py
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/profile_precision_tiers.py \\
-        --report-out profiling/tf32_vs_bf16_backbone.md
+        --report-out profiling/tf32_vs_bf16_mixed.md
 """
 
 from __future__ import annotations
@@ -289,7 +289,7 @@ def _print_comparison(results: list[ProfileResult]) -> None:
 def _write_markdown(path: Path, results: list[ProfileResult]) -> None:
     scope = results[0].scope if results else "backbone"
     lines = [
-        "# tf32_1x vs bf16_mixed profiler comparison",
+        "# tf32 vs bf16_mixed profiler comparison",
         "",
         f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
         f"- Scope: **{scope}** (Perceiver encoder/decoder identical across tiers)",
@@ -357,7 +357,7 @@ def main() -> None:
     data_dir = args.data_dir.expanduser().resolve()
     batch = _load_batch(data_dir)
 
-    tiers = ("tf32_1x", "bf16_mixed")
+    tiers = ("tf32", "bf16_mixed")
     results: list[ProfileResult] = []
     for tier in tiers:
         print(f"\n[profile] {tier} ...", flush=True)

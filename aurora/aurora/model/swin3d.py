@@ -72,12 +72,12 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
         from aurora.model.custom_op_paths import (
-            backbone_bf16_matmul_active,
+            backbone_bf16_hybrid_matmul_active,
             backbone_bf16_mlp_matmul_scope,
         )
 
         use_bf16_mlp = (
-            backbone_bf16_matmul_active()
+            backbone_bf16_hybrid_matmul_active()
             and x.is_cuda
             and not torch.is_grad_enabled()
             and x.dtype in (torch.float32, torch.bfloat16)
@@ -278,7 +278,7 @@ class WindowAttention(nn.Module):
             and x.is_cuda
             and not torch.is_grad_enabled()
         )
-        # MLP-only BF16: QKV/proj stay FP32 (like autocast); cast to BF16 only for CuTe attn.
+        # bf16: all linears BF16; bf16_mixed: MLP-only BF16, cast for non-CuTe.
         if x.dtype == torch.bfloat16 and not bf16_cute_attn:
             x = cast_activation_dtype(x, torch.float32)
 

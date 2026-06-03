@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Paired Nsight Systems captures: bf16_mixed vs tf32_1x (same stamp, NVTX ranges on).
+# Paired Nsight Systems captures: bf16_mixed vs tf32 (same stamp, NVTX ranges on).
 #
 # Usage (repo root):
 #   export CUTE_DSL_ARCH=sm_120a
@@ -7,7 +7,7 @@
 #
 # Outputs:
 #   profiling/nsight/aurora_bf16_mixed_<stamp>.nsys-rep
-#   profiling/nsight/aurora_tf32_1x_<stamp>.nsys-rep
+#   profiling/nsight/aurora_tf32_<stamp>.nsys-rep
 #   profiling/nsight/*_<stamp>_nvtx_sum.csv (after export)
 
 set -euo pipefail
@@ -24,7 +24,7 @@ PAIR_STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="${NSIGHT_OUT_DIR:-$REPO_ROOT/profiling/nsight}"
 mkdir -p "$OUT_DIR"
 
-PRESETS=(bf16_mixed tf32_1x)
+PRESETS=(bf16_mixed tf32)
 REPORTS=()
 
 for preset in "${PRESETS[@]}"; do

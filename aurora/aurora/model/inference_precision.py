@@ -2,7 +2,7 @@
 
 Matmul routing is a **2D grid**:
 
-* **Backbone** — :class:`BackboneMatmulLevel`: ``fp32`` | ``tf32`` | ``bf16_mixed``
+* **Backbone** — :class:`BackboneMatmulLevel`: ``fp32`` | ``tf32`` | ``bf16_mixed`` | ``bf16``
 * **Encoder/decoder** — ``encoder_decoder_use_tensor_core``: TF32 ``F.linear`` (FP32 activations)
 
 Named presets are convenience points on the grid. Override E/D TC with ``+tensor_core`` /
@@ -13,7 +13,6 @@ Custom Triton/CuTe Swin paths never run inside ``torch.autocast``.
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
@@ -32,7 +31,10 @@ class BackboneMatmulLevel(str, Enum):
     """TF32 Tensor Core on backbone linears (FP32 I/O)."""
 
     BF16_MIXED = "bf16_mixed"
-    """TF32 on QKV/proj/patch; BF16 on MLP ``fc1``/``fc2`` (FP32 LayerNorm on MLP output)."""
+    """Hybrid: TF32 QKV/proj/patch; BF16 MLP ``fc1``/``fc2`` only; CuTe BF16 attn; FP32 AdaLN."""
+
+    BF16 = "bf16"
+    """Full backbone ``F.linear`` in BF16; FP32 AdaLN; CuTe BF16 attn."""
 
 
 class AuroraInferencePrecision(str, Enum):
@@ -41,8 +43,9 @@ class AuroraInferencePrecision(str, Enum):
     FP32 = "fp32"
     PYTORCH_AUTOCAST = "pytorch_autocast"
     FAST_FP32 = "fast_fp32"
-    TF32_1X = "tf32_1x"
+    TF32 = "tf32"
     BF16_MIXED = "bf16_mixed"
+    BF16 = "bf16"
 
 
 CudaGraphScope = Literal["off", "backbone", "full_gpu"]
@@ -54,7 +57,9 @@ def backbone_matmul_flags(level: BackboneMatmulLevel) -> tuple[bool, bool]:
         return False, False
     if level == BackboneMatmulLevel.TF32:
         return False, True
-    return True, True
+    if level == BackboneMatmulLevel.BF16_MIXED:
+        return True, True
+    return True, False
 
 
 @dataclass(frozen=True)
@@ -144,11 +149,14 @@ _PRESET_GRID: dict[AuroraInferencePrecision, _PresetGridCell] = {
     AuroraInferencePrecision.FAST_FP32: _PresetGridCell(
         "fast_fp32", BackboneMatmulLevel.FP32, False
     ),
-    AuroraInferencePrecision.TF32_1X: _PresetGridCell(
+    AuroraInferencePrecision.TF32: _PresetGridCell(
         "tf32_backbone", BackboneMatmulLevel.TF32, True
     ),
     AuroraInferencePrecision.BF16_MIXED: _PresetGridCell(
         "bf16_mixed_backbone", BackboneMatmulLevel.BF16_MIXED, True
+    ),
+    AuroraInferencePrecision.BF16: _PresetGridCell(
+        "bf16_mixed_backbone", BackboneMatmulLevel.BF16, True
     ),
 }
 
@@ -205,13 +213,16 @@ class AuroraInferenceConfig:
         bf16, tf32 = backbone_matmul_flags(self.backbone_matmul_level)
         if self.backbone_matmul_bf16 != bf16 or self.backbone_matmul_tf32 != tf32:
             raise ValueError("backbone matmul flags disagree with backbone_matmul_level.")
-        if self.backbone_matmul_level == BackboneMatmulLevel.BF16_MIXED:
+        if self.backbone_matmul_level in (
+            BackboneMatmulLevel.BF16_MIXED,
+            BackboneMatmulLevel.BF16,
+        ):
             if self.kernel_profile != "bf16_mixed_backbone":
                 raise ValueError(
-                    "backbone_matmul_level=bf16_mixed requires kernel_profile=bf16_mixed_backbone."
+                    "bf16_mixed/bf16 presets require kernel_profile=bf16_mixed_backbone."
                 )
             if self.window_attn_compute_dtype != "bfloat16":
-                raise ValueError("bf16_mixed backbone requires CuTe BF16 window attention.")
+                raise ValueError("bf16 CuTe presets require BF16 window attention.")
         if self.backbone_matmul_level == BackboneMatmulLevel.TF32 and not self.backbone_matmul_tf32:
             raise ValueError("backbone_matmul_level=tf32 requires backbone_matmul_tf32=True.")
         if self.backbone_matmul_level == BackboneMatmulLevel.FP32 and (
@@ -321,17 +332,6 @@ def parse_inference_precision(value: str | AuroraInferencePrecision) -> AuroraIn
     if isinstance(value, AuroraInferencePrecision):
         return value
     base, _ = _split_precision_modifiers(value)
-    if base == "fast_fp32_triton":
-        base = "fast_fp32"
-    if base in {"tf32", "1x_tf32"}:
-        base = "tf32_1x"
-    if base in {"full_bf16", "fullbf16", "bf16_full"}:
-        warnings.warn(
-            "full_bf16 is deprecated and removed; use bf16_mixed instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        base = "bf16_mixed"
     try:
         return AuroraInferencePrecision(base)
     except ValueError as exc:
@@ -378,7 +378,7 @@ def resolve_inference_config(
     if enable_cuda_graph and cfg.cuda_graph_scope == "off":
         raise ValueError(
             f"CUDA graph capture is not supported for precision={preset.value!r}. "
-            "Use tf32_1x or bf16_mixed (or a profile with cuda_graph_scope='backbone')."
+            "Use tf32, bf16_mixed, or bf16 (cuda_graph_scope='backbone')."
         )
     cfg.validate()
     return cfg

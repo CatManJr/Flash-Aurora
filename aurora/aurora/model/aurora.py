@@ -180,7 +180,7 @@ class Aurora(torch.nn.Module):
                 (BF16 I/O, FP32 accumulators); float32 tensors use the TF32 CuTe kernel when
                 enabled. Requires ``attn_drop=0``. Defaults to ``False``.
             inference_precision (str, optional): Named preset — ``fp32``, ``pytorch_autocast``,
-                ``fast_fp32`` (Triton Swin + native Perceiver), ``tf32_1x``, or ``bf16_mixed``
+                ``fast_fp32``, ``tf32``, ``bf16_mixed`` (hybrid), or ``bf16``
                 (custom Triton/CuTe Swin with explicit BF16 backbone matmuls).
                 Overrides scattered ``use_triton_*`` / ``use_cute_window_attn`` / ``autocast``
                 flags below when set.

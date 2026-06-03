@@ -811,7 +811,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--inference-precision",
-        choices=("fp32", "pytorch_autocast", "fast_fp32", "tf32_1x", "bf16_mixed"),
+        choices=("fp32", "pytorch_autocast", "fast_fp32", "tf32", "bf16_mixed", "bf16"),
         default=None,
         help=(
             "Named Swin3D inference preset. Overrides scattered Triton/CuTe/autocast flags. "
@@ -905,7 +905,7 @@ def main() -> None:
             raise SystemExit("--cuda-graph requires CUDA (--device cuda).")
         if args.inference_precision in (None, "fp32"):
             raise SystemExit(
-                "--cuda-graph requires --inference-precision tf32_1x or bf16_mixed."
+                "--cuda-graph requires --inference-precision tf32, bf16_mixed, or bf16."
             )
     if args.inference_precision and (
         args.use_triton_layout or args.use_triton_adaln or args.use_triton_mlp
