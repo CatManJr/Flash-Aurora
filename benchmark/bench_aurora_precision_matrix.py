@@ -27,6 +27,11 @@ Examples::
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_precision_matrix.py \\
         --batch-size 1 --cuda-graph --verify-paths
 
+    # Backbone × encoder/decoder matmul combo matrix (e.g. bf16 backbone + fp32 E/D)
+    CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_precision_matrix.py \\
+        --combo-matrix --backbone-levels tf32 bf16 bf16_mixed --encoder-decoder-levels fp32 tf32 \\
+        --model small --preset medium --batch-size 1
+
 Unless ``--batch-size`` is set, batch size is auto-probed to target ``--vram-fraction`` (default
 90%) of total GPU memory using a conservative fp32 forward before the tier matrix runs.
 On ``--preset production`` (721×1440) each probe forward can take several minutes; use
@@ -96,6 +101,24 @@ _BENCH_TIERS: tuple[tuple[str, str, str], ...] = (
     ("bf16_mixed", "bf16_mixed", "hybrid TF32 QKV/proj + BF16 MLP + CuTe BF16 attn"),
     ("bf16", "bf16", "full backbone BF16 linears + CuTe BF16 attn"),
 )
+
+
+def _bench_tiers_from_args(args: argparse.Namespace) -> tuple[tuple[str, str, str], ...]:
+    if not args.combo_matrix:
+        return _BENCH_TIERS
+    from aurora.model.inference_precision import expand_precision_combos
+
+    tiers: list[tuple[str, str, str]] = []
+    for label, cfg in expand_precision_combos(args.backbone_levels, args.encoder_decoder_levels):
+        spec = f"{cfg.backbone_matmul_level.value}@{cfg.encoder_decoder_matmul_level.value}"
+        tiers.append(
+            (
+                label,
+                spec,
+                f"backbone={cfg.backbone_matmul_level.value} E/D={cfg.encoder_decoder_matmul_level.value}",
+            )
+        )
+    return tuple(tiers)
 
 
 @dataclass(frozen=True)
@@ -647,9 +670,10 @@ def _verify_runtime_paths(model: Any, batch: Any) -> None:
             adaln_mod.adaptive_layernorm_film_add_residual_forward = fn
 
     cfg = model.inference_config
+    preset_label = cfg.config_label if cfg else "n/a"
     print("\n[verify-paths] runtime kernel counts (single forward):")
     print(
-        f"  preset={cfg.precision.value if cfg else 'n/a'} "
+        f"  preset={preset_label} "
         f"triton_layout={counts['triton_layout']}/{n_blocks} "
         f"triton_adaln_res={counts['triton_adaln_res']}/{2 * n_blocks} "
         f"triton_gelu={counts['triton_gelu']}/{n_blocks}"
@@ -855,6 +879,23 @@ def main() -> None:
         action="store_true",
         help="Run one forward with kernel counters on tf32 before the tier matrix.",
     )
+    p.add_argument(
+        "--combo-matrix",
+        action="store_true",
+        help="Benchmark backbone × encoder/decoder matmul level Cartesian product instead of named tiers.",
+    )
+    p.add_argument(
+        "--backbone-levels",
+        nargs="+",
+        default=["tf32", "bf16_mixed", "bf16"],
+        help="Backbone matmul levels for --combo-matrix (default: tf32 bf16_mixed bf16).",
+    )
+    p.add_argument(
+        "--encoder-decoder-levels",
+        nargs="+",
+        default=["fp32", "tf32"],
+        help="Encoder/decoder matmul levels for --combo-matrix (default: fp32 tf32).",
+    )
     p.add_argument("--report-out", type=str, default="")
     args = p.parse_args()
 
@@ -966,7 +1007,7 @@ def main() -> None:
         baseline_pred = _prediction_tensors(ref_model.forward(batch))
     _purge_gpu(ref_model)
 
-    for key, precision, label in _BENCH_TIERS:
+    for key, precision, label in _bench_tiers_from_args(args):
         result = _run_tier(
             key=key,
             precision=precision,

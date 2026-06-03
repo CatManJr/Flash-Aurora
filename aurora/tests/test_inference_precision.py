@@ -10,9 +10,12 @@ from aurora.model.inference_precision import (
     AuroraInferenceConfig,
     AuroraInferencePrecision,
     BackboneMatmulLevel,
+    EncoderDecoderMatmulLevel,
     apply_inference_config,
     build_inference_config,
+    expand_precision_combos,
     parse_inference_precision,
+    parse_precision_spec,
     resolve_inference_config,
 )
 
@@ -33,7 +36,7 @@ def test_parse_inference_precision(raw: str, expected: AuroraInferencePrecision)
 
 
 def test_unknown_precision_raises() -> None:
-    with pytest.raises(ValueError, match="Unknown inference precision"):
+    with pytest.raises(ValueError, match="Unknown precision"):
         parse_inference_precision("tf32_1x")
 
 
@@ -164,8 +167,7 @@ def test_custom_ops_cannot_combine_with_autocast() -> None:
         precision=AuroraInferencePrecision.TF32,
         kernel_profile="tf32_backbone",
         backbone_matmul_level=BackboneMatmulLevel.TF32,
-        encoder_decoder_use_tensor_core=False,
-        autocast_encoder_decoder=False,
+        encoder_decoder_matmul_level=EncoderDecoderMatmulLevel.FP32,
     )
     object.__setattr__(cfg, "autocast_backbone", True)
     with pytest.raises(ValueError, match="cannot be combined with backbone autocast"):
@@ -188,12 +190,119 @@ def test_apply_inference_config_expands_constructor_kwargs() -> None:
         "autocast_encoder_decoder": False,
         "encoder_decoder_use_tensor_core": False,
         "backbone_matmul_level": "fp32",
+        "encoder_decoder_matmul_level": "fp32",
+        "inference_config_label": "fast_fp32",
     }
+
+
+def test_parse_precision_combo_at_syntax() -> None:
+    spec = parse_precision_spec("bf16@fp32")
+    assert spec.named_preset is None
+    assert spec.backbone_matmul_level == BackboneMatmulLevel.BF16
+    assert spec.encoder_decoder_matmul_level == EncoderDecoderMatmulLevel.FP32
+
+
+def test_parse_precision_combo_kv_syntax() -> None:
+    spec = parse_precision_spec("backbone=tf32,encoder_decoder=fp32")
+    assert spec.backbone_matmul_level == BackboneMatmulLevel.TF32
+    assert spec.encoder_decoder_matmul_level == EncoderDecoderMatmulLevel.FP32
+
+
+def test_encoder_decoder_bf16_combo_rejected() -> None:
+    with pytest.raises(ValueError, match="encoder_decoder=bf16 is not supported"):
+        parse_precision_spec("backbone=tf32,encoder_decoder=bf16")
+    with pytest.raises(ValueError, match="encoder_decoder=bf16 is not supported"):
+        parse_precision_spec("tf32@bf16")
+
+
+def test_resolve_bf16_mixed_at_fp32_combo() -> None:
+    cfg = resolve_inference_config("bf16_mixed@fp32")
+    assert cfg is not None
+    assert cfg.config_label == "bf16_mixed@fp32"
+    assert cfg.backbone_matmul_level == BackboneMatmulLevel.BF16_MIXED
+    assert cfg.backbone_matmul_bf16 is True
+    assert cfg.backbone_matmul_tf32 is True
+    assert cfg.encoder_decoder_matmul_level == EncoderDecoderMatmulLevel.FP32
+
+
+def test_bf16_mixed_vs_bf16_combo_differ_on_backbone_flags() -> None:
+    mixed = resolve_inference_config("bf16_mixed@fp32")
+    full = resolve_inference_config("bf16@fp32")
+    assert mixed is not None and full is not None
+    assert mixed.backbone_matmul_level == BackboneMatmulLevel.BF16_MIXED
+    assert full.backbone_matmul_level == BackboneMatmulLevel.BF16
+    assert mixed.backbone_matmul_tf32 is True
+    assert full.backbone_matmul_tf32 is False
+
+
+def test_resolve_bf16_at_fp32_combo() -> None:
+    cfg = resolve_inference_config("bf16@fp32")
+    assert cfg is not None
+    assert cfg.precision is None
+    assert cfg.config_label == "bf16@fp32"
+    assert cfg.backbone_matmul_level == BackboneMatmulLevel.BF16
+    assert cfg.encoder_decoder_matmul_level == EncoderDecoderMatmulLevel.FP32
+    assert cfg.encoder_decoder_use_tensor_core is False
+    assert cfg.autocast_encoder_decoder is False
+
+
+def test_expand_precision_combos_cartesian_product() -> None:
+    combos = expand_precision_combos(["tf32", "bf16"], ["fp32", "tf32"])
+    labels = [label for label, _ in combos]
+    assert labels == ["tf32@fp32", "tf32@tf32", "bf16@fp32", "bf16@tf32"]
+    assert len(combos) == 4
+
+
+def test_aurora_constructor_combo_string() -> None:
+    from aurora.model.aurora import AuroraSmallPretrained
+
+    model = AuroraSmallPretrained(use_lora=False, inference_precision="bf16@fp32")
+    assert model.inference_config is not None
+    assert model.inference_config.config_label == "bf16@fp32"
+    assert model.inference_config.backbone_matmul_level == BackboneMatmulLevel.BF16
+    assert model.inference_config.encoder_decoder_matmul_level == EncoderDecoderMatmulLevel.FP32
+    assert model.encoder_decoder_use_tensor_core is False
+
+
+def test_aurora_constructor_independent_level_kwargs() -> None:
+    from aurora.model.aurora import AuroraSmallPretrained
+
+    model = AuroraSmallPretrained(
+        use_lora=False,
+        inference_precision="tf32",
+        encoder_decoder_matmul_level="fp32",
+    )
+    assert model.inference_config is not None
+    assert model.inference_config.config_label == "tf32@fp32"
+    assert model.inference_config.backbone_matmul_level == BackboneMatmulLevel.TF32
+    assert model.inference_config.encoder_decoder_matmul_level == EncoderDecoderMatmulLevel.FP32
+    assert model.encoder_decoder_use_tensor_core is False
 
 
 def test_fp32_rejects_cuda_graph_enable() -> None:
     with pytest.raises(ValueError, match="CUDA graph capture is not supported"):
         resolve_inference_config("fp32", enable_cuda_graph=True)
+
+
+def test_aurora_prepare_encoder_batch_keeps_lat_lon_fp32() -> None:
+    from aurora import Batch, Metadata
+    from aurora.model.aurora import AuroraSmallPretrained
+
+    model = AuroraSmallPretrained(use_lora=False, autocast=True).cuda().to(dtype=torch.bfloat16)
+    batch = Batch(
+        surf_vars={"2t": torch.randn(1, 2, 8, 16, device="cuda", dtype=torch.float32)},
+        static_vars={"lsm": torch.randn(8, 16, device="cuda", dtype=torch.float32)},
+        atmos_vars={"z": torch.randn(1, 2, 4, 8, 16, device="cuda", dtype=torch.float32)},
+        metadata=Metadata(
+            lat=torch.linspace(90, -90, 8, device="cuda", dtype=torch.float32),
+            lon=torch.linspace(0, 360, 17, device="cuda", dtype=torch.float32)[:-1],
+            atmos_levels=(100, 250, 500, 850),
+            time=(),
+        ),
+    )
+    _batch, transformed, _patch_res = model._prepare_encoder_batch(batch)
+    assert transformed.metadata.lat.dtype == torch.float32
+    assert transformed.metadata.lon.dtype == torch.float32
 
 
 def test_aurora_constructor_applies_tf32_preset() -> None:

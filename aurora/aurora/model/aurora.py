@@ -18,7 +18,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
 )
 
-from aurora.batch import Batch
+from aurora.batch import Batch, Metadata
 from aurora.model.compat import (
     _adapt_checkpoint_air_pollution,
     _adapt_checkpoint_pretrained,
@@ -30,6 +30,8 @@ from aurora.model.encoder import Perceiver3DEncoder
 from aurora.model.inference_precision import (
     AuroraInferenceConfig,
     AuroraInferencePrecision,
+    BackboneMatmulLevel,
+    EncoderDecoderMatmulLevel,
     apply_inference_config,
     resolve_inference_config,
 )
@@ -99,6 +101,8 @@ class Aurora(torch.nn.Module):
         use_triton_mlp: bool = False,
         use_cute_window_attn: bool = False,
         inference_precision: Optional[Union[str, AuroraInferencePrecision]] = None,
+        backbone_matmul_level: Optional[Union[str, BackboneMatmulLevel]] = None,
+        encoder_decoder_matmul_level: Optional[Union[str, EncoderDecoderMatmulLevel]] = None,
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         autocast: bool = False,
         bf16_mode: bool = False,
@@ -179,11 +183,13 @@ class Aurora(torch.nn.Module):
                 window attention on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel
                 (BF16 I/O, FP32 accumulators); float32 tensors use the TF32 CuTe kernel when
                 enabled. Requires ``attn_drop=0``. Defaults to ``False``.
-            inference_precision (str, optional): Named preset — ``fp32``, ``pytorch_autocast``,
-                ``fast_fp32``, ``tf32``, ``bf16_mixed`` (hybrid), or ``bf16``
-                (custom Triton/CuTe Swin with explicit BF16 backbone matmuls).
-                Overrides scattered ``use_triton_*`` / ``use_cute_window_attn`` / ``autocast``
-                flags below when set.
+            inference_precision (str, optional): Named preset or combo string
+                (``bf16@fp32``, ``backbone=tf32,encoder_decoder=fp32``). Overrides scattered
+                ``use_triton_*`` / ``use_cute_window_attn`` / ``autocast`` flags when set.
+            backbone_matmul_level (str, optional): Override backbone matmul level independently
+                of ``inference_precision`` (``fp32``, ``tf32``, ``bf16_mixed``, ``bf16``).
+            encoder_decoder_matmul_level (str, optional): Override encoder/decoder matmul
+                level independently (``fp32`` or ``tf32`` only).
             surf_stats (dict[str, tuple[float, float]], optional): For these surface-level
                 variables, adjust the normalisation to the given tuple consisting of a new location
                 and scale.
@@ -239,9 +245,15 @@ class Aurora(torch.nn.Module):
         super().__init__()
         self.inference_config: AuroraInferenceConfig | None = resolve_inference_config(
             inference_precision,
+            backbone_matmul_level=backbone_matmul_level,
+            encoder_decoder_matmul_level=encoder_decoder_matmul_level,
         )
         if self.inference_config is not None:
-            preset_kwargs = apply_inference_config(inference_precision)
+            preset_kwargs = apply_inference_config(
+                inference_precision,
+                backbone_matmul_level=backbone_matmul_level,
+                encoder_decoder_matmul_level=encoder_decoder_matmul_level,
+            )
             autocast = preset_kwargs["autocast"]
             backbone_compute_dtype_name = preset_kwargs["backbone_compute_dtype"]
             window_attn_compute_dtype_name = preset_kwargs["window_attn_compute_dtype"]
@@ -377,7 +389,19 @@ class Aurora(torch.nn.Module):
         batch = self.batch_transform_hook(batch)
 
         p = next(self.parameters())
-        batch = batch.type(p.dtype)
+        param_dtype = p.dtype
+        batch = batch.type(param_dtype)
+        if param_dtype not in (torch.float32, torch.float64):
+            batch = dataclasses.replace(
+                batch,
+                metadata=Metadata(
+                    lat=batch.metadata.lat.to(dtype=torch.float32),
+                    lon=batch.metadata.lon.to(dtype=torch.float32),
+                    atmos_levels=batch.metadata.atmos_levels,
+                    time=batch.metadata.time,
+                    rollout_step=batch.metadata.rollout_step,
+                ),
+            )
         batch = batch.normalise(surf_stats=self.surf_stats)
         batch = batch.crop(patch_size=self.patch_size)
         batch = batch.to(p.device)

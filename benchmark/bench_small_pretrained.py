@@ -2,14 +2,22 @@
 """Simple precision benchmark for AuroraSmallPretrained on HF test batch.
 
 Loads ``aurora-0.25-small-pretrained-test-input.pickle`` + ``aurora-0.25-static.pickle``,
-runs each inference tier, times end-to-end ``forward``, and compares outputs against ``fp32``.
-Prints per-variable **official tolerances** from ``tests/test_model.py`` (mean|err|/mean|ref|).
+runs each inference tier, times end-to-end ``forward``, and compares outputs against the
+PyTorch FP32 baseline. Prints per-variable **official tolerances** from ``tests/test_model.py``.
+
+**Default suite (10 tiers)** — no preset shorthand required in output:
+
+1. PyTorch: ``backbone=fp32, encoder/decoder=fp32`` (baseline for accuracy tables)
+2. PyTorch: ``backbone=autocast_bf16, encoder/decoder=fp32``
+3. Eight explicit custom combos ``{fp32,tf32,bf16_mixed,bf16}@{fp32,tf32}`` (Triton/CuTe Swin)
 
 Examples::
 
     uv run python benchmark/bench_small_pretrained.py
     uv run python benchmark/bench_small_pretrained.py --compare-hf
-    uv run python benchmark/bench_small_pretrained.py --tiers fp32 fast_fp32 bf16_mixed
+    uv run python benchmark/bench_small_pretrained.py --suite legacy
+    uv run python benchmark/bench_small_pretrained.py --combo-matrix \\
+        --backbone-levels fp32 tf32 bf16_mixed bf16 --encoder-decoder-levels fp32 tf32
 """
 
 from __future__ import annotations
@@ -45,14 +53,107 @@ _INPUT_NAME = "aurora-0.25-small-pretrained-test-input.pickle"
 _STATIC_NAME = "aurora-0.25-static.pickle"
 _OUTPUT_NAME = "aurora-0.25-small-pretrained-test-output.pickle"
 
-_DEFAULT_TIERS: tuple[tuple[str, str], ...] = (
-    ("fp32", "PyTorch FP32"),
-    ("fast_fp32", "Triton layout + AdaLN + PyTorch GELU"),
-    ("tf32", "fast_fp32 + TF32 matmul + CuTe TF32 attn"),
-    ("bf16_mixed", "hybrid: TF32 QKV/proj + BF16 MLP + CuTe BF16 attn"),
-    ("bf16", "full backbone BF16 linears + CuTe BF16 attn"),
-    ("pytorch_autocast", "PyTorch backbone BF16 autocast"),
+_PYTORCH_BASELINE_KEY = "pytorch_backbone_fp32_encoder_decoder_fp32"
+
+_LEGACY_NAMED_TIERS: tuple[tuple[str, str, str], ...] = (
+    ("fp32", "fp32", "PyTorch FP32"),
+    ("fast_fp32", "fast_fp32", "Triton layout + AdaLN + PyTorch GELU"),
+    ("tf32", "tf32", "fast_fp32 + TF32 matmul + CuTe TF32 attn"),
+    ("bf16_mixed", "bf16_mixed", "hybrid: TF32 QKV/proj + BF16 MLP + CuTe BF16 attn"),
+    ("bf16", "bf16", "full backbone BF16 linears + CuTe BF16 attn"),
+    ("pytorch_autocast", "pytorch_autocast", "PyTorch backbone BF16 autocast"),
 )
+
+
+def _pytorch_reference_tiers() -> tuple[tuple[str, str, str], ...]:
+    return (
+        (
+            _PYTORCH_BASELINE_KEY,
+            "fp32",
+            "PyTorch: backbone matmul FP32, encoder/decoder matmul FP32, "
+            "no torch.autocast, no Triton/CuTe",
+        ),
+        (
+            "pytorch_backbone_autocast_bf16_encoder_decoder_fp32",
+            "pytorch_autocast",
+            "PyTorch: backbone torch.autocast BF16, encoder/decoder matmul FP32, "
+            "no Triton/CuTe",
+        ),
+    )
+
+
+def _custom_matmul_combo_tiers(
+    *,
+    backbone_levels: tuple[str, ...],
+    encoder_decoder_levels: tuple[str, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    from aurora.model.inference_precision import (
+        DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS,
+        DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS,
+        describe_inference_config,
+        expand_precision_combos,
+    )
+
+    bb = backbone_levels or DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS
+    ed = encoder_decoder_levels or DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS
+    tiers: list[tuple[str, str, str]] = []
+    for label, cfg in expand_precision_combos(bb, ed):
+        spec = f"{cfg.backbone_matmul_level.value}@{cfg.encoder_decoder_matmul_level.value}"
+        tiers.append((label, spec, describe_inference_config(cfg)))
+    return tuple(tiers)
+
+
+def _full_default_suite(
+    *,
+    backbone_levels: tuple[str, ...] = (),
+    encoder_decoder_levels: tuple[str, ...] = (),
+) -> tuple[tuple[str, str, str], ...]:
+    from aurora.model.inference_precision import (
+        DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS,
+        DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS,
+    )
+
+    bb = backbone_levels or DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS
+    ed = encoder_decoder_levels or DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS
+    return _pytorch_reference_tiers() + _custom_matmul_combo_tiers(
+        backbone_levels=bb,
+        encoder_decoder_levels=ed,
+    )
+
+
+def _tier_entry(name: str) -> tuple[str, str, str]:
+    """Resolve a legacy preset name or ``backbone@encoder_decoder`` combo string."""
+    for key, precision, label in _LEGACY_NAMED_TIERS:
+        if name == key:
+            return key, precision, label
+    from aurora.model.inference_precision import describe_inference_config, resolve_inference_config
+
+    cfg = resolve_inference_config(name)
+    if cfg is None:
+        raise ValueError(f"Could not resolve inference tier {name!r}.")
+    spec = f"{cfg.backbone_matmul_level.value}@{cfg.encoder_decoder_matmul_level.value}"
+    if name == spec or "@" in name:
+        return cfg.config_label, spec, describe_inference_config(cfg)
+    return cfg.config_label, name, describe_inference_config(cfg)
+
+
+def _tiers_from_args(args: argparse.Namespace) -> tuple[tuple[str, str, str], ...]:
+    if args.tiers is not None:
+        return tuple(_tier_entry(t) for t in args.tiers)
+
+    bb = tuple(args.backbone_levels)
+    ed = tuple(args.encoder_decoder_levels)
+
+    if args.suite == "legacy":
+        return _LEGACY_NAMED_TIERS
+    if args.suite == "combos":
+        return _custom_matmul_combo_tiers(backbone_levels=bb, encoder_decoder_levels=ed)
+    if args.combo_matrix:
+        if args.combos_only:
+            return _custom_matmul_combo_tiers(backbone_levels=bb, encoder_decoder_levels=ed)
+        return _full_default_suite(backbone_levels=bb, encoder_decoder_levels=ed)
+    return _full_default_suite()
+
 
 # Same relative mean error gates as aurora/tests/test_model.py::test_aurora_small
 _OFFICIAL_TOLERANCES: dict[str, float] = {
@@ -400,17 +501,21 @@ def _print_table(
 ) -> None:
     """Print summary rows sorted by ``ms`` ascending (fastest tier first)."""
     rows_sorted = sorted(rows, key=lambda r: r[2])
+    tier_w = max(36, max((len(r[0]) for r in rows_sorted), default=18))
     print(
-        f"\n{'tier':<18} {'ms':>8} {'speedup':>8} {'max_abs':>10} {'mean_abs':>10} "
+        f"\n{'tier':<{tier_w}} {'ms':>8} {'speedup':>8} {'max_abs':>10} {'mean_abs':>10} "
         f"{'max_rel':>10} {'cos_sim':>8}"
     )
-    print("-" * 88)
+    print("-" * (tier_w + 70))
     for key, _label, ms, speedup, max_abs, mean_abs, max_rel, cos in rows_sorted:
         speedup_s = f"{speedup:.2f}x" if speedup is not None else "  base"
         print(
-            f"{key:<18} {ms:8.1f} {speedup_s:>8} {max_abs:10.4g} {mean_abs:10.4g} "
+            f"{key:<{tier_w}} {ms:8.1f} {speedup_s:>8} {max_abs:10.4g} {mean_abs:10.4g} "
             f"{max_rel:10.4g} {cos:8.6f}"
         )
+    print("\nTier details (full precision description):")
+    for key, label, *_rest in rows_sorted:
+        print(f"  {key}: {label}")
 
 
 def main() -> None:
@@ -430,8 +535,49 @@ def main() -> None:
     parser.add_argument(
         "--tiers",
         nargs="+",
-        default=[t[0] for t in _DEFAULT_TIERS],
-        help="Inference precision tiers to run (default: all five)",
+        default=None,
+        help=(
+            "Explicit tiers: legacy preset names and/or combo strings (bf16_mixed@fp32). "
+            "Overrides --suite."
+        ),
+    )
+    parser.add_argument(
+        "--suite",
+        choices=("full", "legacy", "combos"),
+        default="full",
+        help=(
+            "full (default): 2 PyTorch reference tiers + 8 custom backbone@encoder_decoder combos; "
+            "legacy: named presets (fp32, tf32, bf16, …); "
+            "combos: only the 4×2 custom matmul grid."
+        ),
+    )
+    parser.add_argument(
+        "--combo-matrix",
+        action="store_true",
+        help=(
+            "Like --suite full but override backbone/encoder-decoder level lists for the "
+            "8 custom combos (PyTorch tiers still included unless --combos-only)."
+        ),
+    )
+    parser.add_argument(
+        "--combos-only",
+        action="store_true",
+        help="With --combo-matrix or --suite combos: skip the two PyTorch reference tiers.",
+    )
+    parser.add_argument(
+        "--backbone-levels",
+        nargs="+",
+        default=["fp32", "tf32", "bf16_mixed", "bf16"],
+        help=(
+            "Backbone matmul levels for custom combos "
+            "(default: fp32 tf32 bf16_mixed bf16 → 4×2=8 combos)."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-decoder-levels",
+        nargs="+",
+        default=["fp32", "tf32"],
+        help="Encoder/decoder matmul levels for custom combos (default: fp32 tf32).",
     )
     parser.add_argument(
         "--compare-hf",
@@ -488,50 +634,64 @@ def main() -> None:
         )
         return
 
-    tier_labels = dict(_DEFAULT_TIERS)
-    unknown = [t for t in args.tiers if t not in tier_labels]
-    if unknown:
-        raise SystemExit(f"unknown tier(s): {unknown}; expected one of: {', '.join(tier_labels)}")
+    if args.tiers is None and not args.combo_matrix:
+        pass  # use --suite (default full)
 
-    if "fp32" not in args.tiers:
-        print("[warn] fp32 not in --tiers; using first tier as baseline for relative diffs")
+    try:
+        tier_list = _tiers_from_args(args)
+    except ValueError as exc:
+        raise SystemExit(
+            f"{exc}\nUse --suite full (default), combo strings like bf16_mixed@fp32, "
+            "or --suite legacy for named presets."
+        ) from exc
 
-    baseline_key = "fp32" if "fp32" in args.tiers else args.tiers[0]
+    print(f"[config] suite={args.suite} tiers={len(tier_list)}")
+    for key, spec, label in tier_list:
+        print(f"  [{key}] inference_precision={spec!r}")
+        print(f"           {label}")
+
+    baseline_key = _PYTORCH_BASELINE_KEY
+    if baseline_key not in {t[0] for t in tier_list}:
+        baseline_key = tier_list[0][0]
+        print(
+            f"[warn] PyTorch FP32 baseline {_PYTORCH_BASELINE_KEY!r} not in run; "
+            f"using {baseline_key!r} for relative diffs"
+        )
     baseline: dict[str, torch.Tensor] | None = None
     baseline_ms: float | None = None
     all_preds: dict[str, dict[str, torch.Tensor]] = {}
     rows: list[tuple[str, str, float, float, float, float, float, float | None]] = []
 
-    for tier in args.tiers:
-        print(f"[run] {tier}...", flush=True)
+    for key, precision, label in tier_list:
+        print(f"[run] {key} ({label})...", flush=True)
         pred, ms_per = _run_tier(
-            precision=tier,
+            precision=precision,
             checkpoint=checkpoint,
             batch=batch,
             device=device,
             warmup=args.warmup,
             repeat=args.repeat,
         )
-        all_preds[tier] = pred
-        print(f"[run] {tier} e2e forward={ms_per:.1f} ms ({1000.0 / ms_per:.2f} fwd/s)", flush=True)
-        if tier == baseline_key:
+        all_preds[key] = pred
+        print(f"[run] {key} e2e forward={ms_per:.1f} ms ({1000.0 / ms_per:.2f} fwd/s)", flush=True)
+        if key == baseline_key:
             baseline = pred
             baseline_ms = ms_per
-            rows.append((tier, tier_labels.get(tier, tier), ms_per, None, 0.0, 0.0, 0.0, 1.0))
+            rows.append((key, label, ms_per, None, 0.0, 0.0, 0.0, 1.0))
             continue
         assert baseline is not None and baseline_ms is not None
         max_abs, mean_abs, max_rel, cos = _diff_vs_reference(baseline, pred)
         speedup = baseline_ms / ms_per
-        rows.append((tier, tier_labels.get(tier, tier), ms_per, speedup, max_abs, mean_abs, max_rel, cos))
+        rows.append((key, label, ms_per, speedup, max_abs, mean_abs, max_rel, cos))
 
     _print_table(rows)
 
     if not args.no_official_tol and baseline is not None:
-        for tier, pred in all_preds.items():
-            if tier == baseline_key:
+        for tier_key, pred in all_preds.items():
+            if tier_key == baseline_key:
                 continue
             tol_rows = _official_tol_rows(baseline, pred)
-            _print_official_tol_table(f"[official tol] {tier} vs {baseline_key}", tol_rows)
+            _print_official_tol_table(f"[official tol] {tier_key} vs {baseline_key}", tol_rows)
 
     if args.compare_hf:
         hf_ref = _load_hf_output_tensors(data_dir)
@@ -550,12 +710,11 @@ def main() -> None:
             passed = sum(1 for r in tol_rows if r[4])
             if passed < len(tol_rows):
                 print(
-                    "  [note] This run uses inference_precision=fp32, use_lora=False, batch=1. "
+                    "  [note] Accuracy tables above are vs "
+                    f"{_PYTORCH_BASELINE_KEY} (PyTorch backbone FP32, E/D FP32). "
                     "HF pickle is float64 gold from Microsoft's test harness "
-                    "(aurora/tests/test_model.py::test_aurora_small uses model.double() + "
-                    "use_lora=True + batch×2). Slight 2t/10u/10v mean_rel overshoot vs tol "
-                    "does not indicate a broken fp32 preset — compare tiers against fp32 "
-                    "baseline above for kernel/precision QA."
+                    "(model.double(), use_lora=True, batch×2). "
+                    "Compare custom combos against the PyTorch baseline, not HF gold alone."
                 )
 
 
