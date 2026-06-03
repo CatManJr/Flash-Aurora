@@ -369,6 +369,7 @@ class WindowAttention(nn.Module):
             else:
                 x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
             x = rearrange(x, "B H N D -> B N (H D)")
+        # AdaLN requires FP32 branch input; promote before proj (TF32) + norm1.
         if bf16_cute_attn and x.dtype == torch.bfloat16:
             x = cast_activation_dtype(x, torch.float32)
         if isinstance(self.lora_proj, LoRARollout):

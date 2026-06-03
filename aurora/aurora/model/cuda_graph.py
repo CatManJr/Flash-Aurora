@@ -222,6 +222,7 @@ class CudaGraphAuroraGpuRunner:
         rollout_step: int,
         autocast_backbone: bool = False,
         autocast_encoder_decoder: bool = False,
+        encoder_decoder_use_tensor_core: bool = False,
         warmup_iters: int = 2,
     ) -> None:
         if not next(iter(encoder_batch.surf_vars.values())).is_cuda:
@@ -234,6 +235,7 @@ class CudaGraphAuroraGpuRunner:
         self.rollout_step = rollout_step
         self.autocast_backbone = autocast_backbone
         self.autocast_encoder_decoder = autocast_encoder_decoder
+        self.encoder_decoder_use_tensor_core = encoder_decoder_use_tensor_core
         self.lead_time = model.timestep
         self.graph = torch.cuda.CUDAGraph()
         self._captured_shapes = _batch_tensor_shapes(encoder_batch)
@@ -253,13 +255,14 @@ class CudaGraphAuroraGpuRunner:
             self.static_pred = self._forward_static()
 
     def _forward_static(self) -> Batch:
-        from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+        from aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
         with torch.inference_mode():
-            x = run_with_encoder_decoder_autocast(
+            x = run_with_encoder_decoder_routing(
                 self.model.encoder,
                 self.static_batch,
-                enabled=self.autocast_encoder_decoder,
+                autocast_bf16=self.autocast_encoder_decoder,
+                use_tensor_core=self.encoder_decoder_use_tensor_core,
                 lead_time=self.lead_time,
             )
             x = self.model._run_backbone(
@@ -268,11 +271,12 @@ class CudaGraphAuroraGpuRunner:
                 patch_res=self.patch_res,
                 rollout_step=self.rollout_step,
             )
-            return run_with_encoder_decoder_autocast(
+            return run_with_encoder_decoder_routing(
                 self.model.decoder,
                 x,
                 self.static_batch,
-                enabled=self.autocast_encoder_decoder,
+                autocast_bf16=self.autocast_encoder_decoder,
+                use_tensor_core=self.encoder_decoder_use_tensor_core,
                 patch_res=self.patch_res,
                 lead_time=self.lead_time,
             )
@@ -300,6 +304,7 @@ def build_aurora_cuda_graph_runner(
     rollout_step: int,
     autocast_backbone: bool,
     autocast_encoder_decoder: bool = False,
+    encoder_decoder_use_tensor_core: bool = False,
     warmup_iters: int = 2,
 ) -> CudaGraphAuroraBackboneRunner | CudaGraphAuroraGpuRunner:
     if scope == "backbone":
@@ -338,6 +343,7 @@ def build_aurora_cuda_graph_runner(
             rollout_step=rollout_step,
             autocast_backbone=autocast_backbone,
             autocast_encoder_decoder=autocast_encoder_decoder,
+            encoder_decoder_use_tensor_core=encoder_decoder_use_tensor_core,
             warmup_iters=warmup_iters,
         )
     raise ValueError(f"Unsupported CUDA graph scope {scope!r}")

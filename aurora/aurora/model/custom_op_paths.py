@@ -1,9 +1,9 @@
 """Glue between Aurora model forward paths and custom CUDA/Triton/CuTe ops.
 
-Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. 
-``bf16_mixed`` uses TF32``F.linear`` for QKV/proj/patch merge, BF16 Tensor Core on MLP ``fc1→fc2``, and CuTe BF16
-window attention. 
-``tf32_1x`` keeps FP32 activations with TF32 matmul on all backbone linears.
+Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. ``bf16_mixed`` uses TF32
+``F.linear`` on QKV/proj and encoder/decoder, BF16 Tensor Core on backbone MLP ``fc1→fc2``, and CuTe
+BF16 window attention. ``tf32_1x`` keeps FP32 activations with TF32 matmul on backbone and
+encoder/decoder linears.
 """
 
 from __future__ import annotations
@@ -70,8 +70,25 @@ def run_with_encoder_decoder_autocast(
     enabled: bool,
     **kwargs: Any,
 ) -> _T:
-    with encoder_decoder_autocast(enabled=enabled):
-        return fn(*args, **kwargs)
+    return run_with_encoder_decoder_routing(
+        fn, *args, autocast_bf16=enabled, use_tensor_core=False, **kwargs
+    )
+
+
+def run_with_encoder_decoder_routing(
+    fn: Callable[..., _T],
+    *args: Any,
+    autocast_bf16: bool = False,
+    use_tensor_core: bool = False,
+    matmul_tf32: bool | None = None,
+    **kwargs: Any,
+) -> _T:
+    """Encoder/decoder forward with optional BF16 autocast and/or TF32 ``F.linear`` matmul."""
+    if matmul_tf32 is not None:
+        use_tensor_core = matmul_tf32
+    with encoder_decoder_autocast(enabled=autocast_bf16):
+        with backbone_tf32_matmul_context(enabled=use_tensor_core):
+            return fn(*args, **kwargs)
 
 
 @contextmanager
@@ -400,7 +417,7 @@ def can_use_triton_adaln(
     training: bool,
     drop_path_is_identity: bool,
 ) -> bool:
-    """Fused AdaLN on CUDA FP32 (norm boundary vs ``tf32_1x`` reference; BF16 GEMM upstream)."""
+    """Fused AdaLN on CUDA FP32 activations (residual stream stays FP32)."""
     return (
         enabled
         and not training

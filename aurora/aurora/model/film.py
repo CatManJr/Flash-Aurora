@@ -47,13 +47,21 @@ class AdaptiveLayerNorm(nn.Module):
         nn.init.zeros_(self.ln_modulation[-1].weight)
         nn.init.zeros_(self.ln_modulation[-1].bias)
 
+    def _adaln_branch_input(self, x: torch.Tensor) -> torch.Tensor:
+        """AdaLN must run on FP32 activations; BF16 branch inputs explode numerically."""
+        if x.dtype == torch.float32:
+            return x
+        from aurora.model.custom_op_paths import cast_activation_dtype
+
+        return cast_activation_dtype(x, torch.float32)
+
     def _use_triton_film(self, x: torch.Tensor) -> bool:
         from aurora.model.custom_op_paths import triton_elemwise_dtype_ok
 
         return self.use_triton and x.is_cuda and triton_elemwise_dtype_ok(x.dtype)
 
     def _use_triton_film_fp32_out(self, x: torch.Tensor) -> bool:
-        """Fused LN+FiLM with FP32 output (BF16 ``x`` ok; promotes inside the kernel)."""
+        """Fused LN+FiLM; branch ``x`` is promoted to FP32 before the kernel."""
         return self._use_triton_film(x)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -67,6 +75,7 @@ class AdaptiveLayerNorm(nn.Module):
             torch.Tensor: Output tensor of shape `(B, L, D)`.
         """
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
+        x = self._adaln_branch_input(x)
         if self._use_triton_film_fp32_out(x):
             from aurora.ops.triton_adaln import adaptive_layernorm_film_forward
 
@@ -76,7 +85,7 @@ class AdaptiveLayerNorm(nn.Module):
                 shift,
                 float(self.scale_bias),
                 float(self.ln.eps),
-                output_fp32=x.dtype != torch.float32,
+                output_fp32=True,
             )
         return self.ln(x) * (self.scale_bias + scale) + shift
 
@@ -97,17 +106,15 @@ class AdaptiveLayerNorm(nn.Module):
             Tensor of shape ``(B, L, D)``.
         """
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
+        x = self._adaln_branch_input(x)
         if (
             self.use_triton
             and residual.is_cuda
             and residual.dtype == torch.float32
             and self._use_triton_film(x)
         ):
-            from aurora.model.custom_op_paths import triton_elemwise_dtype_ok
             from aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
-            if not triton_elemwise_dtype_ok(x.dtype):
-                return residual + self.ln(x) * (self.scale_bias + scale) + shift
             return adaptive_layernorm_film_add_residual_forward(
                 residual,
                 x,

@@ -252,10 +252,12 @@ class Aurora(torch.nn.Module):
             use_triton_perceiver_ln_fusion = preset_kwargs["use_triton_perceiver_ln_fusion"]
             use_perceiver_flash_attn = preset_kwargs["use_perceiver_flash_attn"]
             autocast_encoder_decoder = preset_kwargs["autocast_encoder_decoder"]
+            encoder_decoder_use_tensor_core = preset_kwargs["encoder_decoder_use_tensor_core"]
         else:
             backbone_compute_dtype_name = "float32"
             window_attn_compute_dtype_name = "float32"
             autocast_encoder_decoder = False
+            encoder_decoder_use_tensor_core = False
 
         from aurora.model.custom_op_paths import backbone_dtype_from_name
 
@@ -365,6 +367,7 @@ class Aurora(torch.nn.Module):
 
         self.autocast = autocast
         self.autocast_encoder_decoder = autocast_encoder_decoder
+        self.encoder_decoder_use_tensor_core = encoder_decoder_use_tensor_core
         self._cuda_graph_runner: Any | None = None
         self._cuda_graph_scope: str | None = None
         self._cuda_graph_patch_res: tuple[int, int, int] | None = None
@@ -444,8 +447,16 @@ class Aurora(torch.nn.Module):
 
         backbone_input = None
         if scope == "backbone":
+            from aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+
             with torch.inference_mode():
-                backbone_input = self.encoder(transformed_batch, lead_time=self.timestep)
+                backbone_input = run_with_encoder_decoder_routing(
+                    self.encoder,
+                    transformed_batch,
+                    autocast_bf16=self.autocast_encoder_decoder,
+                    use_tensor_core=self.encoder_decoder_use_tensor_core,
+                    lead_time=self.timestep,
+                )
 
         self._cuda_graph_runner = build_aurora_cuda_graph_runner(
             self,
@@ -456,6 +467,7 @@ class Aurora(torch.nn.Module):
             rollout_step=rollout_step,
             autocast_backbone=self.autocast,
             autocast_encoder_decoder=self.autocast_encoder_decoder,
+            encoder_decoder_use_tensor_core=self.encoder_decoder_use_tensor_core,
             warmup_iters=warmup_iters,
         )
         self._cuda_graph_scope = scope
@@ -558,14 +570,15 @@ class Aurora(torch.nn.Module):
                     pred = runner(transformed_batch, rollout_step=rollout_step)
                     return self._finish_prediction(batch, pred)
             elif self._cuda_graph_scope == "backbone":
-                from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+                from aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
                 with nvtx_range("aurora::encoder"):
                     with torch.inference_mode():
-                        x = run_with_encoder_decoder_autocast(
+                        x = run_with_encoder_decoder_routing(
                             self.encoder,
                             transformed_batch,
-                            enabled=self.autocast_encoder_decoder,
+                            autocast_bf16=self.autocast_encoder_decoder,
+                            use_tensor_core=self.encoder_decoder_use_tensor_core,
                             lead_time=self.timestep,
                         )
                 with nvtx_range("aurora::backbone"):
@@ -580,23 +593,25 @@ class Aurora(torch.nn.Module):
                         )
                 with nvtx_range("aurora::decoder"):
                     with torch.inference_mode():
-                        pred = run_with_encoder_decoder_autocast(
+                        pred = run_with_encoder_decoder_routing(
                             self.decoder,
                             x,
                             batch,
-                            enabled=self.autocast_encoder_decoder,
+                            autocast_bf16=self.autocast_encoder_decoder,
+                            use_tensor_core=self.encoder_decoder_use_tensor_core,
                             lead_time=self.timestep,
                             patch_res=patch_res,
                         )
                 return self._finish_prediction(batch, pred)
 
-        from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+        from aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
         with nvtx_range("aurora::encoder"):
-            x = run_with_encoder_decoder_autocast(
+            x = run_with_encoder_decoder_routing(
                 self.encoder,
                 transformed_batch,
-                enabled=self.autocast_encoder_decoder,
+                autocast_bf16=self.autocast_encoder_decoder,
+                use_tensor_core=self.encoder_decoder_use_tensor_core,
                 lead_time=self.timestep,
             )
 
@@ -609,11 +624,12 @@ class Aurora(torch.nn.Module):
             )
 
         with nvtx_range("aurora::decoder"):
-            pred = run_with_encoder_decoder_autocast(
+            pred = run_with_encoder_decoder_routing(
                 self.decoder,
                 x,
                 batch,
-                enabled=self.autocast_encoder_decoder,
+                autocast_bf16=self.autocast_encoder_decoder,
+                use_tensor_core=self.encoder_decoder_use_tensor_core,
                 lead_time=self.timestep,
                 patch_res=patch_res,
             )
