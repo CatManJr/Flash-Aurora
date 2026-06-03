@@ -1,8 +1,9 @@
 """Glue between Aurora model forward paths and custom CUDA/Triton/CuTe ops.
 
-Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. ``bf16_mixed`` uses TF32
-``F.linear`` for QKV/proj/patch merge, BF16 Tensor Core on MLP ``fc1→fc2``, and CuTe BF16
-window attention. ``tf32_1x`` keeps FP32 activations with TF32 matmul on all backbone linears.
+Custom Triton/CuTe Swin paths never run inside ``torch.autocast``. 
+``bf16_mixed`` uses TF32``F.linear`` for QKV/proj/patch merge, BF16 Tensor Core on MLP ``fc1→fc2``, and CuTe BF16
+window attention. 
+``tf32_1x`` keeps FP32 activations with TF32 matmul on all backbone linears.
 """
 
 from __future__ import annotations
