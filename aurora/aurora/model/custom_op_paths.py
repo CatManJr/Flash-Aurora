@@ -424,26 +424,6 @@ def can_use_triton_gelu(
         and triton_elemwise_dtype_ok(x.dtype)
     )
 
-
-def can_use_fused_mlp_ffn(
-    x: torch.Tensor,
-    *,
-    training: bool,
-    drop_p: float,
-) -> bool:
-    """Fused ``fc1→GELU→fc2`` (Triton linear+GELU epilogue + cuBLAS fc2) for inference."""
-    from aurora.ops.triton_mlp_ffn import fused_mlp_ffn_enabled
-
-    return (
-        fused_mlp_ffn_enabled()
-        and not training
-        and drop_p == 0.0
-        and not torch.is_grad_enabled()
-        and x.is_cuda
-        and triton_elemwise_dtype_ok(x.dtype)
-    )
-
-
 def can_use_cute_window_attention(
     qkv: torch.Tensor,
     *,

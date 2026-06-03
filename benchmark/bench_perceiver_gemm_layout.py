@@ -160,6 +160,8 @@ def _run_microbenches(
     w_kv = attn.to_kv.weight
     w_o = attn.to_out.weight
     w1, w2 = mlp.net[0].weight, mlp.net[2].weight
+    with torch.inference_mode():
+        hidden = F.gelu(F.linear(lat2, w1), approximate="none")
 
     cases: list[tuple[str, Callable[[], None]]] = [
         ("to_q  nested", lambda: F.linear(latents, w_q)),
@@ -168,8 +170,8 @@ def _run_microbenches(
         ("to_kv flat", lambda: F.linear(ctx2, w_kv)),
         ("to_out", lambda: F.linear(lat2, w_o)),  # after attn — use flat
         ("fc1", lambda: F.linear(lat2, w1)),
-        ("fc2", lambda: F.linear(F.gelu(F.linear(lat2, w1)), w2)),
-        ("fc1+fc2 chain", lambda: mlp.net(lat2)),
+        ("fc2 only", lambda: F.linear(hidden, w2)),
+        ("mlp full", lambda: mlp.net(lat2)),
     ]
 
     for name, fn in cases:
@@ -231,11 +233,11 @@ def main() -> None:
         latents, ctx, attn, mlp, warmup=args.warmup, iters=args.micro_iters, device=device
     )
 
-    print("\n=== Layout / fusion roadmap (next steps) ===")
-    print("  1. MLP: fused fc1+GELU+fc2 (M=140k, K=512, N=1024→512) — largest GEMM time")
-    print("  2. Optional BF16 TC on fc1/fc2 only (decoder preset) — validate vs official tol")
-    print("  3. Weight prepack (TN align8) if cuBLASLt heuristic shifts on sm_120")
-    print("  4. QKV: batched GEMM already flat via last-dim Linear; low ROI vs MLP")
+    print("\n=== MLP roadmap (two tracks only; no Triton MLP) ===")
+    print("  A. fc2 fast: M=140k K=1024 N=512 — prepack TN, decoder BF16 TC, CuTe/cuDNN GEMM")
+    print("  B. fc1+GELU+fc2 fused graph — CuTeDSL or cuDNN frontend (gemm_* + epilogue)")
+    print("     https://github.com/NVIDIA/cudnn-frontend/tree/develop/python/cudnn")
+    print("  Skip: fc1+GELU-only fusion (low ROI vs fc2); standalone Triton MLP removed")
 
 
 if __name__ == "__main__":

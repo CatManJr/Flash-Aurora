@@ -74,30 +74,7 @@ class MLP(nn.Module):
         from aurora.model.custom_op_paths import (
             backbone_bf16_matmul_active,
             backbone_bf16_mlp_matmul_scope,
-            can_use_fused_mlp_ffn,
         )
-
-        if can_use_fused_mlp_ffn(x, training=self.training, drop_p=self.drop.p):
-            from aurora.ops.triton_mlp_ffn import mlp_ffn_forward
-
-            def _fused() -> torch.Tensor:
-                return mlp_ffn_forward(
-                    x, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias
-                )
-
-            use_bf16_mlp = (
-                backbone_bf16_matmul_active()
-                and x.is_cuda
-                and not torch.is_grad_enabled()
-                and x.dtype in (torch.float32, torch.bfloat16)
-            )
-            if use_bf16_mlp:
-                with backbone_bf16_mlp_matmul_scope():
-                    x = _fused()
-            else:
-                x = _fused()
-            x = self.drop(x)
-            return x
 
         use_bf16_mlp = (
             backbone_bf16_matmul_active()
