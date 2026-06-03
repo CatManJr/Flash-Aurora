@@ -87,11 +87,7 @@ class WindowAttnFwdBf16:
         tile_m: int = 64,
         tile_n: Optional[int] = None,
         num_stages: int = 1,
-    ):速度/显存：约 1.4%，在 E2E 里 decoder heads 占比小，符合预期
-    说明
-    batched 按 forward 里实际的 surf_vars / atmos_vars 顺序 堆权重（HF batch 只有 4 个 atmos 变量时不会误用 5 路 head）
-    level_condition / separate_perceiver 非空时仍 强制 loop（与 pollution 等大模型配置兼容）
-    若要把 batched 当默认，再改 AURORA_BATCHED_PATCH_HEADS 默认值为 1；目前按奥卡姆 默认关、benchmark 开关测。下一步若要再抠 E2E，应看 Perceiver level_decoder / SDPA，而不是多 tier 测 E/D
+    ):
         assert _CUTE_AVAILABLE, "CuTeDSL / cutlass / quack not found"
 
         if tile_n is None:
