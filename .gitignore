@@ -16,6 +16,8 @@ tutorials_python/
 .env
 .pytest_cache
 aurora/.pytest_cache
+fetched/
+*/fetched/
 aurora/.github
 cuda-keyring_1.1-1_all.deb
 

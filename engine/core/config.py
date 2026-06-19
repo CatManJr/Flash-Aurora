@@ -59,6 +59,7 @@ class EngineConfig:
     variant: ModelVariantSpec
     source: SourceProfile
     asset_root: Path | None = None
+    user_cwd: Path | None = None
     allow_hub_download: bool = True
     export_dir: Path = field(default_factory=lambda: Path("output"))
     inference_precision: str | None = None

@@ -153,6 +153,7 @@ class PresetRegistry:
             variant=src.variant,
             source=src.source,
             asset_root=src.asset_root,
+            user_cwd=src.user_cwd,
             allow_hub_download=src.allow_hub_download,
             export_dir=src.export_dir,
             inference_precision=src.inference_precision,

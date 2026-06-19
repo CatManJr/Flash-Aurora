@@ -10,6 +10,7 @@ from aurora.model.aurora import Aurora
 from engine.core.checkpoint import CheckpointLoader
 from engine.core.config import EngineConfig
 from engine.core.hooks import RolloutObserver
+from engine.core.paths import AssetStore
 from engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from engine.core.rollout_session import RolloutSession
 from engine.egress.export import RolloutExporter
@@ -24,6 +25,8 @@ class AuroraEngine:
         presets: PresetRegistry | None = None,
     ) -> None:
         self.config = config
+        if self.config.user_cwd is None:
+            self.config.user_cwd = Path.cwd()
         self._presets = presets or DEFAULT_PRESETS
         self._model: Aurora | None = None
         self._loader = CheckpointLoader(config)
@@ -47,6 +50,11 @@ class AuroraEngine:
         if allow_hub_download is not None:
             config.allow_hub_download = allow_hub_download
         return cls(config, presets=registry)
+
+    @property
+    def fetched_dir(self) -> Path:
+        store = AssetStore(root=self.config.asset_root)
+        return store.resolve_root(self.config.asset_root, self.config.user_cwd)
 
     @property
     def model(self) -> Aurora:

@@ -3,9 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from aurora.model.aurora import Aurora
-from aurora.model.checkpoint_local import resolve_checkpoint_path
 
-from engine.core.config import EngineConfig, ModelVariantSpec
+from engine.core.config import EngineConfig
 from engine.core.model_registry import ModelFactory
 from engine.core.paths import AssetStore
 
@@ -17,12 +16,12 @@ class CheckpointLoader:
 
     def load(self, model: Aurora) -> Path:
         variant = self._config.variant
-        root = self._assets.resolve_root(self._config.asset_root)
-        path = resolve_checkpoint_path(
-            filename=variant.checkpoint_filename,
-            checkpoint_dir=root,
+        path = self._assets.fetch_hub_file(
+            variant.checkpoint_filename,
             repo=variant.hf_repo,
-            allow_hub_download=self._config.allow_hub_download,
+            allow_download=self._config.allow_hub_download,
+            explicit=self._config.asset_root,
+            user_cwd=self._config.user_cwd,
         )
         model.load_checkpoint_local(str(path), strict=variant.strict_checkpoint)
         return path
