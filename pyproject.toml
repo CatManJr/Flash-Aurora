@@ -28,6 +28,24 @@ dev = [
     "pytest>=8.0.0",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "aurora"]
+python_files = ["test_*.py"]
+markers = [
+    "gpu: requires CUDA",
+    "integration: requires asset_root and on-disk checkpoints",
+    "engine: engine tests",
+]
+norecursedirs = [
+    "flash-attention",
+    "cutlass",
+    "aurora/.venv",
+    ".git",
+    ".venv",
+]
+addopts = ["-ra"]
+
 # Default package index only (override via env / global uv.toml if needed).
 [[tool.uv.index]]
 name = "tuna"

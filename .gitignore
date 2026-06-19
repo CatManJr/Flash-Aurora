@@ -1,3 +1,7 @@
+# Vendored third-party trees
+cutlass/
+flash-attention/
+
 # Python-generated files
 __pycache__/
 *.py[oc]
