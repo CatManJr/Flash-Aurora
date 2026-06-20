@@ -16,7 +16,7 @@ class InitialConditionBuilder:
         self._assets = AssetStore(root=config.asset_root)
         self._static = StaticFieldLoader(config, self._assets)
 
-    def _allowed_roots(self) -> tuple:
+    def _allowed_roots(self) -> tuple[Path, ...]:
         return self._assets.allowed_roots(self._config.asset_root, self._config.user_cwd)
 
     def _fetch_input(self, filename: str) -> Path:
@@ -28,9 +28,7 @@ class InitialConditionBuilder:
             user_cwd=self._config.user_cwd,
         )
 
-    def from_pickle(self, filename: str) -> Batch:
-        path = self._fetch_input(filename)
-        batch = BatchDeserializer.from_pickle(path, allowed_roots=self._allowed_roots())
+    def _with_static(self, batch: Batch) -> Batch:
         static = self._static.load(lat=batch.metadata.lat, lon=batch.metadata.lon)
         return Batch(
             surf_vars=batch.surf_vars,
@@ -39,12 +37,25 @@ class InitialConditionBuilder:
             metadata=batch.metadata,
         )
 
+    def from_pickle(self, filename: str) -> Batch:
+        path = self._fetch_input(filename)
+        batch = BatchDeserializer.from_pickle(path, allowed_roots=self._allowed_roots())
+        return self._with_static(batch)
+
+    def from_netcdf_path(self, path: Path) -> Batch:
+        resolved = path.expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"NetCDF not found: {resolved}")
+        roots = self._allowed_roots()
+        if resolved.parent not in roots:
+            roots = roots + (resolved.parent,)
+        batch = BatchDeserializer.from_netcdf(resolved, allowed_roots=roots)
+        return self._with_static(batch)
+
     def from_netcdf(self, filename: str) -> Batch:
         path = self._assets.join(
             filename,
             explicit=self._config.asset_root,
             user_cwd=self._config.user_cwd,
         )
-        if not path.is_file():
-            raise FileNotFoundError(f"NetCDF not found: {path}")
-        return BatchDeserializer.from_netcdf(path, allowed_roots=self._allowed_roots())
+        return self.from_netcdf_path(path)
