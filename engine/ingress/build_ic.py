@@ -16,6 +16,9 @@ class InitialConditionBuilder:
         self._assets = AssetStore(root=config.asset_root)
         self._static = StaticFieldLoader(config, self._assets)
 
+    def _allowed_roots(self) -> tuple:
+        return self._assets.allowed_roots(self._config.asset_root, self._config.user_cwd)
+
     def _fetch_input(self, filename: str) -> Path:
         return self._assets.fetch_hub_file(
             filename,
@@ -27,8 +30,8 @@ class InitialConditionBuilder:
 
     def from_pickle(self, filename: str) -> Batch:
         path = self._fetch_input(filename)
-        batch = BatchDeserializer.from_pickle(path)
-        static = self._static.load()
+        batch = BatchDeserializer.from_pickle(path, allowed_roots=self._allowed_roots())
+        static = self._static.load(lat=batch.metadata.lat, lon=batch.metadata.lon)
         return Batch(
             surf_vars=batch.surf_vars,
             static_vars=static,
@@ -44,4 +47,4 @@ class InitialConditionBuilder:
         )
         if not path.is_file():
             raise FileNotFoundError(f"NetCDF not found: {path}")
-        return BatchDeserializer.from_netcdf(path)
+        return BatchDeserializer.from_netcdf(path, allowed_roots=self._allowed_roots())

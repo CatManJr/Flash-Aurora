@@ -19,7 +19,9 @@ def test_from_pickle_requires_existing_file(tmp_path: Path) -> None:
         builder.from_pickle("missing.pickle")
 
 
-def test_default_fetched_dir_under_user_cwd(tmp_path: Path) -> None:
+def test_default_fetched_dir_under_user_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AURORA_HF_LOCAL_DIR", raising=False)
+    monkeypatch.delenv("FLASH_AURORA_ASSET_ROOT", raising=False)
     config = DEFAULT_PRESETS.get("small_pretrained")
     config.user_cwd = tmp_path
     config.allow_hub_download = False

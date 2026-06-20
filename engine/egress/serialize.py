@@ -4,6 +4,8 @@ from pathlib import Path
 
 from aurora import Batch
 
+from engine.core.netcdf_codec import write_batch_netcdf
+
 
 class BatchExporter:
     def __init__(self, export_dir: Path) -> None:
@@ -11,4 +13,4 @@ class BatchExporter:
         self._export_dir.mkdir(parents=True, exist_ok=True)
 
     def write_netcdf(self, batch: Batch, path: Path) -> None:
-        batch.to_netcdf(str(path))
+        write_batch_netcdf(batch, path)

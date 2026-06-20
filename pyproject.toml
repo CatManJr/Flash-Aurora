@@ -12,7 +12,7 @@ dependencies = [
     "flash-attn-4[cu13]",
     "huggingface-hub>=1.8.0",
     "matplotlib>=3.10.8",
-    "numpy>=2.4.2",
+    "numpy",
     "pandas>=3.0.1",
     "pydantic>=2.12.5",
     "pytest>=9.0.2",
@@ -21,6 +21,7 @@ dependencies = [
     "timm>=1.0.26",
     "torch>=2.10.0",
     "triton>=3.6.0",
+    "xarray",
 ]
 
 [project.optional-dependencies]

@@ -22,6 +22,10 @@ VARIANTS: dict[str, ModelVariantSpec] = {
         checkpoint_filename="aurora-0.25-small-pretrained.ckpt",
         use_lora=False,
         strict_checkpoint=False,
+        surf_vars=STANDARD_SURF,
+        atmos_vars=("u", "v", "t", "q"),
+        levels=(50, 250, 500, 600, 700, 850, 925),
+        resolution=(400, 800),
     ),
     "aurora-0.25-finetuned": ModelVariantSpec(
         name="aurora-0.25-finetuned",

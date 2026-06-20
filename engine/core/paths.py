@@ -9,6 +9,22 @@ FETCHED_DIR_NAME = "fetched"
 ENV_ASSET_ROOT_KEYS = ("AURORA_HF_LOCAL_DIR", "FLASH_AURORA_ASSET_ROOT")
 
 
+def safe_filename(filename: str) -> str:
+    """Reject path-like hub filenames; callers must pass a bare name."""
+    name = Path(filename).name
+    if name != filename or name in {"", ".", ".."}:
+        raise ValueError(f"Unsafe filename: {filename!r}")
+    return name
+
+
+def basename_only(filename: str) -> str:
+    """Strip directory components; used when joining under a trusted root."""
+    name = Path(filename).name
+    if name in {"", ".", ".."}:
+        raise ValueError(f"Unsafe filename: {filename!r}")
+    return name
+
+
 @dataclass(frozen=True)
 class AssetStore:
     """Resolve weight and data files under a user-controlled root.
@@ -36,6 +52,13 @@ class AssetStore:
         base = (user_cwd or Path.cwd()).expanduser().resolve()
         return base / FETCHED_DIR_NAME
 
+    def allowed_roots(
+        self,
+        explicit: Path | None = None,
+        user_cwd: Path | None = None,
+    ) -> tuple[Path, ...]:
+        return (self.resolve_root(explicit, user_cwd),)
+
     def ensure_root(
         self,
         explicit: Path | None = None,
@@ -51,7 +74,8 @@ class AssetStore:
         explicit: Path | None = None,
         user_cwd: Path | None = None,
     ) -> Path:
-        return self.resolve_root(explicit, user_cwd) / filename
+        safe_name = basename_only(filename)
+        return self.resolve_root(explicit, user_cwd) / safe_name
 
     def fetch_hub_file(
         self,
@@ -62,8 +86,9 @@ class AssetStore:
         explicit: Path | None = None,
         user_cwd: Path | None = None,
     ) -> Path:
+        safe_name = safe_filename(filename)
         root = self.ensure_root(explicit, user_cwd)
-        local = root / filename
+        local = root / safe_name
         if local.is_file():
             return local
         if not allow_download:
