@@ -10,6 +10,11 @@ from engine.core.redaction import redact_text, safe_path, sanitize_exception
 from engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from engine.ingress.adapters.request import IngestRequest
 from engine.ingress.download.backends import DownloadBackendError, DownloadOutcome, get_backend
+from engine.ingress.download.credentials import (
+    DownloadCredentials,
+    merge_credentials,
+    use_download_credentials,
+)
 from engine.ingress.download.layout import cache_subdir, expected_paths, missing_keys
 from engine.ingress.download.paths import ensure_directory, normalize_path
 
@@ -48,8 +53,14 @@ class DataDownloader:
     Model checkpoints/static pickles still use ``AssetStore`` / Hugging Face.
     """
 
-    def __init__(self, config: EngineConfig) -> None:
+    def __init__(
+        self,
+        config: EngineConfig,
+        *,
+        credentials: DownloadCredentials | None = None,
+    ) -> None:
         self.config = config
+        self._credentials = credentials
         if self.config.user_cwd is None:
             self.config.user_cwd = Path.cwd()
 
@@ -58,17 +69,54 @@ class DataDownloader:
         cls,
         name: str,
         *,
-        asset_root: Path | None = None,
-        user_cwd: Path | None = None,
+        asset_root: Path | str,
+        user_cwd: Path | str | None = None,
         presets: PresetRegistry | None = None,
+        credentials: DownloadCredentials | None = None,
+        cds_api_key: str | None = None,
+        cds_api_url: str | None = None,
+        ecmwf_api_key: str | None = None,
+        ecmwf_api_url: str | None = None,
+        ecmwf_email: str | None = None,
     ) -> DataDownloader:
         registry = presets or DEFAULT_PRESETS
         config = registry.get(name)
-        if asset_root is not None:
-            config.asset_root = normalize_path(asset_root)
+        config.asset_root = normalize_path(asset_root)
         if user_cwd is not None:
             config.user_cwd = normalize_path(user_cwd)
-        return cls(config)
+        preset_credentials = merge_credentials(
+            credentials,
+            DownloadCredentials(
+                cds_api_key=cds_api_key,
+                cds_api_url=cds_api_url,
+                ecmwf_api_key=ecmwf_api_key,
+                ecmwf_api_url=ecmwf_api_url,
+                ecmwf_email=ecmwf_email,
+            ),
+        )
+        return cls(config, credentials=preset_credentials)
+
+    def _effective_credentials(
+        self,
+        credentials: DownloadCredentials | None = None,
+        *,
+        cds_api_key: str | None = None,
+        cds_api_url: str | None = None,
+        ecmwf_api_key: str | None = None,
+        ecmwf_api_url: str | None = None,
+        ecmwf_email: str | None = None,
+    ) -> DownloadCredentials:
+        return merge_credentials(
+            self._credentials,
+            credentials,
+            DownloadCredentials(
+                cds_api_key=cds_api_key,
+                cds_api_url=cds_api_url,
+                ecmwf_api_key=ecmwf_api_key,
+                ecmwf_api_url=ecmwf_api_url,
+                ecmwf_email=ecmwf_email,
+            ),
+        )
 
     def resolve_cache_dir(self, request: DownloadRequest | None = None) -> Path:
         if request is not None and request.cache_dir is not None:
@@ -104,6 +152,12 @@ class DataDownloader:
         valid_time: datetime,
         *,
         cache_dir: Path | None = None,
+        credentials: DownloadCredentials | None = None,
+        cds_api_key: str | None = None,
+        cds_api_url: str | None = None,
+        ecmwf_api_key: str | None = None,
+        ecmwf_api_url: str | None = None,
+        ecmwf_email: str | None = None,
     ) -> DownloadResult:
         directory = ensure_directory(
             normalize_path(cache_dir)
@@ -120,9 +174,18 @@ class DataDownloader:
                 skipped=tuple(paths),
             )
 
+        creds = self._effective_credentials(
+            credentials,
+            cds_api_key=cds_api_key,
+            cds_api_url=cds_api_url,
+            ecmwf_api_key=ecmwf_api_key,
+            ecmwf_api_url=ecmwf_api_url,
+            ecmwf_email=ecmwf_email,
+        )
         backend = get_backend(self.config.source)
         try:
-            outcome: DownloadOutcome = backend.ensure(self.config.source, valid_time, directory)
+            with use_download_credentials(creds):
+                outcome: DownloadOutcome = backend.ensure(self.config.source, valid_time, directory)
         except DownloadBackendError:
             raise
         except Exception as exc:
@@ -156,12 +219,27 @@ class DataDownloader:
         cache_dir: Path | None = None,
         time_index: int = 1,
         download: bool = True,
+        credentials: DownloadCredentials | None = None,
+        cds_api_key: str | None = None,
+        cds_api_url: str | None = None,
+        ecmwf_api_key: str | None = None,
+        ecmwf_api_url: str | None = None,
+        ecmwf_email: str | None = None,
     ) -> IngestRequest:
         directory = normalize_path(cache_dir) if cache_dir is not None else self.resolve_cache_dir(
             DownloadRequest(valid_time=valid_time)
         )
         if download and self.missing(valid_time, cache_dir=directory):
-            self.ensure(valid_time, cache_dir=directory)
+            self.ensure(
+                valid_time,
+                cache_dir=directory,
+                credentials=credentials,
+                cds_api_key=cds_api_key,
+                cds_api_url=cds_api_url,
+                ecmwf_api_key=ecmwf_api_key,
+                ecmwf_api_url=ecmwf_api_url,
+                ecmwf_email=ecmwf_email,
+            )
         return IngestRequest(
             valid_time=valid_time,
             cache_dir=directory,

@@ -10,7 +10,7 @@ import xarray as xr
 from aurora import Batch, Metadata
 
 from engine.core.config import EngineConfig, STANDARD_ATMOS, STANDARD_SURF, STANDARD_STATIC
-from engine.core.netcdf_codec import NETCDF_ENGINE
+from engine.core.netcdf_codec import INGRESS_NETCDF_ENGINE
 from engine.ingress.adapters.base import resolve_cache_dir
 from engine.ingress.adapters.request import IngestRequest
 from engine.ingress.time import TimeHistoryPolicy
@@ -40,11 +40,8 @@ CDS_ERA5_STATIC_FIELDS: tuple[tuple[str, str], ...] = tuple(
 
 
 def open_ingress_netcdf(path: Path) -> xr.Dataset:
-    """Open cached ingress NetCDF, falling back to netcdf4 for CDS downloads."""
-    try:
-        return xr.open_dataset(path, engine=NETCDF_ENGINE)
-    except (ValueError, OSError, KeyError, ImportError):
-        return xr.open_dataset(path, engine="netcdf4")
+    """Open cached ingress NetCDF (CDS downloads are NetCDF4/HDF5)."""
+    return xr.open_dataset(path, engine=INGRESS_NETCDF_ENGINE)
 
 
 class CdsEra5Adapter:
@@ -123,8 +120,21 @@ class CdsEra5Adapter:
             for cds, aurora in CDS_ERA5_STATIC_FIELDS
         }
 
+        level_coord = (
+            atmos_ds["pressure_level"] if "pressure_level" in atmos_ds.coords else atmos_ds["level"]
+        )
+        levels = tuple(int(level) for level in level_coord.values)
+        expected_levels = config.variant.levels
+        if set(levels) != set(expected_levels):
+            raise ValueError(
+                f"ERA5 atmospheric levels {levels} do not match expected {expected_levels}"
+            )
+        level_index = [levels.index(level) for level in expected_levels]
+
         atmos_vars = {
-            aurora: self._history_tensor(policy.select_pair(atmos_ds[cds].values))
+            aurora: self._history_tensor(
+                policy.select_pair(atmos_ds[cds].values[:, level_index, ...])
+            )
             for cds, aurora in CDS_ERA5_ATMOS_FIELDS
         }
 
@@ -135,10 +145,6 @@ class CdsEra5Adapter:
         if time_index < 0 or time_index >= len(valid_times):
             raise ValueError(f"time_index {time_index} out of range for {len(valid_times)} steps")
 
-        level_coord = (
-            atmos_ds["pressure_level"] if "pressure_level" in atmos_ds.coords else atmos_ds["level"]
-        )
-
         return Batch(
             surf_vars=surf_vars,
             static_vars=static_vars,
@@ -147,7 +153,7 @@ class CdsEra5Adapter:
                 lat=lat,
                 lon=lon,
                 time=(valid_times[time_index],),
-                atmos_levels=tuple(int(level) for level in level_coord.values),
+                atmos_levels=expected_levels,
                 rollout_step=0,
             ),
         )

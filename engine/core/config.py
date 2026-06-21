@@ -103,9 +103,22 @@ class EngineConfig:
     variant: ModelVariantSpec
     source: SourceProfile
     asset_root: Path | None = None
+    checkpoint_path: Path | None = None
     user_cwd: Path | None = None
     allow_hub_download: bool = True
+    hf_endpoint: str | None = None
+    hf_revision: str | None = None
+    hf_token: str | None = None
     export_dir: Path = field(default_factory=lambda: Path("output"))
     inference_precision: str | None = None
     cuda_graph: bool = False
     device: str = "cuda:0"
+
+    def hub_download_options(self) -> "HubDownloadOptions":
+        from engine.core.hub import HubDownloadOptions
+
+        return HubDownloadOptions(
+            endpoint=self.hf_endpoint,
+            revision=self.hf_revision,
+            token=self.hf_token,
+        )

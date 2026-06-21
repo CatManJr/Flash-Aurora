@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from engine.core.paths import AssetRootRequiredError
 from engine.core.presets import DEFAULT_PRESETS
-from engine.core.paths import FETCHED_DIR_NAME
 from engine.ingress.build_ic import InitialConditionBuilder
 
 
@@ -19,15 +19,12 @@ def test_from_pickle_requires_existing_file(tmp_path: Path) -> None:
         builder.from_pickle("missing.pickle")
 
 
-def test_default_fetched_dir_under_user_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("AURORA_HF_LOCAL_DIR", raising=False)
-    monkeypatch.delenv("FLASH_AURORA_ASSET_ROOT", raising=False)
+def test_from_pickle_requires_asset_root(tmp_path: Path) -> None:
     config = DEFAULT_PRESETS.get("small_pretrained")
+    config.asset_root = None
     config.user_cwd = tmp_path
     config.allow_hub_download = False
     builder = InitialConditionBuilder(config)
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(AssetRootRequiredError):
         builder.from_pickle("missing.pickle")
-
-    assert (tmp_path / FETCHED_DIR_NAME).is_dir()

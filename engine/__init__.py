@@ -4,6 +4,8 @@ ensure_repo_paths()
 
 from engine.core.config import EngineConfig
 from engine.core.engine import AuroraEngine
+from engine.core.hub import HF_MIRROR_ENDPOINT, HubDownloadOptions
+from engine.core.paths import normalize_asset_path
 from engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from engine.ingress.adapters import IngestRequest
 from engine.ingress.build_ic import InitialConditionBuilder
@@ -19,7 +21,10 @@ __all__ = [
     "DownloadRequest",
     "DownloadResult",
     "EngineConfig",
+    "HF_MIRROR_ENDPOINT",
+    "HubDownloadOptions",
     "InitialConditionBuilder",
     "IngestRequest",
     "PresetRegistry",
+    "normalize_asset_path",
 ]

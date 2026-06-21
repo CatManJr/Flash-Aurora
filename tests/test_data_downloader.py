@@ -127,10 +127,12 @@ def test_cams_backend_raises_helpful_error(tmp_path: Path) -> None:
 def test_cds_client_requires_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from engine.ingress.download.cds import cds_client
 
+    monkeypatch.delenv("CDSAPI_KEY", raising=False)
+    monkeypatch.delenv("CDSAPI_URL", raising=False)
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr("engine.ingress.download.paths.user_home", lambda: fake_home)
-    with pytest.raises(FileNotFoundError, match=".cdsapirc"):
+    with pytest.raises(FileNotFoundError, match="Missing CDS credentials"):
         cds_client()
 
     (fake_home / ".cdsapirc").write_text("url: https://example\nkey: test\n")
@@ -138,3 +140,42 @@ def test_cds_client_requires_config(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         mocked.return_value.Client.return_value = MagicMock()
         client = cds_client()
     assert client is mocked.return_value.Client.return_value
+
+
+def test_cds_client_accepts_explicit_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.ingress.download.cds import cds_client
+    from engine.ingress.download.credentials import DownloadCredentials, use_download_credentials
+
+    monkeypatch.delenv("CDSAPI_KEY", raising=False)
+    with patch("engine.ingress.download.cds.require_cdsapi") as mocked:
+        mocked.return_value.Client.return_value = MagicMock()
+        with use_download_credentials(DownloadCredentials(cds_api_key="super-secret-key")):
+            cds_client()
+        mocked.return_value.Client.assert_called_once_with(
+            url="https://cds.climate.copernicus.eu/api",
+            key="super-secret-key",
+        )
+
+
+def test_ensure_accepts_cds_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = DEFAULT_PRESETS.get("era5_pretrained")
+    config.asset_root = tmp_path
+    downloader = DataDownloader(config)
+    valid_time = datetime(2023, 1, 1, 6)
+    cache = tmp_path / "era5"
+
+    def fake_download(cache_dir: Path, day: str, *, include_static: bool = True):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "static": cache_dir / "static.nc",
+            "surface": cache_dir / f"{day}-surface-level.nc",
+            "atmospheric": cache_dir / f"{day}-atmospheric.nc",
+        }
+        for path in paths.values():
+            path.write_bytes(b"nc")
+        return paths
+
+    with patch("engine.ingress.download.backends.cds.download_era5_day", side_effect=fake_download) as mocked:
+        downloader.ensure(valid_time, cache_dir=cache, cds_api_key="abc12345")
+
+    mocked.assert_called_once()

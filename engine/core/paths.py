@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from engine.core.hub import HubDownloadOptions, download_hub_file
 from engine.core.redaction import redact_text, safe_path
 
-FETCHED_DIR_NAME = "fetched"
 
-ENV_ASSET_ROOT_KEYS = ("AURORA_HF_LOCAL_DIR", "FLASH_AURORA_ASSET_ROOT")
+class AssetRootRequiredError(ValueError):
+    """Raised when callers omit the required ``asset_root``."""
 
 
 def safe_filename(filename: str) -> str:
@@ -27,43 +27,51 @@ def basename_only(filename: str) -> str:
     return name
 
 
+def normalize_asset_path(path: Path | str) -> Path:
+    """Expand ``~`` and resolve to an absolute path."""
+    return Path(path).expanduser().resolve()
+
+
+def require_asset_root(
+    explicit: Path | str | None,
+    *,
+    store_root: Path | str | None = None,
+) -> Path:
+    """Return a normalized asset root supplied by the caller."""
+    if explicit is not None:
+        return normalize_asset_path(explicit)
+    if store_root is not None:
+        return normalize_asset_path(store_root)
+    raise AssetRootRequiredError(
+        "asset_root is required. Pass asset_root= to from_preset(), for example "
+        "AuroraEngine.from_preset('era5_pretrained', asset_root='~/aurora/assets')."
+    )
+
+
 @dataclass(frozen=True)
 class AssetStore:
-    """Resolve weight and data files under a user-controlled root.
-
-    Priority: explicit asset_root, store root, environment variable,
-    then ``{user_cwd}/fetched``. user_cwd is the caller working directory,
-    usually captured as Path.cwd() when AuroraEngine is created.
-    """
+    """Resolve weight and cache files under a caller-provided root only."""
 
     root: Path | None = None
 
     def resolve_root(
         self,
-        explicit: Path | None = None,
+        explicit: Path | str | None = None,
         user_cwd: Path | None = None,
     ) -> Path:
-        if explicit is not None:
-            return Path(explicit).expanduser().resolve()
-        if self.root is not None:
-            return self.root.expanduser().resolve()
-        for key in ENV_ASSET_ROOT_KEYS:
-            env = os.environ.get(key)
-            if env:
-                return Path(env).expanduser().resolve()
-        base = (user_cwd or Path.cwd()).expanduser().resolve()
-        return base / FETCHED_DIR_NAME
+        del user_cwd  # kept for call-site compatibility; not used for discovery
+        return require_asset_root(explicit, store_root=self.root)
 
     def allowed_roots(
         self,
-        explicit: Path | None = None,
+        explicit: Path | str | None = None,
         user_cwd: Path | None = None,
     ) -> tuple[Path, ...]:
         return (self.resolve_root(explicit, user_cwd),)
 
     def ensure_root(
         self,
-        explicit: Path | None = None,
+        explicit: Path | str | None = None,
         user_cwd: Path | None = None,
     ) -> Path:
         root = self.resolve_root(explicit, user_cwd)
@@ -73,7 +81,7 @@ class AssetStore:
     def join(
         self,
         filename: str,
-        explicit: Path | None = None,
+        explicit: Path | str | None = None,
         user_cwd: Path | None = None,
     ) -> Path:
         safe_name = basename_only(filename)
@@ -85,8 +93,9 @@ class AssetStore:
         *,
         repo: str,
         allow_download: bool,
-        explicit: Path | None = None,
+        explicit: Path | str | None = None,
         user_cwd: Path | None = None,
+        hub: HubDownloadOptions | None = None,
     ) -> Path:
         safe_name = safe_filename(filename)
         root = self.ensure_root(explicit, user_cwd)
@@ -97,14 +106,16 @@ class AssetStore:
             raise FileNotFoundError(
                 redact_text(
                     f"Missing {filename!r} under {safe_path(root)}. "
-                    "Place the file there, set asset_root, or enable allow_hub_download."
+                    "Place the file there, pass checkpoint_path=, or enable allow_hub_download "
+                    "(optionally with hf_endpoint= for a Hugging Face mirror)."
                 )
             )
-        from huggingface_hub import hf_hub_download
-
-        downloaded = hf_hub_download(
-            repo_id=repo,
-            filename=filename,
-            local_dir=str(root),
+        options = hub or HubDownloadOptions()
+        return download_hub_file(
+            filename,
+            repo=repo,
+            local_dir=root,
+            revision=options.revision,
+            endpoint=options.endpoint,
+            token=options.token,
         )
-        return Path(downloaded).resolve()

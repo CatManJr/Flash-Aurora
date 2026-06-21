@@ -9,9 +9,9 @@ import pytest
 import xarray as xr
 
 from engine.core.config import EngineConfig
-from engine.core.netcdf_codec import NETCDF_ENGINE
+from engine.core.netcdf_codec import INGRESS_NETCDF_ENGINE, NETCDF_ENGINE
 from engine.core.presets import DEFAULT_PRESETS
-from engine.ingress.adapters.era5 import CdsEra5Adapter
+from engine.ingress.adapters.era5 import CdsEra5Adapter, open_ingress_netcdf
 from engine.ingress.adapters.registry import DEFAULT_ADAPTERS
 from engine.ingress.adapters.request import IngestRequest
 from engine.ingress.build_ic import InitialConditionBuilder
@@ -128,6 +128,16 @@ def test_from_source_validates_era5_batch(tmp_path: Path) -> None:
     )
     batch = builder.from_source(request)
     assert batch.surf_vars["msl"].shape == (1, 2, 5, 8)
+
+
+def test_open_ingress_netcdf_reads_netcdf4(tmp_path: Path) -> None:
+    paths = write_era5_fixture(tmp_path)
+    netcdf4_path = tmp_path / "surface-netcdf4.nc"
+    with xr.open_dataset(paths["surface"], engine=NETCDF_ENGINE) as src:
+        src.to_netcdf(netcdf4_path, engine=INGRESS_NETCDF_ENGINE)
+
+    with open_ingress_netcdf(netcdf4_path) as ds:
+        assert "t2m" in ds
 
 
 def test_era5_default_paths_under_cache_dir(tmp_path: Path) -> None:

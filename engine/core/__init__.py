@@ -1,10 +1,11 @@
 from engine.core.config import EngineConfig, ModelVariantSpec, SourceProfile
-from engine.core.paths import AssetStore, FETCHED_DIR_NAME
+from engine.core.paths import AssetRootRequiredError, AssetStore, normalize_asset_path
 
 __all__ = [
+    "AssetRootRequiredError",
     "AssetStore",
     "EngineConfig",
-    "FETCHED_DIR_NAME",
     "ModelVariantSpec",
     "SourceProfile",
+    "normalize_asset_path",
 ]

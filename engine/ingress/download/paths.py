@@ -37,10 +37,3 @@ def ecmwfapirc_path() -> Path:
 def platform_label() -> str:
     return sys.platform
 
-
-def env_asset_root() -> Path | None:
-    for key in ("AURORA_HF_LOCAL_DIR", "FLASH_AURORA_ASSET_ROOT"):
-        value = os.environ.get(key)
-        if value:
-            return normalize_path(value)
-    return None

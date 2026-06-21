@@ -29,6 +29,7 @@ class StaticFieldLoader:
             allow_download=self._config.allow_hub_download,
             explicit=self._config.asset_root,
             user_cwd=self._config.user_cwd,
+            hub=self._config.hub_download_options(),
         )
         payload = load_trusted_pickle(path, roots)
         if not isinstance(payload, dict):

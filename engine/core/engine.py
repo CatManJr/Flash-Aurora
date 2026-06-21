@@ -10,7 +10,8 @@ from aurora.model.aurora import Aurora
 from engine.core.checkpoint import CheckpointLoader
 from engine.core.config import EngineConfig
 from engine.core.hooks import RolloutObserver
-from engine.core.paths import AssetStore
+from engine.core.hub import HF_MIRROR_ENDPOINT
+from engine.core.paths import AssetStore, normalize_asset_path
 from engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from engine.core.rollout_session import RolloutSession
 from engine.egress.export import RolloutExporter
@@ -41,16 +42,30 @@ class AuroraEngine:
         cls,
         name: str,
         *,
-        asset_root: Path | None = None,
+        asset_root: Path | str,
+        checkpoint_path: Path | str | None = None,
         allow_hub_download: bool | None = None,
+        hf_endpoint: str | None = None,
+        hf_mirror: bool = False,
+        hf_revision: str | None = None,
+        hf_token: str | None = None,
         presets: PresetRegistry | None = None,
     ) -> AuroraEngine:
         registry = presets or DEFAULT_PRESETS
         config = registry.get(name)
-        if asset_root is not None:
-            config.asset_root = asset_root
+        config.asset_root = normalize_asset_path(asset_root)
+        if checkpoint_path is not None:
+            config.checkpoint_path = normalize_asset_path(checkpoint_path)
         if allow_hub_download is not None:
             config.allow_hub_download = allow_hub_download
+        if hf_mirror:
+            config.hf_endpoint = HF_MIRROR_ENDPOINT
+        elif hf_endpoint is not None:
+            config.hf_endpoint = hf_endpoint
+        if hf_revision is not None:
+            config.hf_revision = hf_revision
+        if hf_token is not None:
+            config.hf_token = hf_token
         return cls(config, presets=registry)
 
     @property

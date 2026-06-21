@@ -8,7 +8,10 @@ import xarray as xr
 
 from aurora import Batch, Metadata
 
+# Engine egress (Batch round-trip) uses NetCDF3 via scipy for broad compatibility.
 NETCDF_ENGINE = "scipy"
+# CDS and most external ingress files are NetCDF4/HDF5; scipy cannot read them.
+INGRESS_NETCDF_ENGINE = "netcdf4"
 
 
 def _tensor_to_numpy(value: torch.Tensor) -> np.ndarray:

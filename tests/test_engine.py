@@ -6,22 +6,19 @@ from engine.core.engine import AuroraEngine
 from engine.core.presets import DEFAULT_PRESETS
 
 
-def test_from_preset_returns_engine(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("AURORA_HF_LOCAL_DIR", raising=False)
-    monkeypatch.delenv("FLASH_AURORA_ASSET_ROOT", raising=False)
-    engine = AuroraEngine.from_preset("era5_pretrained")
+def test_from_preset_returns_engine(tmp_path: Path) -> None:
+    engine = AuroraEngine.from_preset("era5_pretrained", asset_root=tmp_path)
     assert engine.config.variant.model_class == "AuroraPretrained"
     assert engine.config.source.schema == "cds_era5"
-    assert engine.fetched_dir.name == "fetched"
+    assert engine.fetched_dir == tmp_path.resolve()
 
 
 def test_engine_captures_user_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("AURORA_HF_LOCAL_DIR", raising=False)
-    monkeypatch.delenv("FLASH_AURORA_ASSET_ROOT", raising=False)
     monkeypatch.chdir(tmp_path)
-    engine = AuroraEngine.from_preset("era5_pretrained")
+    assets = tmp_path / "assets"
+    engine = AuroraEngine.from_preset("era5_pretrained", asset_root=assets)
     assert engine.config.user_cwd == tmp_path.resolve()
-    assert engine.fetched_dir == (tmp_path / "fetched").resolve()
+    assert engine.fetched_dir == assets.resolve()
 
 
 def test_preset_registry_lists_examples() -> None:

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+from contextvars import ContextVar
 from pathlib import Path
+
+_ephemeral_literals: ContextVar[tuple[str, ...]] = ContextVar(
+    "flash_aurora_ephemeral_redaction_literals",
+    default=(),
+)
 
 SENSITIVE_ENV_SUBSTRINGS: tuple[str, ...] = (
     "TOKEN",
@@ -28,6 +34,9 @@ SENSITIVE_ENV_KEYS: frozenset[str] = frozenset(
         "AZURE_STORAGE_CONNECTION_STRING",
         "CDSAPI_KEY",
         "CDSAPI_URL",
+        "ECMWF_API_KEY",
+        "ECMWF_API_URL",
+        "ECMWF_API_EMAIL",
         "AURORA_HF_LOCAL_DIR",
         "FLASH_AURORA_ASSET_ROOT",
     }
@@ -74,12 +83,13 @@ def _config_secret(path: Path, key_names: tuple[str, ...]) -> str | None:
 
 
 def _redaction_literals() -> tuple[str, ...]:
-    literals: list[str] = []
-    for key, value in os.environ.items():
-        if not value or len(value) < 4:
-            continue
-        if _is_sensitive_env_key(key):
-            literals.append(value)
+    # Longest first so partial overlaps do not leave suffixes behind.
+    literals = list(_ephemeral_literals.get())
+    literals.extend(
+        value
+        for key, value in os.environ.items()
+        if value and len(value) >= 4 and _is_sensitive_env_key(key)
+    )
 
     from engine.ingress.download.paths import cdsapirc_path, ecmwfapirc_path
 
@@ -90,8 +100,17 @@ def _redaction_literals() -> tuple[str, ...]:
     if ecmwf_key:
         literals.append(ecmwf_key)
 
-    # Longest first so partial overlaps do not leave suffixes behind.
     return tuple(sorted(set(literals), key=len, reverse=True))
+
+
+def push_ephemeral_literals(*values: str):
+    current = _ephemeral_literals.get()
+    added = tuple(value for value in values if value and len(value) >= 4)
+    return _ephemeral_literals.set(current + added)
+
+
+def pop_ephemeral_literals(token) -> None:
+    _ephemeral_literals.reset(token)
 
 
 def redact_text(text: str) -> str:
