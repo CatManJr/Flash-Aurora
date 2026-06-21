@@ -23,6 +23,50 @@ STANDARD_SURF: tuple[str, ...] = ("2t", "10u", "10v", "msl")
 STANDARD_STATIC: tuple[str, ...] = ("lsm", "slt", "z")
 STANDARD_ATMOS: tuple[str, ...] = ("t", "u", "v", "q", "z")
 
+CAMS_SURF_POLLUTION: tuple[str, ...] = (
+    "pm1",
+    "pm2p5",
+    "pm10",
+    "tcco",
+    "tc_no",
+    "tcno2",
+    "gtco3",
+    "tcso2",
+)
+CAMS_ATMOS_POLLUTION: tuple[str, ...] = ("co", "no", "no2", "go3", "so2")
+CAMS_STATIC: tuple[str, ...] = STANDARD_STATIC + (
+    "static_ammonia",
+    "static_ammonia_log",
+    "static_co",
+    "static_co_log",
+    "static_nox",
+    "static_nox_log",
+    "static_so2",
+    "static_so2_log",
+)
+
+WAVE_SURF_WAM: tuple[str, ...] = (
+    "swh",
+    "mwd",
+    "mwp",
+    "pp1d",
+    "shww",
+    "mdww",
+    "mpww",
+    "shts",
+    "mdts",
+    "mpts",
+    "swh1",
+    "mwd1",
+    "mwp1",
+    "swh2",
+    "mwd2",
+    "mwp2",
+    "wind",
+    "dwi",
+)
+WAVE_STATIC: tuple[str, ...] = STANDARD_STATIC + ("wmb", "lat_mask")
+
 
 @dataclass(frozen=True)
 class ModelVariantSpec:

@@ -15,6 +15,7 @@ from engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from engine.core.rollout_session import RolloutSession
 from engine.egress.export import RolloutExporter
 from engine.ingress.build_ic import InitialConditionBuilder
+from engine.ingress.adapters import IngestRequest
 from engine.ingress.validator import BatchValidator
 from engine.runtime.graph_pool import GraphPool
 
@@ -92,6 +93,12 @@ class AuroraEngine:
 
     def run_from_netcdf(self, path: Path | str, steps: int = 1) -> list[Batch]:
         batch = self._builder().from_netcdf_path(Path(path))
+        if steps == 1:
+            return [self.predict(batch)]
+        return list(self.rollout_stream(batch, steps))
+
+    def run_from_adapter(self, request: IngestRequest, steps: int = 1) -> list[Batch]:
+        batch = self._builder().from_source(request)
         if steps == 1:
             return [self.predict(batch)]
         return list(self.rollout_stream(batch, steps))

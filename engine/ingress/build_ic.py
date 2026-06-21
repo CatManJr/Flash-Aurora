@@ -6,8 +6,10 @@ from aurora import Batch
 
 from engine.core.config import EngineConfig
 from engine.core.paths import AssetStore
+from engine.ingress.adapters import IngestRequest, get_adapter
 from engine.ingress.deserialize import BatchDeserializer
 from engine.ingress.static import StaticFieldLoader
+from engine.ingress.validator import BatchValidator
 
 
 class InitialConditionBuilder:
@@ -15,6 +17,7 @@ class InitialConditionBuilder:
         self._config = config
         self._assets = AssetStore(root=config.asset_root)
         self._static = StaticFieldLoader(config, self._assets)
+        self._validator = BatchValidator(config.variant)
 
     def _allowed_roots(self) -> tuple[Path, ...]:
         return self._assets.allowed_roots(self._config.asset_root, self._config.user_cwd)
@@ -59,3 +62,9 @@ class InitialConditionBuilder:
             user_cwd=self._config.user_cwd,
         )
         return self.from_netcdf_path(path)
+
+    def from_source(self, request: IngestRequest) -> Batch:
+        adapter = get_adapter(self._config.source)
+        batch = adapter.build_initial_batch(request, self._config)
+        self._validator.validate(batch)
+        return batch

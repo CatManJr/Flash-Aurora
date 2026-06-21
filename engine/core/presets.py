@@ -6,6 +6,11 @@ from engine.core.config import (
     SourceProfile,
     STANDARD_ATMOS,
     STANDARD_SURF,
+    CAMS_ATMOS_POLLUTION,
+    CAMS_STATIC,
+    CAMS_SURF_POLLUTION,
+    WAVE_STATIC,
+    WAVE_SURF_WAM,
 )
 
 VARIANTS: dict[str, ModelVariantSpec] = {
@@ -56,16 +61,17 @@ VARIANTS: dict[str, ModelVariantSpec] = {
         checkpoint_filename="aurora-0.4-air-pollution.ckpt",
         resolution=(451, 900),
         static_pickle="aurora-0.4-air-pollution-static.pickle",
-        surf_vars=STANDARD_SURF + ("pm1", "pm2p5", "pm10", "co", "no", "no2", "go3", "so2"),
-        atmos_vars=STANDARD_ATMOS
-        + ("co", "no", "no2", "go3", "so2", "pm1", "pm2p5", "pm10", "aod550"),
+        surf_vars=STANDARD_SURF + CAMS_SURF_POLLUTION,
+        static_vars=CAMS_STATIC,
+        atmos_vars=STANDARD_ATMOS + CAMS_ATMOS_POLLUTION,
         strict_checkpoint=False,
     ),
     "aurora-0.25-wave": ModelVariantSpec(
         name="aurora-0.25-wave",
         model_class="AuroraWave",
         checkpoint_filename="aurora-0.25-wave.ckpt",
-        surf_vars=STANDARD_SURF + ("swh", "mwd", "mwp", "pp1d", "shww", "mdww", "mpww"),
+        surf_vars=STANDARD_SURF + WAVE_SURF_WAM,
+        static_vars=WAVE_STATIC,
         static_pickle="aurora-0.25-wave-static.pickle",
         strict_checkpoint=False,
     ),
@@ -100,7 +106,7 @@ SOURCES: dict[str, SourceProfile] = {
     "wb2_wam": SourceProfile(
         name="wb2_wam",
         schema="wb2_wam",
-        time_policy="pair",
+        time_policy="first_two",
         flip_lat=True,
         flip_lat_wave=False,
         raw_layout="mixed",
