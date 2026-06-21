@@ -2,7 +2,7 @@
 
 Custom Triton/CuTe Swin paths never run inside ``torch.autocast``.
 
-* ``bf16_mixed`` — hybrid: TF32 backbone linears except MLP ``fc1``/``fc2`` (BF16).
+* ``bf16_mixed`` — hybrid: BF16 WindowAttention QKV/proj + MLP; other linears TF32.
 * ``bf16`` — all backbone ``F.linear`` in BF16.
 * AdaLN/LN boundaries stay FP32 on both BF16 presets.
 * ``tf32`` — FP32 activations, TF32 backbone + E/D linears.
@@ -11,6 +11,7 @@ Custom Triton/CuTe Swin paths never run inside ``torch.autocast``.
 from __future__ import annotations
 
 import contextvars
+import os
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, TypeVar
 
@@ -28,6 +29,9 @@ _bf16_matmul_routing: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _bf16_mlp_matmul_scope: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_bf16_mlp_matmul_scope", default=False
 )
+_bf16_attention_matmul_scope: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_bf16_attention_matmul_scope", default=False
+)
 _bf16_hybrid_matmul: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_bf16_hybrid_matmul", default=False
 )
@@ -39,8 +43,16 @@ def backbone_bf16_matmul_active() -> bool:
 
 
 def backbone_bf16_hybrid_matmul_active() -> bool:
-    """True for ``bf16_mixed`` (TF32 linears + BF16 MLP only)."""
+    """True for ``bf16_mixed`` (BF16 attention/MLP; TF32 otherwise)."""
     return _bf16_matmul_routing.get() and _bf16_hybrid_matmul.get()
+
+
+def bf16_mixed_attention_linear_enabled() -> bool:
+    """Route WindowAttention QKV/proj linears through BF16 in bf16_mixed.
+
+    The opt-out exists only for A/B regression checks against the old hybrid path.
+    """
+    return os.environ.get("AURORA_BF16_MIXED_ATTENTION_LINEAR", "1") != "0"
 
 
 @contextmanager
@@ -51,6 +63,16 @@ def backbone_bf16_mlp_matmul_scope() -> Iterator[None]:
         yield
     finally:
         _bf16_mlp_matmul_scope.reset(token)
+
+
+@contextmanager
+def backbone_bf16_attention_matmul_scope() -> Iterator[None]:
+    """Mark WindowAttention QKV/proj ``F.linear`` for BF16 in hybrid mode."""
+    token = _bf16_attention_matmul_scope.set(True)
+    try:
+        yield
+    finally:
+        _bf16_attention_matmul_scope.reset(token)
 
 
 @contextmanager
@@ -119,10 +141,11 @@ def _bf16_layer_norm_hook(
 
 @contextmanager
 def backbone_bf16_mixed_matmul_context(*, enabled: bool) -> Iterator[None]:
-    """``bf16_mixed``: TF32 ``F.linear`` except MLP ``fc1``/``fc2`` (BF16).
+    """``bf16_mixed``: BF16 WindowAttention + MLP, TF32 for other linears.
 
-    * QKV, proj, patch merge, AdaLN modulation: TF32 Tensor Core, FP32 I/O.
-    * MLP ``fc1``/``fc2`` (inside :func:`backbone_bf16_mlp_matmul_scope`): BF16 autocast.
+    * WindowAttention QKV/proj: BF16 autocast.
+    * MLP ``fc1``/``fc2``: BF16 autocast.
+    * Patch merge, AdaLN modulation, and other backbone linears: TF32 Tensor Core, FP32 I/O.
     * ``F.layer_norm`` on BF16 input: FP32 statistics/output.
     """
     if not enabled:
@@ -156,7 +179,7 @@ def backbone_bf16_mixed_matmul_context(*, enabled: bool) -> Iterator[None]:
         weight: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if _bf16_mlp_matmul_scope.get() and (
+        if (_bf16_mlp_matmul_scope.get() or _bf16_attention_matmul_scope.get()) and (
             input.is_cuda
             and not torch.is_grad_enabled()
             and input.dtype in (torch.float32, torch.bfloat16)

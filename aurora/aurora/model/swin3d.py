@@ -9,6 +9,7 @@ Code adapted from
 
 """
 
+import contextlib
 import itertools
 from datetime import timedelta
 from functools import lru_cache
@@ -268,30 +269,47 @@ class WindowAttention(nn.Module):
             torch.Tensor: Output of shape `(nW*B, N, C)`.
         """
         from aurora.model.custom_op_paths import (
+            backbone_bf16_attention_matmul_scope,
+            backbone_bf16_hybrid_matmul_active,
             backbone_bf16_matmul_active,
+            bf16_mixed_attention_linear_enabled,
             cast_activation_dtype,
         )
 
+        use_bf16_attention_linear = (
+            backbone_bf16_hybrid_matmul_active()
+            and bf16_mixed_attention_linear_enabled()
+            and self.use_cute_window_attn
+            and self.cute_window_attn_dtype == torch.bfloat16
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+        )
         bf16_cute_attn = (
             backbone_bf16_matmul_active()
             and self.cute_window_attn_dtype == torch.bfloat16
             and x.is_cuda
             and not torch.is_grad_enabled()
         )
-        # bf16: all linears BF16; bf16_mixed: MLP-only BF16, cast for non-CuTe.
+        # bf16: all linears BF16; bf16_mixed: attention/MLP BF16, TF32 elsewhere.
         if x.dtype == torch.bfloat16 and not bf16_cute_attn:
             x = cast_activation_dtype(x, torch.float32)
 
-        if isinstance(self.lora_qkv, LoRARollout):
-            qkv = self._linear_with_optional_lora_merge(
-                x,
-                self.qkv,
-                self.lora_qkv,
-                step=rollout_step,
-                cache_name="qkv",
-            )
-        else:
-            qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
+        qkv_scope = (
+            backbone_bf16_attention_matmul_scope()
+            if use_bf16_attention_linear
+            else contextlib.nullcontext()
+        )
+        with qkv_scope:
+            if isinstance(self.lora_qkv, LoRARollout):
+                qkv = self._linear_with_optional_lora_merge(
+                    x,
+                    self.qkv,
+                    self.lora_qkv,
+                    step=rollout_step,
+                    cache_name="qkv",
+                )
+            else:
+                qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
         attn_dropout = self.attn_drop if self.training else 0.0
 
         use_cute = can_use_cute_window_attention(
@@ -369,19 +387,28 @@ class WindowAttention(nn.Module):
             else:
                 x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
             x = rearrange(x, "B H N D -> B N (H D)")
-        # AdaLN requires FP32 branch input; promote before proj (TF32) + norm1.
-        if bf16_cute_attn and x.dtype == torch.bfloat16:
+        # AdaLN requires FP32 branch input.  In the experimental bf16 attention-linear
+        # path, keep proj in BF16 too and promote once after proj instead.
+        if bf16_cute_attn and not use_bf16_attention_linear and x.dtype == torch.bfloat16:
             x = cast_activation_dtype(x, torch.float32)
-        if isinstance(self.lora_proj, LoRARollout):
-            x = self._linear_with_optional_lora_merge(
-                x,
-                self.proj,
-                self.lora_proj,
-                step=rollout_step,
-                cache_name="proj",
-            )
-        else:
-            x = self.proj(x) + self.lora_proj(x, rollout_step)
+        proj_scope = (
+            backbone_bf16_attention_matmul_scope()
+            if use_bf16_attention_linear
+            else contextlib.nullcontext()
+        )
+        with proj_scope:
+            if isinstance(self.lora_proj, LoRARollout):
+                x = self._linear_with_optional_lora_merge(
+                    x,
+                    self.proj,
+                    self.lora_proj,
+                    step=rollout_step,
+                    cache_name="proj",
+                )
+            else:
+                x = self.proj(x) + self.lora_proj(x, rollout_step)
+        if use_bf16_attention_linear and x.dtype == torch.bfloat16:
+            x = cast_activation_dtype(x, torch.float32)
         x = self.proj_drop(x)
         return x
 

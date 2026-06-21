@@ -10,7 +10,7 @@ Named presets (``fp32``, ``fast_fp32``, ``tf32``, ``bf16_mixed``, ``bf16``, …)
 Override either axis explicitly or use a combo string (``backbone@encoder_decoder``).
 The left token is always a **backbone matmul level**; the right is **encoder/decoder only**:
 
-* ``bf16_mixed@fp32`` — hybrid backbone (TF32 QKV/proj + BF16 MLP) + strict FP32 Perceiver
+* ``bf16_mixed@fp32`` — hybrid backbone (BF16 attention QKV/proj + MLP) + strict FP32 Perceiver
 * ``bf16@fp32`` — full backbone BF16 linears + strict FP32 Perceiver
 * ``bf16_mixed@tf32`` — hybrid backbone + Perceiver TF32 tensor cores (same E/D as preset ``bf16_mixed``)
 * ``bf16@tf32`` — full backbone BF16 + Perceiver TF32 (same E/D as preset ``bf16``)
@@ -426,7 +426,7 @@ def describe_backbone_matmul_level(level: BackboneMatmulLevel) -> str:
     if level == BackboneMatmulLevel.TF32:
         return "backbone matmul TF32 tensor cores"
     if level == BackboneMatmulLevel.BF16_MIXED:
-        return "backbone matmul hybrid: TF32 QKV/proj + BF16 MLP"
+        return "backbone matmul hybrid: BF16 attention QKV/proj + BF16 MLP; TF32 elsewhere"
     return "backbone matmul BF16 (all Swin linears)"
 
 

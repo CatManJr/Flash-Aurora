@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +28,7 @@ _LEGACY_NAMED_TIERS: tuple[tuple[str, str, str], ...] = (
     ("fp32", "fp32", "PyTorch FP32"),
     ("fast_fp32", "fast_fp32", "Triton layout + AdaLN + PyTorch GELU"),
     ("tf32", "tf32", "fast_fp32 + TF32 matmul + CuTe TF32 attn"),
-    ("bf16_mixed", "bf16_mixed", "hybrid: TF32 QKV/proj + BF16 MLP + CuTe BF16 attn"),
+    ("bf16_mixed", "bf16_mixed", "hybrid: BF16 attention QKV/proj + BF16 MLP"),
     ("bf16", "bf16", "full backbone BF16 linears + CuTe BF16 attn"),
     ("pytorch_autocast", "pytorch_autocast", "PyTorch backbone BF16 autocast"),
 )
@@ -331,18 +332,29 @@ def set_cute_window_attn(model: Any, enabled: bool) -> None:
             module.use_cute_window_attn = enabled
 
 
+def set_cute_window_attn_dtype(model: Any, dtype: torch.dtype) -> None:
+    """Override CuTe attention compute dtype for ablation experiments."""
+    model.cute_window_attn_dtype = dtype
+    for module in model.backbone.modules():
+        if hasattr(module, "cute_window_attn_dtype"):
+            module.cute_window_attn_dtype = dtype
+
+
 def build_model(
     precision: str,
     checkpoint: Path,
     device: torch.device,
     *,
     use_cute_window_attn: bool | None = None,
+    cute_window_attn_dtype: torch.dtype | None = None,
 ) -> Any:
     from aurora import AuroraPretrained
 
     model = AuroraPretrained(use_lora=False, inference_precision=precision)
     if use_cute_window_attn is not None:
         set_cute_window_attn(model, use_cute_window_attn)
+    if cute_window_attn_dtype is not None:
+        set_cute_window_attn_dtype(model, cute_window_attn_dtype)
     model.load_checkpoint_local(str(checkpoint), strict=True)
     model.eval()
     return model.to(device)
@@ -398,12 +410,14 @@ def run_tier(
     warmup: int,
     repeat: int,
     use_cute_window_attn: bool | None = None,
+    cute_window_attn_dtype: torch.dtype | None = None,
 ) -> tuple[dict[str, torch.Tensor], float, float, float]:
     model = build_model(
         precision,
         checkpoint,
         device,
         use_cute_window_attn=use_cute_window_attn,
+        cute_window_attn_dtype=cute_window_attn_dtype,
     )
     try:
         pred, ms_per, peak_alloc, peak_reserved = time_forward(
@@ -423,13 +437,31 @@ def run_ablate_cute(
     repeat: int,
 ) -> None:
     """Isolate CuTe window attn vs PyTorch SDPA (same Triton + matmul preset)."""
-    cases: list[tuple[str, str, bool | None]] = [
-        ("fp32", "fp32 baseline", None),
-        ("pytorch_autocast", "PyTorch autocast + SDPA", None),
-        ("tf32", "TF32 + Triton + CuTe attn", None),
-        ("tf32", "TF32 + Triton + SDPA (no CuTe)", False),
-        ("bf16_mixed", "BF16 MLP + Triton + CuTe attn", None),
-        ("bf16_mixed", "BF16 MLP + Triton + SDPA (no CuTe)", False),
+    cases: list[
+        tuple[str, str, bool | None, torch.dtype | None, str | None, dict[str, str]]
+    ] = [
+        ("fp32", "fp32 baseline", None, None, None, {}),
+        ("pytorch_autocast", "PyTorch autocast + SDPA", None, None, None, {}),
+        ("tf32", "TF32 + Triton + CuTe attn", None, None, None, {}),
+        ("tf32", "TF32 + Triton + SDPA (no CuTe)", False, None, None, {}),
+        ("bf16_mixed", "BF16 attention QKV/proj + BF16 MLP + CuTe attn", None, None, None, {}),
+        (
+            "bf16_mixed",
+            "Legacy BF16 MLP + CuTe BF16 attn + TF32 QKV/proj",
+            True,
+            None,
+            "bf16_mixed_legacy_tf32_qkv",
+            {"AURORA_BF16_MIXED_ATTENTION_LINEAR": "0"},
+        ),
+        (
+            "bf16_mixed",
+            "BF16 MLP + Triton + CuTe TF32 attn (no QKV BF16 cast)",
+            True,
+            torch.float32,
+            "bf16_mixed_cute_tf32",
+            {},
+        ),
+        ("bf16_mixed", "BF16 MLP + Triton + SDPA (no CuTe)", False, None, None, {}),
     ]
     baseline: dict[str, torch.Tensor] | None = None
     baseline_ms: float | None = None
@@ -441,18 +473,32 @@ def run_ablate_cute(
     print("CuTe ablation: same preset, toggle window attention only")
     print("=" * 72)
 
-    for precision, label, use_cute in cases:
-        tier_key = precision if use_cute is None else f"{precision}{'_cute' if use_cute else '_sdpa'}"
-        print(f"[run] {tier_key}: {label}...", flush=True)
-        pred, ms_per, peak_alloc, _reserved = run_tier(
-            precision=precision,
-            checkpoint=checkpoint,
-            batch=batch,
-            device=device,
-            warmup=warmup,
-            repeat=repeat,
-            use_cute_window_attn=use_cute,
+    for precision, label, use_cute, cute_dtype, explicit_key, env in cases:
+        tier_key = (
+            explicit_key
+            if explicit_key is not None
+            else precision if use_cute is None else f"{precision}{'_cute' if use_cute else '_sdpa'}"
         )
+        print(f"[run] {tier_key}: {label}...", flush=True)
+        old_env = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            pred, ms_per, peak_alloc, _reserved = run_tier(
+                precision=precision,
+                checkpoint=checkpoint,
+                batch=batch,
+                device=device,
+                warmup=warmup,
+                repeat=repeat,
+                use_cute_window_attn=use_cute,
+                cute_window_attn_dtype=cute_dtype,
+            )
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         all_preds[tier_key] = pred
         print(f"[run] {tier_key} forward={ms_per:.1f} ms peak={peak_alloc:.0f} MB", flush=True)
         if tier_key == "fp32":
@@ -472,6 +518,8 @@ def run_ablate_cute(
         "tf32",
         "tf32_sdpa",
         "bf16_mixed",
+        "bf16_mixed_legacy_tf32_qkv",
+        "bf16_mixed_cute_tf32",
         "bf16_mixed_sdpa",
     )
     print_per_variable_table("Per-variable max_abs vs fp32 baseline", baseline, all_preds, tier_order=focus)

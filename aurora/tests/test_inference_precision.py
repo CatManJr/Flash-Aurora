@@ -95,7 +95,7 @@ def test_tf32_preset_adds_cute() -> None:
     assert cfg.cuda_graph_scope == "backbone"
 
 
-def test_bf16_mixed_preset_is_hybrid_tf32_plus_mlp_bf16() -> None:
+def test_bf16_mixed_preset_is_attention_and_mlp_bf16_hybrid() -> None:
     cfg = resolve_inference_config("bf16_mixed")
     assert cfg is not None
     assert cfg.kernel_profile == "bf16_mixed_backbone"
@@ -330,6 +330,7 @@ def test_aurora_constructor_applies_bf16_mixed_preset() -> None:
     assert model.inference_config.backbone_matmul_tf32 is True
     block = model.backbone.encoder_layers[0].blocks[0]
     assert block.attn.cute_window_attn_dtype == torch.bfloat16
+    assert block.attn.use_cute_window_attn is True
 
 
 def test_aurora_constructor_applies_bf16_preset() -> None:
