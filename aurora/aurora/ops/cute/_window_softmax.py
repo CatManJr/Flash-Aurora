@@ -22,12 +22,12 @@ from cutlass import Float32, Int32, Uint8
 
 from quack import layout_utils
 
-# Swin shifted-window masks use -100; treat as hard mask (SDPA-equivalent) not a soft offset.
+# Swin shifted-window masks use finite -100 additive bias in the PyTorch SDPA path.
 WINDOW_ATTN_MASK_THRESHOLD = -50.0
 # Host packs ``(bias < threshold)`` into uint8 before the CuTe path (1 = masked, 0 = allowed).
 WINDOW_ATTN_MASK_U8_DTYPE = torch.uint8
-# Large finite sentinel (not -inf) so multi-pass online softmax avoids NaN from -inf - finite.
-WINDOW_ATTN_MASKED_LOGIT = -1.0e4
+# The current Aurora window attention callsites use scale_qk=1/sqrt(head_dim).
+WINDOW_ATTN_MASKED_BIAS = -100.0
 
 
 @cute.jit
@@ -105,6 +105,7 @@ def apply_swin_mask_u8_gmem(
     m_start: Int32,
     n_start: Int32,
     seqlen: Int32,
+    mask_bias_unscaled: Float32,
     n_always_valid: cutlass.Constexpr[bool] = False,
     rows_all_valid: bool = False,
 ) -> None:
@@ -115,22 +116,25 @@ def apply_swin_mask_u8_gmem(
     check for single-pass (``tile_n == seqlen``). ``rows_all_valid`` is a runtime
     predicate: when the whole m-block lies within ``seqlen`` (every m-block except
     the partial last one), the per-element row-bounds branch is skipped entirely.
+
+    PyTorch SDPA receives the Swin mask as a finite additive bias of ``-100`` after
+    QK scaling.  CuTe stores unscaled QK logits in ``acc_S``, so callers pass
+    ``mask_bias_unscaled = -100 / scale_qk``.
     """
     neg_inf = -Float32.inf
-    masked_logit = Float32(WINDOW_ATTN_MASKED_LOGIT)
     zero_u8 = Uint8(0)
 
     if cutlass.const_expr(n_always_valid):
         if rows_all_valid:
             for i in cutlass.range(cute.size(acc_S), unroll_full=True):
                 if mMask_w[m_start + tScS[i][0], n_start + tScS[i][1]] != zero_u8:
-                    acc_S[i] = masked_logit
+                    acc_S[i] = acc_S[i] + mask_bias_unscaled
         else:
             for i in cutlass.range(cute.size(acc_S), unroll_full=True):
                 m_idx = m_start + tScS[i][0]
                 if m_idx < seqlen:
                     if mMask_w[m_idx, n_start + tScS[i][1]] != zero_u8:
-                        acc_S[i] = masked_logit
+                        acc_S[i] = acc_S[i] + mask_bias_unscaled
                 else:
                     acc_S[i] = neg_inf
     else:
@@ -139,7 +143,7 @@ def apply_swin_mask_u8_gmem(
             m_idx = m_start + tScS[i][0]
             if (m_idx < seqlen) & (n_idx < seqlen):
                 if mMask_w[m_idx, n_idx] != zero_u8:
-                    acc_S[i] = masked_logit
+                    acc_S[i] = acc_S[i] + mask_bias_unscaled
             else:
                 acc_S[i] = neg_inf
 

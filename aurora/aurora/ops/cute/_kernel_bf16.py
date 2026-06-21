@@ -51,6 +51,7 @@ try:
         to_cute_tensor,
     )
     from ._window_softmax import (
+        WINDOW_ATTN_MASKED_BIAS,
         WindowOnlineSoftmax,
         apply_partial_kv_mask,
         apply_swin_mask_u8_gmem,
@@ -357,6 +358,7 @@ class WindowAttnFwdBf16:
             nW = mBias.shape[0]
             win_id = bwin_id % nW
             mMask_w = mBias[win_id, None, None]
+            mask_bias_unscaled = Float32(WINDOW_ATTN_MASKED_BIAS * math.sqrt(self.head_dim))
 
         acc_S = cute.make_rmem_tensor(
             thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
@@ -404,6 +406,7 @@ class WindowAttnFwdBf16:
             if cutlass.const_expr(mBias is not None):
                 apply_swin_mask_u8_gmem(
                     acc_S, tScS, mMask_w, m_start, Int32(0), seqlen,
+                    mask_bias_unscaled,
                     n_always_valid=self.single_kv_tile,
                     rows_all_valid=(m_start + self.tile_m <= seqlen),
                 )
@@ -481,7 +484,8 @@ class WindowAttnFwdBf16:
                         apply_partial_kv_mask(acc_S, tScS, n_start, seqlen)
                     if cutlass.const_expr(mBias is not None):
                         apply_swin_mask_u8_gmem(
-                            acc_S, tScS, mMask_w, m_start, n_start, seqlen
+                            acc_S, tScS, mMask_w, m_start, n_start, seqlen,
+                            mask_bias_unscaled,
                         )
 
                 row_scale = softmax.online_softmax(
@@ -1095,6 +1099,7 @@ class WindowAttnFwdBf16Stream:
                 nW = mBias.shape[0]
                 win_id = bwin_id % nW
                 mMask_w = mBias[win_id, None, None]
+                mask_bias_unscaled = Float32(WINDOW_ATTN_MASKED_BIAS * math.sqrt(self.head_dim))
 
             # cS/tScS: coordinate tensors for OOB masking and/or attention bias.
             if cutlass.const_expr(self.seq_len % self.tile_n != 0 or mBias is not None):
@@ -1122,6 +1127,7 @@ class WindowAttnFwdBf16Stream:
                 if cutlass.const_expr(mBias is not None):
                     apply_swin_mask_u8_gmem(
                         acc_S, tScS, mMask_w, m_start, Int32(0), seqlen,
+                        mask_bias_unscaled,
                         n_always_valid=self.single_kv_tile,
                         rows_all_valid=(m_start + self.tile_m <= seqlen),
                     )
@@ -1170,7 +1176,8 @@ class WindowAttnFwdBf16Stream:
                             apply_partial_kv_mask(acc_S, tScS, n_start, seqlen)
                         if cutlass.const_expr(mBias is not None):
                             apply_swin_mask_u8_gmem(
-                                acc_S, tScS, mMask_w, m_start, n_start, seqlen
+                                acc_S, tScS, mMask_w, m_start, n_start, seqlen,
+                                mask_bias_unscaled,
                             )
 
                     row_scale = softmax.online_softmax(

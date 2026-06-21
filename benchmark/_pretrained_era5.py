@@ -478,8 +478,8 @@ def run_ablate_cute(
 
     print()
     print("Interpretation:")
-    print("  - msl max_abs ~35 with CuTe preset but ~0.4 m/s on 10u/10v → see per-var table, not pooled max.")
-    print("  - If *_sdpa max_abs is good and preset/*_cute is bad → outlier is CuTe window attention.")
+    print("  - Compare each preset with its *_sdpa row to isolate CuTe window attention.")
+    print("  - Per-variable max_abs keeps msl outliers from hiding 10u/10v behavior.")
 
 
 def cuda_oom_like(exc: BaseException) -> bool:
