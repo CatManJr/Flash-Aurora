@@ -28,6 +28,13 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+download = [
+    "cdsapi",
+    "netcdf4",
+    "gcsfs",
+    "zarr",
+    "ecmwf-api-client",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

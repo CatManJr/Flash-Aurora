@@ -1,3 +1,3 @@
-from engine import AuroraEngine, EngineConfig
+from engine import AuroraEngine, DataDownloader, EngineConfig, IngestRequest
 
-__all__ = ["AuroraEngine", "EngineConfig"]
+__all__ = ["AuroraEngine", "DataDownloader", "EngineConfig", "IngestRequest"]

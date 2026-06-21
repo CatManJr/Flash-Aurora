@@ -39,6 +39,14 @@ CDS_ERA5_STATIC_FIELDS: tuple[tuple[str, str], ...] = tuple(
 )
 
 
+def open_ingress_netcdf(path: Path) -> xr.Dataset:
+    """Open cached ingress NetCDF, falling back to netcdf4 for CDS downloads."""
+    try:
+        return xr.open_dataset(path, engine=NETCDF_ENGINE)
+    except (ValueError, OSError, KeyError, ImportError):
+        return xr.open_dataset(path, engine="netcdf4")
+
+
 class CdsEra5Adapter:
     """Build a Batch from cached CDS ERA5 NetCDF files (example_era5 layout)."""
 
@@ -50,9 +58,9 @@ class CdsEra5Adapter:
                     f"Missing ERA5 input {path}. Download with CDS API or set IngestRequest.raw_paths."
                 )
 
-        with xr.open_dataset(paths.surface, engine=NETCDF_ENGINE) as surf_ds, xr.open_dataset(
-            paths.atmospheric, engine=NETCDF_ENGINE
-        ) as atmos_ds, xr.open_dataset(paths.static, engine=NETCDF_ENGINE) as static_ds:
+        with open_ingress_netcdf(paths.surface) as surf_ds, open_ingress_netcdf(
+            paths.atmospheric
+        ) as atmos_ds, open_ingress_netcdf(paths.static) as static_ds:
             return self._build_batch(
                 surf_ds=surf_ds,
                 atmos_ds=atmos_ds,

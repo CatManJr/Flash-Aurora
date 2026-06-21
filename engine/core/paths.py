@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from engine.core.redaction import redact_text, safe_path
+
 FETCHED_DIR_NAME = "fetched"
 
 ENV_ASSET_ROOT_KEYS = ("AURORA_HF_LOCAL_DIR", "FLASH_AURORA_ASSET_ROOT")
@@ -93,8 +95,10 @@ class AssetStore:
             return local
         if not allow_download:
             raise FileNotFoundError(
-                f"Missing {filename!r} under {root}. "
-                "Place the file there, set asset_root, or enable allow_hub_download."
+                redact_text(
+                    f"Missing {filename!r} under {safe_path(root)}. "
+                    "Place the file there, set asset_root, or enable allow_hub_download."
+                )
             )
         from huggingface_hub import hf_hub_download
 
