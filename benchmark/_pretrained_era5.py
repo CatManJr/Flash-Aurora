@@ -265,6 +265,42 @@ def print_official_tol_table(title: str, rows: list[tuple[str, float, float, flo
     print(f"  summary: {passed}/{len(rows)} variables within official tolerance")
 
 
+def per_variable_diff_rows(
+    reference: dict[str, torch.Tensor],
+    candidate: dict[str, torch.Tensor],
+) -> list[tuple[str, float, float]]:
+    """Per-variable max and mean absolute error vs reference."""
+    rows: list[tuple[str, float, float]] = []
+    for group, name in _OFFICIAL_VAR_ORDER:
+        key = f"{group}.{name}"
+        err = (candidate[key] - reference[key]).abs()
+        rows.append((name, float(err.max().item()), float(err.mean().item())))
+    return rows
+
+
+def print_per_variable_table(
+    title: str,
+    baseline: dict[str, torch.Tensor],
+    preds_by_tier: dict[str, dict[str, torch.Tensor]],
+    *,
+    tier_order: tuple[str, ...] | None = None,
+) -> None:
+    """Print per-variable max_abs (and mean_abs) so msl outliers do not hide wind errors."""
+    keys = tier_order or tuple(preds_by_tier)
+    print(f"\n{title}")
+    var_names = [name for _group, name in _OFFICIAL_VAR_ORDER]
+    header = f"  {'tier':<28}" + "".join(f"{name:>10}" for name in var_names)
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for tier_key in keys:
+        if tier_key not in preds_by_tier:
+            continue
+        by_name = {n: mx for n, mx, _mn in per_variable_diff_rows(baseline, preds_by_tier[tier_key])}
+        line = f"  {tier_key:<28}" + "".join(f"{by_name.get(name, float('nan')):10.4g}" for name in var_names)
+        print(line)
+    print(f"  (max_abs vs baseline; vars: {' '.join(var_names)})")
+
+
 def print_summary_table(
     rows: list[tuple[str, str, float, float, float, float, float, float | None]],
 ) -> None:
@@ -286,10 +322,27 @@ def print_summary_table(
         print(f"  {key}: {label}")
 
 
-def build_model(precision: str, checkpoint: Path, device: torch.device) -> Any:
+def set_cute_window_attn(model: Any, enabled: bool) -> None:
+    """Toggle CuTe window attention without changing matmul preset hooks."""
+    backbone = model.backbone
+    backbone.use_cute_window_attn = enabled
+    for module in backbone.modules():
+        if hasattr(module, "use_cute_window_attn"):
+            module.use_cute_window_attn = enabled
+
+
+def build_model(
+    precision: str,
+    checkpoint: Path,
+    device: torch.device,
+    *,
+    use_cute_window_attn: bool | None = None,
+) -> Any:
     from aurora import AuroraPretrained
 
     model = AuroraPretrained(use_lora=False, inference_precision=precision)
+    if use_cute_window_attn is not None:
+        set_cute_window_attn(model, use_cute_window_attn)
     model.load_checkpoint_local(str(checkpoint), strict=True)
     model.eval()
     return model.to(device)
@@ -344,8 +397,14 @@ def run_tier(
     device: torch.device,
     warmup: int,
     repeat: int,
+    use_cute_window_attn: bool | None = None,
 ) -> tuple[dict[str, torch.Tensor], float, float, float]:
-    model = build_model(precision, checkpoint, device)
+    model = build_model(
+        precision,
+        checkpoint,
+        device,
+        use_cute_window_attn=use_cute_window_attn,
+    )
     try:
         pred, ms_per, peak_alloc, peak_reserved = time_forward(
             model, batch, warmup=warmup, repeat=repeat, device=device
@@ -353,6 +412,74 @@ def run_tier(
         return prediction_tensors(pred), ms_per, peak_alloc, peak_reserved
     finally:
         purge_gpu(model)
+
+
+def run_ablate_cute(
+    *,
+    checkpoint: Path,
+    batch: Any,
+    device: torch.device,
+    warmup: int,
+    repeat: int,
+) -> None:
+    """Isolate CuTe window attn vs PyTorch SDPA (same Triton + matmul preset)."""
+    cases: list[tuple[str, str, bool | None]] = [
+        ("fp32", "fp32 baseline", None),
+        ("pytorch_autocast", "PyTorch autocast + SDPA", None),
+        ("tf32", "TF32 + Triton + CuTe attn", None),
+        ("tf32", "TF32 + Triton + SDPA (no CuTe)", False),
+        ("bf16_mixed", "BF16 MLP + Triton + CuTe attn", None),
+        ("bf16_mixed", "BF16 MLP + Triton + SDPA (no CuTe)", False),
+    ]
+    baseline: dict[str, torch.Tensor] | None = None
+    baseline_ms: float | None = None
+    all_preds: dict[str, dict[str, torch.Tensor]] = {}
+    rows: list[tuple[str, str, float, float, float, float, float, float | None]] = []
+
+    print()
+    print("=" * 72)
+    print("CuTe ablation: same preset, toggle window attention only")
+    print("=" * 72)
+
+    for precision, label, use_cute in cases:
+        tier_key = precision if use_cute is None else f"{precision}{'_cute' if use_cute else '_sdpa'}"
+        print(f"[run] {tier_key}: {label}...", flush=True)
+        pred, ms_per, peak_alloc, _reserved = run_tier(
+            precision=precision,
+            checkpoint=checkpoint,
+            batch=batch,
+            device=device,
+            warmup=warmup,
+            repeat=repeat,
+            use_cute_window_attn=use_cute,
+        )
+        all_preds[tier_key] = pred
+        print(f"[run] {tier_key} forward={ms_per:.1f} ms peak={peak_alloc:.0f} MB", flush=True)
+        if tier_key == "fp32":
+            baseline = pred
+            baseline_ms = ms_per
+            rows.append((tier_key, label, ms_per, None, 0.0, 0.0, 0.0, 1.0))
+            continue
+        assert baseline is not None and baseline_ms is not None
+        max_abs, mean_abs, max_rel, cos = diff_vs_reference(baseline, pred)
+        rows.append((tier_key, label, ms_per, baseline_ms / ms_per, max_abs, mean_abs, max_rel, cos))
+
+    print_summary_table(rows)
+
+    assert baseline is not None
+    focus = (
+        "pytorch_autocast",
+        "tf32",
+        "tf32_sdpa",
+        "bf16_mixed",
+        "bf16_mixed_sdpa",
+    )
+    print_per_variable_table("Per-variable max_abs vs fp32 baseline", baseline, all_preds, tier_order=focus)
+
+    print()
+    print("Interpretation:")
+    print("  - msl max_abs ~35 with CuTe preset but ~0.4 m/s on 10u/10v → see per-var table, not pooled max.")
+    print("  - If *_sdpa max_abs is good and preset/*_cute is bad → outlier is CuTe window attention.")
 
 
 def cuda_oom_like(exc: BaseException) -> bool:

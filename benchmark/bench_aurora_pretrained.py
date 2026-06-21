@@ -17,6 +17,9 @@ Examples::
 
     uv run python benchmark/bench_aurora_pretrained.py --suite legacy --warmup 1 --repeat 1
     uv run python benchmark/bench_aurora_pretrained.py --tiers tf32 bf16_mixed@fp32
+
+    # CuTe window attn vs SDPA (per-variable max_abs table)
+    uv run python benchmark/bench_aurora_pretrained.py --ablate-cute --warmup 1 --repeat 1
 """
 
 from __future__ import annotations
@@ -44,8 +47,10 @@ from _pretrained_era5 import (  # noqa: E402
     load_era5_batch,
     official_tol_rows,
     print_official_tol_table,
+    print_per_variable_table,
     print_summary_table,
     purge_gpu,
+    run_ablate_cute,
     run_tier,
     tiers_from_args,
 )
@@ -98,6 +103,16 @@ def main() -> None:
         action="store_true",
         help="Skip per-variable tolerance tables vs fp32 baseline",
     )
+    parser.add_argument(
+        "--no-per-var",
+        action="store_true",
+        help="Skip per-variable max_abs table after the summary (default: print)",
+    )
+    parser.add_argument(
+        "--ablate-cute",
+        action="store_true",
+        help="CuTe window attn vs SDPA ablation on tf32/bf16_mixed (instead of tier suite)",
+    )
     parser.add_argument("--warmup", type=int, default=1, help="Warmup forwards before timing (default: 1)")
     parser.add_argument("--repeat", type=int, default=3, help="Timed forwards per tier (default: 3)")
     args = parser.parse_args()
@@ -126,6 +141,17 @@ def main() -> None:
     print(f"[config] checkpoint={checkpoint}")
     print(f"[config] valid_time={valid_time} time_index={args.time_index}")
     print(f"[config] timing warmup={args.warmup} repeat={args.repeat}")
+
+    if args.ablate_cute:
+        run_ablate_cute(
+            checkpoint=checkpoint,
+            batch=batch,
+            device=device,
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
+        purge_gpu(batch)
+        return
 
     try:
         tier_list = tiers_from_args(args)
@@ -173,6 +199,15 @@ def main() -> None:
         rows.append((key, label, ms_per, baseline_ms / ms_per, max_abs, mean_abs, max_rel, cos))
 
     print_summary_table(rows)
+
+    if baseline is not None and not args.no_per_var:
+        non_baseline = tuple(k for k in all_preds if k != baseline_key)
+        print_per_variable_table(
+            f"Per-variable max_abs vs {baseline_key}",
+            baseline,
+            all_preds,
+            tier_order=non_baseline,
+        )
 
     if not args.no_official_tol and baseline is not None:
         for tier_key, pred in all_preds.items():
