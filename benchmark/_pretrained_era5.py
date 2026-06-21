@@ -29,7 +29,7 @@ _LEGACY_NAMED_TIERS: tuple[tuple[str, str, str], ...] = (
     ("fast_fp32", "fast_fp32", "Triton layout + AdaLN + PyTorch GELU"),
     ("tf32", "tf32", "fast_fp32 + TF32 matmul + CuTe TF32 attn"),
     ("bf16_mixed", "bf16_mixed", "hybrid: BF16 attention QKV/proj + BF16 MLP"),
-    ("bf16", "bf16", "full backbone BF16 linears + CuTe BF16 attn"),
+    ("bf16", "bf16", "full backbone BF16 + fused CuTe attn (quant-prep)"),
     ("pytorch_autocast", "pytorch_autocast", "PyTorch backbone BF16 autocast"),
 )
 

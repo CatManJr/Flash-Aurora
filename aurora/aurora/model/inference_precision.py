@@ -427,7 +427,10 @@ def describe_backbone_matmul_level(level: BackboneMatmulLevel) -> str:
         return "backbone matmul TF32 tensor cores"
     if level == BackboneMatmulLevel.BF16_MIXED:
         return "backbone matmul hybrid: BF16 attention QKV/proj + BF16 MLP; TF32 elsewhere"
-    return "backbone matmul BF16 (all Swin linears)"
+    return (
+        "backbone matmul full BF16 (all Swin linears + fused CuTe attn; "
+        "quant-prep / GeForce-oriented)"
+    )
 
 
 def describe_encoder_decoder_matmul_level(level: EncoderDecoderMatmulLevel) -> str:

@@ -3,8 +3,8 @@
 Custom Triton/CuTe Swin paths never run inside ``torch.autocast``.
 
 * ``bf16_mixed`` — hybrid: BF16 WindowAttention QKV/proj + MLP; other linears TF32.
-* ``bf16`` — all backbone ``F.linear`` in BF16.
-* AdaLN/LN boundaries stay FP32 on both BF16 presets.
+* ``bf16`` — speed / quant-prep tier: all backbone ``F.linear`` in BF16, fused CuTe
+  attention chain (no mid-attn FP32 cast), entry cast to BF16; AdaLN/residual stay FP32.
 * ``tf32`` — FP32 activations, TF32 backbone + E/D linears.
 """
 
@@ -45,6 +45,50 @@ def backbone_bf16_matmul_active() -> bool:
 def backbone_bf16_hybrid_matmul_active() -> bool:
     """True for ``bf16_mixed`` (BF16 attention/MLP; TF32 otherwise)."""
     return _bf16_matmul_routing.get() and _bf16_hybrid_matmul.get()
+
+
+def backbone_bf16_full_matmul_active() -> bool:
+    """True for ``bf16`` (all backbone linears BF16, no TF32 hybrid hooks)."""
+    return _bf16_matmul_routing.get() and not _bf16_hybrid_matmul.get()
+
+
+def backbone_bf16_speed_stream_active() -> bool:
+    """Optional BF16 activation stream between AdaLN islands (``bf16`` only).
+
+    Opt-in via ``AURORA_BF16_SPEED_STREAM=1``; default off until tol-validated for production.
+    """
+    if not backbone_bf16_full_matmul_active():
+        return False
+    return os.environ.get("AURORA_BF16_SPEED_STREAM", "0") == "1"
+
+
+def use_bf16_fused_attention_chain(
+    *,
+    use_cute_window_attn: bool,
+    cute_window_attn_dtype: torch.dtype,
+    is_cuda: bool,
+) -> bool:
+    """QKV → CuTe attn → proj without an intermediate FP32 cast."""
+    if not (
+        use_cute_window_attn
+        and cute_window_attn_dtype == torch.bfloat16
+        and is_cuda
+        and not torch.is_grad_enabled()
+    ):
+        return False
+    if backbone_bf16_full_matmul_active():
+        return True
+    return (
+        backbone_bf16_hybrid_matmul_active()
+        and bf16_mixed_attention_linear_enabled()
+    )
+
+
+def downcast_bf16_speed_activation(tensor: torch.Tensor) -> torch.Tensor:
+    """Restore BF16 activation stream after an FP32 AdaLN/LN island."""
+    if backbone_bf16_speed_stream_active() and tensor.dtype == torch.float32:
+        return cast_activation_dtype(tensor, torch.bfloat16)
+    return tensor
 
 
 def bf16_mixed_attention_linear_enabled() -> bool:
@@ -401,7 +445,9 @@ def run_backbone_with_dtype_routing(
                 )
             return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
 
-        if (
+        if backbone_matmul_bf16 and not backbone_matmul_tf32 and not autocast:
+            x = prepare_backbone_input(x, torch.bfloat16)
+        elif (
             backbone_compute_dtype is not None
             and not backbone_matmul_bf16
             and x.dtype != backbone_compute_dtype

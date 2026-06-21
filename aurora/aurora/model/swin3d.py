@@ -270,19 +270,16 @@ class WindowAttention(nn.Module):
         """
         from aurora.model.custom_op_paths import (
             backbone_bf16_attention_matmul_scope,
-            backbone_bf16_hybrid_matmul_active,
             backbone_bf16_matmul_active,
-            bf16_mixed_attention_linear_enabled,
+            backbone_bf16_speed_stream_active,
             cast_activation_dtype,
+            use_bf16_fused_attention_chain,
         )
 
-        use_bf16_attention_linear = (
-            backbone_bf16_hybrid_matmul_active()
-            and bf16_mixed_attention_linear_enabled()
-            and self.use_cute_window_attn
-            and self.cute_window_attn_dtype == torch.bfloat16
-            and x.is_cuda
-            and not torch.is_grad_enabled()
+        use_bf16_fused_chain = use_bf16_fused_attention_chain(
+            use_cute_window_attn=self.use_cute_window_attn,
+            cute_window_attn_dtype=self.cute_window_attn_dtype,
+            is_cuda=x.is_cuda,
         )
         bf16_cute_attn = (
             backbone_bf16_matmul_active()
@@ -290,13 +287,13 @@ class WindowAttention(nn.Module):
             and x.is_cuda
             and not torch.is_grad_enabled()
         )
-        # bf16: all linears BF16; bf16_mixed: attention/MLP BF16, TF32 elsewhere.
+        # bf16 speed stream keeps BF16 activations; bf16_mixed keeps FP32 between blocks.
         if x.dtype == torch.bfloat16 and not bf16_cute_attn:
             x = cast_activation_dtype(x, torch.float32)
 
         qkv_scope = (
             backbone_bf16_attention_matmul_scope()
-            if use_bf16_attention_linear
+            if use_bf16_fused_chain
             else contextlib.nullcontext()
         )
         with qkv_scope:
@@ -387,13 +384,13 @@ class WindowAttention(nn.Module):
             else:
                 x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
             x = rearrange(x, "B H N D -> B N (H D)")
-        # AdaLN requires FP32 branch input.  In the experimental bf16 attention-linear
-        # path, keep proj in BF16 too and promote once after proj instead.
-        if bf16_cute_attn and not use_bf16_attention_linear and x.dtype == torch.bfloat16:
+        # AdaLN requires FP32 branch input.  Fused BF16 chain keeps proj in BF16 and
+        # promotes once after proj instead of casting attn output to FP32 mid-chain.
+        if bf16_cute_attn and not use_bf16_fused_chain and x.dtype == torch.bfloat16:
             x = cast_activation_dtype(x, torch.float32)
         proj_scope = (
             backbone_bf16_attention_matmul_scope()
-            if use_bf16_attention_linear
+            if use_bf16_fused_chain
             else contextlib.nullcontext()
         )
         with proj_scope:
@@ -407,7 +404,7 @@ class WindowAttention(nn.Module):
                 )
             else:
                 x = self.proj(x) + self.lora_proj(x, rollout_step)
-        if use_bf16_attention_linear and x.dtype == torch.bfloat16:
+        if use_bf16_fused_chain and x.dtype == torch.bfloat16 and not backbone_bf16_speed_stream_active():
             x = cast_activation_dtype(x, torch.float32)
         x = self.proj_drop(x)
         return x

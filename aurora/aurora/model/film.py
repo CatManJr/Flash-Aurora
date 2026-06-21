@@ -55,6 +55,11 @@ class AdaptiveLayerNorm(nn.Module):
 
         return cast_activation_dtype(x, torch.float32)
 
+    def _finalize_adaln_output(self, x: torch.Tensor) -> torch.Tensor:
+        from aurora.model.custom_op_paths import downcast_bf16_speed_activation
+
+        return downcast_bf16_speed_activation(x)
+
     def _use_triton_film(self, x: torch.Tensor) -> bool:
         from aurora.model.custom_op_paths import triton_elemwise_dtype_ok
 
@@ -79,15 +84,19 @@ class AdaptiveLayerNorm(nn.Module):
         if self._use_triton_film_fp32_out(x):
             from aurora.ops.triton_adaln import adaptive_layernorm_film_forward
 
-            return adaptive_layernorm_film_forward(
-                x,
-                scale,
-                shift,
-                float(self.scale_bias),
-                float(self.ln.eps),
-                output_fp32=True,
+            return self._finalize_adaln_output(
+                adaptive_layernorm_film_forward(
+                    x,
+                    scale,
+                    shift,
+                    float(self.scale_bias),
+                    float(self.ln.eps),
+                    output_fp32=True,
+                )
             )
-        return self.ln(x) * (self.scale_bias + scale) + shift
+        return self._finalize_adaln_output(
+            self.ln(x) * (self.scale_bias + scale) + shift
+        )
 
     def forward_add_residual(
         self, residual: torch.Tensor, x: torch.Tensor, c: torch.Tensor
@@ -115,13 +124,16 @@ class AdaptiveLayerNorm(nn.Module):
         ):
             from aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
-            return adaptive_layernorm_film_add_residual_forward(
-                residual,
-                x,
-                scale,
-                shift,
-                float(self.scale_bias),
-                float(self.ln.eps),
-                output_fp32=True,
+            return self._finalize_adaln_output(
+                adaptive_layernorm_film_add_residual_forward(
+                    residual,
+                    x,
+                    scale,
+                    shift,
+                    float(self.scale_bias),
+                    float(self.ln.eps),
+                    output_fp32=True,
+                )
             )
-        return residual + self.ln(x) * (self.scale_bias + scale) + shift
+        branch = self.ln(x) * (self.scale_bias + scale) + shift
+        return residual + self._finalize_adaln_output(branch)
