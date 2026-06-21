@@ -21,6 +21,13 @@ fetched/
 aurora/.github
 cuda-keyring_1.1-1_all.deb
 
+# Local notebook experiments (engine / AutoDL testing; not for commit)
+*.ipynb
+.ipynb_checkpoints/
+
+# Default rollout export dir from example notebooks
+output/
+
 # Nsight Systems / Compute profiling outputs
 profiling/nsight/
 *.nsys-rep
@@ -30,3 +37,4 @@ profiling/nsight/
 *.qdrep
 profiling/*.json
 profiling/*.md
+.vscode/settings.json
