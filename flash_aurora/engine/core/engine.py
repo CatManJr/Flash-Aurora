@@ -19,6 +19,13 @@ from flash_aurora.engine.ingress.build_ic import InitialConditionBuilder
 from flash_aurora.engine.ingress.adapters import IngestRequest
 from flash_aurora.engine.ingress.validator import BatchValidator
 from flash_aurora.engine.runtime.graph_pool import GraphPool
+from flash_aurora.engine.runtime.gpu_guard import (
+    GpuGuardRegistry,
+    GpuGuardTicket,
+    gpu_guard_enabled,
+    resolve_guard_dir,
+    try_local_cuda_cleanup,
+)
 
 
 class AuroraEngine:
@@ -36,6 +43,7 @@ class AuroraEngine:
         self._validator = BatchValidator(config.variant)
         self._graph_pool = GraphPool()
         self._exporter = RolloutExporter(self._resolved_export_dir())
+        self._gpu_ticket: GpuGuardTicket | None = None
 
     def _resolved_export_dir(self) -> Path:
         return normalize_user_path(
@@ -87,7 +95,9 @@ class AuroraEngine:
             config.hf_token = hf_token
         if inference_precision is not None:
             config.inference_precision = inference_precision
-        return cls(config, presets=registry)
+        engine = cls(config, presets=registry)
+        engine.config.preset_name = name
+        return engine
 
     @property
     def fetched_dir(self) -> Path:
@@ -109,7 +119,46 @@ class AuroraEngine:
             raise RuntimeError("Call load() before using the model.")
         return self._model
 
-    def load(self) -> Aurora:
+    def _device_index(self) -> int:
+        device = self.config.device
+        if device.startswith("cuda:"):
+            return int(device.split(":", 1)[1])
+        return 0
+
+    def acquire_gpu(self, *, rollout_steps: int | None = None) -> GpuGuardTicket | None:
+        """Reserve GPU memory across processes (share small jobs, queue large ones)."""
+        if self._gpu_ticket is not None:
+            return self._gpu_ticket
+        if not self.config.gpu_guard or not gpu_guard_enabled():
+            return None
+        steps = self.config.gpu_rollout_steps if rollout_steps is None else rollout_steps
+        preset = self.config.preset_name or self.config.variant.name
+        registry = GpuGuardRegistry(resolve_guard_dir(self.config.asset_root))
+        self._gpu_ticket = registry.acquire(
+            device_index=self._device_index(),
+            preset=preset,
+            variant=self.config.variant,
+            rollout_steps=steps,
+            timeout=self.config.gpu_guard_timeout,
+        )
+        return self._gpu_ticket
+
+    def release_gpu(self, *, move_model_to_cpu: bool = True) -> None:
+        """Release the cross-process GPU lease and optionally free local CUDA cache."""
+        if self._gpu_ticket is not None:
+            self._gpu_ticket.release()
+            self._gpu_ticket = None
+        if move_model_to_cpu and self._model is not None:
+            self._model.cpu()
+        try_local_cuda_cleanup(device_index=self._device_index())
+
+    def gpu_guard_status(self):
+        """Return active leases and queue entries for this engine's device."""
+        registry = GpuGuardRegistry(resolve_guard_dir(self.config.asset_root))
+        return registry.status(device_index=self._device_index())
+
+    def load(self, *, rollout_steps: int | None = None) -> Aurora:
+        self.acquire_gpu(rollout_steps=rollout_steps)
         model = self._loader.build_model()
         self._loader.load(model)
         device = torch.device(self.config.device)
@@ -148,6 +197,9 @@ class AuroraEngine:
         steps: int,
         observers: Iterable[RolloutObserver] | None = None,
     ) -> Generator[Batch, None, None]:
+        self.acquire_gpu(rollout_steps=steps)
+        if self._gpu_ticket is not None:
+            self._gpu_ticket.heartbeat()
         self.validate(batch)
         session = RolloutSession(self.model, observers)
         yield from session.run(batch, steps)

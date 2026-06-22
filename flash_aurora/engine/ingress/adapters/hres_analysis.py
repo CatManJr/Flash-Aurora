@@ -15,6 +15,10 @@ from flash_aurora.engine.core.paths import AssetStore
 from flash_aurora.engine.ingress.adapters.base import resolve_cache_dir
 from flash_aurora.engine.ingress.adapters.era5 import CdsEra5Adapter
 from flash_aurora.engine.ingress.adapters.request import IngestRequest
+from flash_aurora.engine.ingress.download.grib_preprocess import (
+    GRIB_SURF_FIELDS,
+    materialize_hres_01_netcdf,
+)
 from flash_aurora.engine.ingress.static import StaticFieldLoader
 
 
@@ -42,12 +46,6 @@ class HresAnalysisPaths:
         return self.cache_dir / f"atmos_{var}_{self.day}_{hour:02d}.grib"
 
 
-GRIB_SURF_FIELDS: tuple[tuple[str, str], ...] = (
-    ("2t", "t2m"),
-    ("10u", "u10"),
-    ("10v", "v10"),
-    ("msl", "msl"),
-)
 
 
 class GribHresAnalysisAdapter:
@@ -59,6 +57,12 @@ class GribHresAnalysisAdapter:
 
     def build_initial_batch(self, request: IngestRequest, config: EngineConfig) -> Batch:
         paths = self._resolve_paths(request, config)
+        if not self._has_netcdf_cache(paths) and self._has_grib_cache(paths):
+            materialize_hres_01_netcdf(
+                paths.cache_dir,
+                paths.day,
+                levels=config.variant.levels,
+            )
         if self._has_netcdf_cache(paths):
             batch = self._build_from_netcdf(paths, config, request)
         elif self._has_grib_cache(paths):
@@ -132,14 +136,19 @@ class GribHresAnalysisAdapter:
         config: EngineConfig,
         request: IngestRequest,
     ) -> Batch:
+        from flash_aurora.engine.ingress.download.grib_preprocess import CFGRIB_ENGINE, require_cfgrib
+
+        require_cfgrib()
         try:
-            with xr.open_dataset(paths.surf_grib("2t"), engine="cfgrib") as ref_ds:
+            with xr.open_dataset(paths.surf_grib("2t"), engine=CFGRIB_ENGINE) as ref_ds:
                 lat = CdsEra5Adapter._coord_tensor(ref_ds.latitude.values)
                 lon = CdsEra5Adapter._coord_tensor(ref_ds.longitude.values)
-        except ImportError as exc:
-            raise ImportError(
-                "Reading GRIB inputs requires cfgrib. Install with: pip install cfgrib"
-            ) from exc
+        except ValueError as exc:
+            if "unrecognized engine" in str(exc) and CFGRIB_ENGINE in str(exc):
+                raise ImportError(
+                    "Reading GRIB inputs requires cfgrib. Install with: uv pip install cfgrib"
+                ) from exc
+            raise
 
         surf_vars = {
             aurora: self._load_surf_grib(paths, aurora, file_var)
@@ -222,7 +231,9 @@ class GribHresAnalysisAdapter:
         return torch.from_numpy(np.ascontiguousarray(stacked)[None])
 
     def _load_surf_grib(self, paths: HresAnalysisPaths, aurora: str, file_var: str) -> torch.Tensor:
-        with xr.open_dataset(paths.surf_grib(aurora), engine="cfgrib") as dataset:
+        from flash_aurora.engine.ingress.download.grib_preprocess import CFGRIB_ENGINE
+
+        with xr.open_dataset(paths.surf_grib(aurora), engine=CFGRIB_ENGINE) as dataset:
             data = np.ascontiguousarray(dataset[file_var].values[:2][None])
         return torch.from_numpy(data)
 
@@ -232,8 +243,10 @@ class GribHresAnalysisAdapter:
         var: str,
         levels: tuple[int | float, ...],
     ) -> torch.Tensor:
-        with xr.open_dataset(paths.atmos_grib(var, 0), engine="cfgrib") as ds_00, xr.open_dataset(
-            paths.atmos_grib(var, 6), engine="cfgrib"
+        from flash_aurora.engine.ingress.download.grib_preprocess import CFGRIB_ENGINE
+
+        with xr.open_dataset(paths.atmos_grib(var, 0), engine=CFGRIB_ENGINE) as ds_00, xr.open_dataset(
+            paths.atmos_grib(var, 6), engine=CFGRIB_ENGINE
         ) as ds_06:
             level_name = self._level_coord(ds_00)
             frame_00 = ds_00[var].sel({level_name: list(levels)}).values

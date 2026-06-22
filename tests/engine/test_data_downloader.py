@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -277,3 +278,127 @@ def test_ensure_accepts_cds_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         downloader.ensure(valid_time, cache_dir=cache, cds_api_key="abc12345")
 
     mocked.assert_called_once()
+
+
+def test_grib_ifs_expected_paths_use_grib_layout(tmp_path: Path) -> None:
+    config = DEFAULT_PRESETS.get("hres_0.1")
+    valid_time = datetime(2022, 5, 11, 6)
+    cache = tmp_path / "hres_0.1"
+    paths = expected_paths(config.source, valid_time, cache)
+    assert paths["surf_2t"].name == "surf_2t_2022-05-11.grib"
+    assert paths["atmos_t_06"].name == "atmos_t_2022-05-11_06.grib"
+
+
+def test_missing_hres_01_detects_absent_grib_files(tmp_path: Path) -> None:
+    config = DEFAULT_PRESETS.get("hres_0.1")
+    valid_time = datetime(2022, 5, 11, 6)
+    cache = tmp_path / "hres_0.1"
+    cache.mkdir()
+    missing = missing_keys(config.source, valid_time, cache)
+    assert "surf_2t" in missing
+    assert "atmos_t_00" in missing
+
+
+def test_missing_hres_01_skips_when_netcdf_cache_complete(tmp_path: Path) -> None:
+    config = DEFAULT_PRESETS.get("hres_0.1")
+    valid_time = datetime(2022, 5, 11, 6)
+    cache = tmp_path / "hres_0.1"
+    cache.mkdir()
+    for name in (
+        "2022-05-11-surface-level.nc",
+        "2022-05-11-atmospheric-00.nc",
+        "2022-05-11-atmospheric-06.nc",
+    ):
+        (cache / name).write_bytes(b"nc")
+    assert missing_keys(config.source, valid_time, cache) == ()
+
+
+def test_grib_ifs_backend_downloads_when_missing(tmp_path: Path) -> None:
+    config = DEFAULT_PRESETS.get("hres_0.1")
+    downloader = DataDownloader(config)
+    valid_time = datetime(2022, 5, 11, 6)
+    cache = tmp_path / "hres_0.1"
+
+    def fake_download(cache_dir: Path, day: str):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        paths = expected_paths(config.source, valid_time, cache_dir)
+        for path in paths.values():
+            path.write_bytes(b"grib")
+        return paths
+
+    with patch(
+        "flash_aurora.engine.ingress.download.backends.grib_ifs.download_ifs_analysis_day",
+        side_effect=fake_download,
+    ):
+        result = downloader.ensure(valid_time, cache_dir=cache)
+
+    assert result.complete
+    assert result.downloaded
+    assert result.paths["surf_2t"].is_file()
+
+
+def test_grib_ifs_urls_match_upstream_layout() -> None:
+    from flash_aurora.engine.ingress.download.grib_ifs import atmos_grib_url, surf_grib_url
+
+    date = datetime(2022, 5, 11, 6)
+    assert surf_grib_url(date, "2t").endswith("ec.oper.an.sfc.128_167_2t.regn1280sc.20220511.grb")
+    assert atmos_grib_url(date, "t", 6).endswith("ec.oper.an.pl.128_130_t.regn1280sc.2022051106.grb")
+    assert atmos_grib_url(date, "u", 12).endswith("ec.oper.an.pl.128_131_u.regn1280uv.2022051112.grb")
+
+
+def test_mars_client_accepts_explicit_ecmwf_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.credentials import DownloadCredentials, use_download_credentials
+    from flash_aurora.engine.ingress.download.mars import mars_service
+
+    monkeypatch.delenv("ECMWF_API_KEY", raising=False)
+    with patch("flash_aurora.engine.ingress.download.mars.require_ecmwfapi") as mocked:
+        mocked.return_value.ECMWFService.return_value = MagicMock()
+        with use_download_credentials(
+            DownloadCredentials(ecmwf_api_key="secret-key", ecmwf_email="user@example.com")
+        ):
+            with mars_service() as client:
+                assert client is mocked.return_value.ECMWFService.return_value
+        mocked.return_value.ECMWFService.assert_called_once()
+
+
+def test_fetch_bytes_retries_without_verify_on_ucar_ssl_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from requests.exceptions import SSLError
+
+    import flash_aurora.engine.ingress.download.http as http_module
+    from flash_aurora.engine.ingress.download.http import fetch_bytes
+
+    http_module._ucar_insecure_tls = False
+    http_module._insecure_warnings_suppressed = False
+    url = (
+        "https://data.rda.ucar.edu/d113001/ec.oper.an.sfc/202205/"
+        "ec.oper.an.sfc.128_167_2t.regn1280sc.20220511.grb"
+    )
+    calls: list[bool] = []
+
+    class FakeResponse:
+        def __init__(self, payload: bytes) -> None:
+            self.content = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_get(target: str, *, timeout: float, verify: bool, stream: bool = False):
+        calls.append(verify)
+        if verify:
+            raise SSLError("certificate has expired")
+        return FakeResponse(b"grib")
+
+    import requests
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setenv("FLASH_AURORA_SSL_VERIFY", "1")
+
+    with pytest.warns(UserWarning, match="UCAR RDA TLS"):
+        assert fetch_bytes(url, timeout=10, progress=False) == b"grib"
+    assert calls == [True, False]
+
+    calls.clear()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert fetch_bytes(url, timeout=10, progress=False) == b"grib"
+    assert calls == [False]

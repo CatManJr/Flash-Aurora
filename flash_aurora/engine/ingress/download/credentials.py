@@ -69,6 +69,14 @@ class DownloadCredentials:
         url = self.ads_api_url or ADS_DEFAULT_URL
         return url, key
 
+    def ecmwf_settings(self) -> tuple[str, str, str] | None:
+        key = self.ecmwf_api_key
+        email = self.ecmwf_email
+        if not key or not email:
+            return None
+        url = self.ecmwf_api_url or ECMWF_DEFAULT_URL
+        return url, key, email
+
     def secret_literals(self) -> tuple[str, ...]:
         return tuple(
             value

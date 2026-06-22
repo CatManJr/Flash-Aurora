@@ -113,6 +113,10 @@ class EngineConfig:
     inference_precision: str | None = None
     cuda_graph: bool = False
     device: str = "cuda:0"
+    preset_name: str | None = None
+    gpu_guard: bool = True
+    gpu_guard_timeout: float = 3600.0
+    gpu_rollout_steps: int = 1
 
     def hub_download_options(self) -> "HubDownloadOptions":
         from flash_aurora.engine.core.hub import HubDownloadOptions
