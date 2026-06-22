@@ -1,6 +1,7 @@
-"""Copyright (c) Catman Jr. Licensed under the MIT license."""
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
 
-"""Perceiver cross-attention SDPA smoke tests."""
+Perceiver cross-attention SDPA smoke tests.
+"""
 
 from __future__ import annotations
 
