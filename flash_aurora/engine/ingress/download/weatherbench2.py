@@ -42,10 +42,14 @@ def require_weatherbench2_deps():
 
 def open_hres_t0_store():
     require_weatherbench2_deps()
-    import fsspec
     import xarray as xr
 
-    return xr.open_zarr(fsspec.get_mapper(WB2_HRES_T0_URL), chunks=None)
+    # WeatherBench2 is a public GCS bucket; anonymous access avoids ADC warnings/hangs.
+    return xr.open_zarr(
+        WB2_HRES_T0_URL,
+        storage_options={"token": "anon"},
+        chunks=None,
+    )
 
 
 def download_hres_t0_day(cache_dir: Path | str, day: str) -> dict[str, Path]:

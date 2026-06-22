@@ -28,6 +28,8 @@ dependencies = [
     "xarray",
     "netcdf4",
     "cdsapi",
+    "zarr>=3.2.1",
+    "gcsfs>=2026.6.0",
 ]
 
 [project.optional-dependencies]

@@ -9,9 +9,8 @@ import xarray as xr
 from flash_aurora.aurora import Batch, Metadata
 
 from flash_aurora.engine.core.config import EngineConfig, STANDARD_STATIC
-from flash_aurora.engine.core.netcdf_codec import NETCDF_ENGINE
 from flash_aurora.engine.ingress.adapters.base import resolve_cache_dir
-from flash_aurora.engine.ingress.adapters.era5 import CdsEra5Adapter
+from flash_aurora.engine.ingress.adapters.era5 import CdsEra5Adapter, open_ingress_netcdf
 from flash_aurora.engine.ingress.adapters.request import IngestRequest
 from flash_aurora.engine.ingress.builder import TimeHistoryBuilder
 
@@ -58,9 +57,9 @@ class Wb2HresT0Adapter:
                     "Download from WeatherBench2 or set IngestRequest.raw_paths."
                 )
 
-        with xr.open_dataset(paths.surface, engine=NETCDF_ENGINE) as surf_ds, xr.open_dataset(
-            paths.atmospheric, engine=NETCDF_ENGINE
-        ) as atmos_ds, xr.open_dataset(paths.static, engine=NETCDF_ENGINE) as static_ds:
+        with open_ingress_netcdf(paths.surface) as surf_ds, open_ingress_netcdf(
+            paths.atmospheric
+        ) as atmos_ds, open_ingress_netcdf(paths.static) as static_ds:
             return self._build_batch(
                 surf_ds=surf_ds,
                 atmos_ds=atmos_ds,
