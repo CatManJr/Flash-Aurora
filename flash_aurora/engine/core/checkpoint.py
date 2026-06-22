@@ -45,10 +45,14 @@ class CheckpointLoader:
 
     def build_model(self) -> Aurora:
         variant = self._config.variant
+        model_kwargs: dict[str, object] = {}
+        if self._config.inference_precision is not None:
+            model_kwargs["inference_precision"] = self._config.inference_precision
         model = ModelFactory.create(
             variant.model_class,
             use_lora=variant.use_lora,
             lora_mode=variant.lora_mode,
+            **model_kwargs,
         )
         model.eval()
         return model

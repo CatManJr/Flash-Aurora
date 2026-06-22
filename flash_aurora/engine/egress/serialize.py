@@ -13,4 +13,6 @@ class BatchExporter:
         self._export_dir.mkdir(parents=True, exist_ok=True)
 
     def write_netcdf(self, batch: Batch, path: Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         write_batch_netcdf(batch, path)

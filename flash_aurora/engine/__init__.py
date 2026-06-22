@@ -1,7 +1,7 @@
 from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.core.engine import AuroraEngine
 from flash_aurora.engine.core.hub import HF_MIRROR_ENDPOINT, HubDownloadOptions
-from flash_aurora.engine.core.paths import normalize_asset_path
+from flash_aurora.engine.core.paths import normalize_asset_path, normalize_user_path
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from flash_aurora.engine.ingress.adapters import IngestRequest
 from flash_aurora.engine.ingress.build_ic import InitialConditionBuilder
@@ -23,4 +23,5 @@ __all__ = [
     "IngestRequest",
     "PresetRegistry",
     "normalize_asset_path",
+    "normalize_user_path",
 ]

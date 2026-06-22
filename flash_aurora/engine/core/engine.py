@@ -11,7 +11,7 @@ from flash_aurora.engine.core.checkpoint import CheckpointLoader
 from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.core.hooks import RolloutObserver
 from flash_aurora.engine.core.hub import HF_MIRROR_ENDPOINT
-from flash_aurora.engine.core.paths import AssetStore, normalize_asset_path
+from flash_aurora.engine.core.paths import AssetStore, normalize_asset_path, normalize_user_path
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from flash_aurora.engine.core.rollout_session import RolloutSession
 from flash_aurora.engine.egress.export import RolloutExporter
@@ -35,7 +35,20 @@ class AuroraEngine:
         self._loader = CheckpointLoader(config)
         self._validator = BatchValidator(config.variant)
         self._graph_pool = GraphPool()
-        self._exporter = RolloutExporter(config.export_dir)
+        self._exporter = RolloutExporter(self._resolved_export_dir())
+
+    def _resolved_export_dir(self) -> Path:
+        return normalize_user_path(
+            self.config.export_dir,
+            user_cwd=self.config.user_cwd,
+        )
+
+    def set_export_dir(self, export_dir: Path | str) -> Path:
+        """Update the rollout export directory and refresh the exporter."""
+        resolved = normalize_user_path(export_dir, user_cwd=self.config.user_cwd)
+        self.config.export_dir = resolved
+        self._exporter = RolloutExporter(resolved)
+        return resolved
 
     @classmethod
     def from_preset(
@@ -49,13 +62,19 @@ class AuroraEngine:
         hf_mirror: bool = False,
         hf_revision: str | None = None,
         hf_token: str | None = None,
+        export_dir: Path | str | None = None,
+        inference_precision: str | None = None,
         presets: PresetRegistry | None = None,
     ) -> AuroraEngine:
         registry = presets or DEFAULT_PRESETS
         config = registry.get(name)
-        config.asset_root = normalize_asset_path(asset_root)
+        user_cwd = Path.cwd()
+        config.user_cwd = user_cwd
+        config.asset_root = normalize_user_path(asset_root, user_cwd=user_cwd)
         if checkpoint_path is not None:
-            config.checkpoint_path = normalize_asset_path(checkpoint_path)
+            config.checkpoint_path = normalize_user_path(checkpoint_path, user_cwd=user_cwd)
+        if export_dir is not None:
+            config.export_dir = normalize_user_path(export_dir, user_cwd=user_cwd)
         if allow_hub_download is not None:
             config.allow_hub_download = allow_hub_download
         if hf_mirror:
@@ -66,6 +85,8 @@ class AuroraEngine:
             config.hf_revision = hf_revision
         if hf_token is not None:
             config.hf_token = hf_token
+        if inference_precision is not None:
+            config.inference_precision = inference_precision
         return cls(config, presets=registry)
 
     @property
@@ -135,6 +156,12 @@ class AuroraEngine:
         self,
         batch: Batch,
         steps: int,
+        *,
+        export_dir: Path | str | None = None,
     ) -> Generator[Path, None, None]:
+        if export_dir is not None:
+            self.set_export_dir(export_dir)
+        else:
+            self.set_export_dir(self.config.export_dir)
         for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):
             yield self._exporter.write_step(step_index, prediction)

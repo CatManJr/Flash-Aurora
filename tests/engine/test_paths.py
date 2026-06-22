@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from flash_aurora.engine.core.paths import AssetRootRequiredError, AssetStore, normalize_asset_path
+from flash_aurora.engine.core.paths import AssetRootRequiredError, AssetStore, normalize_asset_path, normalize_user_path
 
 
 def test_normalize_asset_path_expands_user(tmp_path: Path) -> None:
@@ -46,6 +46,13 @@ def test_ensure_root_creates_directory(tmp_path: Path) -> None:
     store = AssetStore(root=target)
     created = store.ensure_root()
     assert created.is_dir()
+
+
+def test_normalize_user_path_uses_user_cwd(tmp_path: Path) -> None:
+    base = tmp_path / "notebook"
+    base.mkdir()
+    resolved = normalize_user_path("assets", user_cwd=base)
+    assert resolved == (base / "assets").resolve()
 
 
 def test_library_source_has_no_autodl_paths() -> None:

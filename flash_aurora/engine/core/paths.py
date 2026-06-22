@@ -32,6 +32,24 @@ def normalize_asset_path(path: Path | str) -> Path:
     return Path(path).expanduser().resolve()
 
 
+def normalize_user_path(
+    path: Path | str,
+    *,
+    user_cwd: Path | None = None,
+) -> Path:
+    """Resolve a user path against a stable working directory.
+
+  Absolute paths are normalized as-is. Relative paths are joined to ``user_cwd``
+  (default: process cwd at call time), which avoids surprises when Jupyter's cwd
+  differs from the repository root.
+    """
+    expanded = Path(path).expanduser()
+    if expanded.is_absolute():
+        return expanded.resolve()
+    base = user_cwd or Path.cwd()
+    return (base / expanded).resolve()
+
+
 def require_asset_root(
     explicit: Path | str | None,
     *,

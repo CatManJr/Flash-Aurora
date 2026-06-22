@@ -1,5 +1,10 @@
 from flash_aurora.engine.core.config import EngineConfig, ModelVariantSpec, SourceProfile
-from flash_aurora.engine.core.paths import AssetRootRequiredError, AssetStore, normalize_asset_path
+from flash_aurora.engine.core.paths import (
+    AssetRootRequiredError,
+    AssetStore,
+    normalize_asset_path,
+    normalize_user_path,
+)
 
 __all__ = [
     "AssetRootRequiredError",
@@ -8,4 +13,5 @@ __all__ = [
     "ModelVariantSpec",
     "SourceProfile",
     "normalize_asset_path",
+    "normalize_user_path",
 ]

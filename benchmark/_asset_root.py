@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 
 def default_asset_root() -> Path:
-    """Resolve checkpoint/data root from env or ``./assets`` under the current working directory."""
-    for key in ("AURORA_ASSET_ROOT", "AURORA_HF_LOCAL_DIR"):
-        value = os.environ.get(key)
-        if value:
-            return Path(value).expanduser().resolve()
-    return (Path.cwd() / "assets").resolve()
+    """Return ``<cwd>/assets``, creating the directory if needed."""
+    root = (Path.cwd() / "assets").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root

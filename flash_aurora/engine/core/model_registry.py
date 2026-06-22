@@ -24,10 +24,16 @@ MODEL_REGISTRY: dict[str, type[AuroraBase]] = {
 
 class ModelFactory:
     @staticmethod
-    def create(class_name: str, *, use_lora: bool, lora_mode: str) -> AuroraBase:
+    def create(
+        class_name: str,
+        *,
+        use_lora: bool,
+        lora_mode: str,
+        **kwargs: object,
+    ) -> AuroraBase:
         model_cls = MODEL_REGISTRY.get(class_name)
         if model_cls is None:
             raise KeyError(f"Unknown model class: {class_name}")
         if class_name in {"AuroraPretrained", "AuroraSmallPretrained", "Aurora12hPretrained"}:
-            return model_cls(use_lora=use_lora)
-        return model_cls(use_lora=use_lora, lora_mode=lora_mode)
+            return model_cls(use_lora=use_lora, **kwargs)
+        return model_cls(use_lora=use_lora, lora_mode=lora_mode, **kwargs)
