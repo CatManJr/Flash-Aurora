@@ -1,4 +1,4 @@
-# Flash-Aurora: One More Step Toward Efficient Geospatial Foundation Models Inference Service
+# Flash-Aurora: One Small Step Toward Efficient Geospatial Foundation Models Inference Service
 
 High-performance inference stack for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model. The repository packages the upstream model under `flash_aurora.aurora`, custom CUDA kernels (Triton and CuTeDSL), precision routing, and `flash_aurora.engine` for data ingress, checkpoints, rollout, and export.
 
@@ -10,14 +10,14 @@ cd flash-aurora
 uv sync
 ```
 
-Dependencies include PyTorch, `nvidia-cutlass-dsl[cu13]`, and `quack-kernels` (see `pyproject.toml`). CuTe DSL JIT-compiles for the local GPU by default.
+Dependencies include PyTorch, `nvidia-cutlass-dsl[cu13]`, and `quack-kernels` (see `pyproject.toml`). CuTe DSL JIT-compiles for the local GPU by default. Other dependencies are the same as [Microsoft Aurora](https://github.com/microsoft/aurora).
 
 ## Repository layout
 
 | Path | Role |
 |------|------|
 | `flash_aurora/aurora/` | Aurora model fork (upstream README preserved in place). See `NOTICE.md` and `LICENSE.txt`. |
-| `flash_aurora/engine/` | `AuroraEngine`, presets, NetCDF ingress, rollout, export. |
+| `flash_aurora/engine/` | `AuroraEngine`, presets, ingress/download, rollout, export, GPU guard. |
 | `flash_aurora/aurora/ops/triton/` | Fused Swin layout and AdaLN kernels. |
 | `flash_aurora/aurora/ops/cute/` | CuTeDSL window self-attention kernels. |
 | `benchmark/` | Kernel- and model-level timing scripts. |
@@ -97,25 +97,85 @@ Measured with `benchmark/bench_aurora_pretrained.py` on **AuroraPretrained** at 
 
 The PyTorch FP32 reference uses no custom kernels. Every other custom tier uses Triton layout and AdaLN fusion; `tf32` and BF16 tiers additionally use CuTe window attention and the corresponding backbone matmul mode. Cosine similarity is computed over the flattened output tensor (all surface and atmospheric variables) relative to the PyTorch FP32 reference. All custom tiers pass per-variable mean relative-error tolerances from the upstream golden tests on this ERA5 sample. Recommended production preset on this hardware: `bf16_mixed@fp32` or `bf16_mixed@tf32` (about 3x speedup with bounded drift).
 
-## AuroraEngine
+## Engine (`flash_aurora.engine`)
 
-`AuroraEngine` integrates the model, precision presets, and I/O into one API:
+`flash_aurora.engine` is the inference service layer. It binds Aurora variants, upstream data profiles, checkpoint resolution, batch validation, multi-step rollout, and NetCDF export behind a preset-driven API. Tutorial notebooks under `docs/example_*.ipynb` exercise each preset end to end.
 
-1. **Preset registry** -- Named bundles (for example `era5_pretrained`) pair a model variant, checkpoint, and data source profile (CDS ERA5, WeatherBench2 HRES, CAMS, wave).
-2. **Checkpoint resolution** -- Local `asset_root` with optional Hugging Face Hub download and mirror support.
-3. **Precision wiring** -- `EngineConfig.inference_precision` enables the Triton fusion base and, when selected, TF32/BF16 matmul and CuTe attention consistently across the forward path.
-4. **Ingress and validation** -- `InitialConditionBuilder` and `BatchValidator` for NetCDF and adapter inputs.
-5. **Rollout and export** -- Multi-step `rollout_stream` and optional `cuda_graph` warmup for fixed-shape backbone replay.
+### Architecture
+
+The engine is organized in four layers. Data flows from download and adapters into a validated `Batch`, through the loaded model, and optionally to disk as forecast NetCDF.
+
+| Layer | Path | Role |
+|-------|------|------|
+| Core | `engine/core/` | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`. |
+| Ingress | `engine/ingress/` | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, static fields. |
+| Egress | `engine/egress/` | `RolloutExporter`, CPU offload, step-wise NetCDF naming. |
+| Runtime | `engine/runtime/` | CUDA Graph warmup (`GraphPool`), cross-process `GpuGuard`, VRAM budget estimates. |
+
+A **preset** pairs a `ModelVariantSpec` (checkpoint, variable lists, grid shape $(H, W)$, timestep $\Delta t$) with a `SourceProfile` (schema, latitude convention, cache layout). `DataDownloader.ensure()` fills the preset cache. `InitialConditionBuilder` reads cached files or adapter requests and attaches Hugging Face static fields. `BatchValidator` checks tensor shapes and variable names against the variant. `AuroraEngine.load()` resolves checkpoints, applies `inference_precision`, and optionally acquires a `GpuGuard` lease from estimated VRAM. `predict()` runs one forward step; `rollout_stream()` chains $K$ steps with model-internal history, advancing valid time by $\Delta t$ per step. `rollout_and_export()` writes CPU-side NetCDF under `export_dir`.
+
+### Presets and data sources
+
+| Preset | Model | Grid $(H \times W)$ | Source | Download backend |
+|--------|-------|---------------------|--------|------------------|
+| `era5_pretrained` | AuroraPretrained | $721 \times 1440$ | CDS ERA5 | CDS |
+| `hres_t0_finetuned` | Aurora (LoRA) | $721 \times 1440$ | WeatherBench2 HRES | WB2 + ERA5 static |
+| `small_pretrained` | AuroraSmallPretrained | $400 \times 800$ | CDS ERA5 | CDS |
+| `hres_0.1` | AuroraHighRes | $1801 \times 3600$ | IFS GRIB analysis | ECMWF Open Data / GRIB |
+| `cams` | AuroraAirPollution | $451 \times 900$ | CAMS reanalysis | ADS |
+| `wave` | AuroraWave | $721 \times 1440$ | WB2 met + MARS wave GRIB | WB2 + MARS |
+| `tc_tracking` | Aurora (LoRA) | $721 \times 1440$ | WeatherBench2 HRES | WB2 + ERA5 static |
+
+Personal ECMWF accounts typically lack MARS archive access. For `wave`, stage `{day}-wave.grib` under the cache manually or use an institutional MARS credential; see `docs/example_wave.ipynb`.
+
+### Capabilities
+
+- **Checkpoint and static assets.** Local `asset_root` with optional Hugging Face Hub download (`allow_hub_download`, mirror via `HF_MIRROR_ENDPOINT`).
+- **Precision wiring.** `EngineConfig.inference_precision` selects the Triton fusion base and, when set, TF32/BF16 matmul and CuTe window attention (see above).
+- **Automated ingress.** CDS (ERA5), ADS (CAMS), WeatherBench2 (HRES met), ECMWF Open Data (0.1-degree GRIB), and MARS (wave GRIB when permitted). Credentials merge from environment variables, `~/.cdsapirc`, `~/.ecmwfapirc`, and optional constructor kwargs.
+- **Multi-step rollout.** `rollout_stream(batch, K)` and `run_from_netcdf(..., steps=K)`; optional `RolloutObserver` hooks per step.
+- **NetCDF export.** `rollout_and_export()` writes forecast steps to `export_dir`.
+- **CUDA Graph warmup.** `warmup()` captures fixed-shape backbone graphs when `cuda_graph=True`.
+- **GPU scheduling.** `GpuGuard` (default on) estimates VRAM from variant, precision tier, and rollout depth; large jobs queue when memory is saturated. Disable with `gpu_guard=False` or `FLASH_AURORA_GPU_GUARD=0`.
+
+### Core API
+
+**Engine lifecycle.**
 
 ```python
 from flash_aurora import AuroraEngine
 
-engine = AuroraEngine.from_preset("era5_pretrained", asset_root="/path/to/assets")
-engine.config.inference_precision = "bf16_mixed@fp32"
+engine = AuroraEngine.from_preset(
+    "era5_pretrained",
+    asset_root="/path/to/assets",
+    inference_precision="bf16_mixed@fp32",
+)
 engine.load()
 engine.warmup()
-predictions = engine.run_from_netcdf("/path/to/era5.nc", steps=1)
+pred = engine.run_from_netcdf("/path/to/era5.nc", steps=1)[0]
+engine.release_gpu()
 ```
+
+**Download and ingest.**
+
+```python
+from datetime import datetime
+from flash_aurora import AuroraEngine, DataDownloader
+from flash_aurora.engine import InitialConditionBuilder
+
+engine = AuroraEngine.from_preset("era5_pretrained", asset_root="/path/to/assets")
+dl = DataDownloader.from_preset("era5_pretrained", asset_root="/path/to/assets")
+dl.ensure(valid_time=datetime(2023, 1, 1, 6))
+
+request = dl.ingest_request(datetime(2023, 1, 1, 6), time_index=1, download=False)
+batch = InitialConditionBuilder(engine.config).from_source(request)
+forecasts = list(engine.rollout_stream(batch, steps=4))
+paths = list(engine.rollout_and_export(batch, steps=4))
+```
+
+**Configuration surface.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`. Inspect registered names with `DEFAULT_PRESETS.names()`.
+
+**Utilities.** `ecmwf_credential_status()` reports ECMWF API readiness before MARS requests; `normalize_user_path()` and `AssetStore` constrain file access to allowed roots under `asset_root`.
 
 ## Testing notes
 
@@ -132,6 +192,8 @@ Third-party components bundled in the library:
 
 ## Reference
 
-Bodnar et al., *A Foundation Model for the Earth System*, Nature (2025). [doi:10.1038/s41586-025-09005-y](https://doi.org/10.1038/s41586-025-09005-y)
+**Aurora model.** Bodnar et al., *A Foundation Model for the Earth System*, Nature (2025). [doi:10.1038/s41586-025-09005-y](https://doi.org/10.1038/s41586-025-09005-y). Upstream documentation: [microsoft.github.io/aurora](https://microsoft.github.io/aurora).
 
-Upstream model documentation: [microsoft.github.io/aurora](https://microsoft.github.io/aurora)
+**CUTLASS / CuTe DSL.** CuTe window-attention and dense GEMM kernels under `flash_aurora/aurora/ops/cute/` adapt layout, TMA, and GEMM patterns from [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) CuTe DSL examples (BSD-3-Clause; see file headers such as `ops/cute/_dense_gemm_sm120.py`). Runtime dependency: `nvidia-cutlass-dsl`.
+
+**Flash Attention.** FMHA mainloop, online softmax, and dispatch structure follow [flash-attn](https://github.com/Dao-AILab/flash-attention) (`flash_attn/cute/`; Tri Dao).
