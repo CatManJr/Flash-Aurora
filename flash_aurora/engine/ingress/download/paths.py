@@ -47,6 +47,34 @@ def ecmwfapirc_path() -> Path:
     return user_config_file(".ecmwfapirc")
 
 
+def read_ecmwfapirc() -> dict[str, str] | None:
+    """Parse ``~/.ecmwfapirc`` JSON (``url``, ``key``, ``email``).
+
+    Returns ``None`` when the file is missing, unreadable, or incomplete.
+    """
+    path = ecmwfapirc_path()
+    if not path.is_file():
+        return None
+    try:
+        import json
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    parsed: dict[str, str] = {}
+    for field in ("url", "key", "email"):
+        value = payload.get(field)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                parsed[field] = stripped
+    if "key" in parsed and "email" in parsed:
+        return parsed
+    return None
+
+
 def platform_label() -> str:
     return sys.platform
 

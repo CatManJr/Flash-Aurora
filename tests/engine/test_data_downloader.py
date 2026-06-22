@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -346,6 +347,58 @@ def test_grib_ifs_urls_match_upstream_layout() -> None:
     assert atmos_grib_url(date, "u", 12).endswith("ec.oper.an.pl.128_131_u.regn1280uv.2022051112.grb")
 
 
+def test_ecmwf_credential_status_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.credentials import ecmwf_credential_status
+
+    monkeypatch.delenv("ECMWF_API_KEY", raising=False)
+    monkeypatch.delenv("ECMWF_API_EMAIL", raising=False)
+    ready, message, email = ecmwf_credential_status()
+    assert ready is False
+    assert email is None
+    assert "missing" in message.lower()
+
+    monkeypatch.setenv("ECMWF_API_KEY", "secret-key")
+    monkeypatch.setenv("ECMWF_API_EMAIL", "user@example.com")
+    ready, message, email = ecmwf_credential_status()
+    assert ready is True
+    assert email == "user@example.com"
+    assert "ECMWF_API_KEY env" in message
+
+
+def test_mars_client_sets_ecmwf_rc_file_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.credentials import DownloadCredentials, use_download_credentials
+    from flash_aurora.engine.ingress.download.mars import mars_service
+
+    monkeypatch.delenv("ECMWF_API_KEY", raising=False)
+    monkeypatch.delenv("ECMWF_API_URL", raising=False)
+    monkeypatch.delenv("ECMWF_API_EMAIL", raising=False)
+    monkeypatch.delenv("ECMWF_API_RC_FILE", raising=False)
+
+    rc_files: list[str] = []
+
+    class FakeService:
+        pass
+
+    def capture_service(name: str):
+        rc_path = os.environ.get("ECMWF_API_RC_FILE", "")
+        rc_files.append(rc_path)
+        assert rc_path.endswith(".json")
+        assert Path(rc_path).is_file()
+        assert os.environ.get("ECMWF_API_KEY") == "secret-key"
+        assert os.environ.get("ECMWF_API_EMAIL") == "user@example.com"
+        return FakeService()
+
+    with patch("flash_aurora.engine.ingress.download.mars.require_ecmwfapi") as mocked:
+        mocked.return_value.ECMWFService.side_effect = capture_service
+        with use_download_credentials(
+            DownloadCredentials(ecmwf_api_key="secret-key", ecmwf_email="user@example.com")
+        ):
+            with mars_service() as client:
+                assert isinstance(client, FakeService)
+
+    assert len(rc_files) == 1
+
+
 def test_mars_client_accepts_explicit_ecmwf_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     from flash_aurora.engine.ingress.download.credentials import DownloadCredentials, use_download_credentials
     from flash_aurora.engine.ingress.download.mars import mars_service
@@ -359,6 +412,109 @@ def test_mars_client_accepts_explicit_ecmwf_credentials(monkeypatch: pytest.Monk
             with mars_service() as client:
                 assert client is mocked.return_value.ECMWFService.return_value
         mocked.return_value.ECMWFService.assert_called_once()
+
+
+def test_read_ecmwfapirc_parses_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.paths import read_ecmwfapirc
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("flash_aurora.engine.ingress.download.paths.user_home", lambda: fake_home)
+
+    assert read_ecmwfapirc() is None
+
+    (fake_home / ".ecmwfapirc").write_text(
+        '{"url": "https://api.ecmwf.int/v1", "key": "mars-key", "email": "user@example.com"}\n'
+    )
+    parsed = read_ecmwfapirc()
+    assert parsed == {
+        "url": "https://api.ecmwf.int/v1",
+        "key": "mars-key",
+        "email": "user@example.com",
+    }
+
+
+def test_merge_credentials_fills_ecmwf_from_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.credentials import DownloadCredentials, merge_credentials
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("flash_aurora.engine.ingress.download.paths.user_home", lambda: fake_home)
+    monkeypatch.delenv("ECMWF_API_KEY", raising=False)
+    monkeypatch.delenv("ECMWF_API_EMAIL", raising=False)
+    (fake_home / ".ecmwfapirc").write_text(
+        '{"url": "https://api.ecmwf.int/v1", "key": "file-key", "email": "file@example.com"}\n'
+    )
+
+    merged = merge_credentials(DownloadCredentials())
+    assert merged.ecmwf_settings() == ("https://api.ecmwf.int/v1", "file-key", "file@example.com")
+
+
+def test_mars_service_rejects_missing_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.mars import MarsConfigError, mars_service
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("flash_aurora.engine.ingress.download.paths.user_home", lambda: fake_home)
+    monkeypatch.delenv("ECMWF_API_KEY", raising=False)
+    monkeypatch.delenv("ECMWF_API_EMAIL", raising=False)
+
+    with pytest.raises(MarsConfigError, match="Missing ECMWF credentials"):
+        with mars_service():
+            pass
+
+
+def test_mars_service_rejects_invalid_ecmwfapirc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.mars import MarsConfigError, mars_service
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("flash_aurora.engine.ingress.download.paths.user_home", lambda: fake_home)
+    monkeypatch.delenv("ECMWF_API_KEY", raising=False)
+    monkeypatch.delenv("ECMWF_API_EMAIL", raising=False)
+    (fake_home / ".ecmwfapirc").write_text('{"key": "only-key"}\n')
+
+    with pytest.raises(MarsConfigError, match="Invalid ECMWF credentials"):
+        with mars_service():
+            pass
+
+
+def test_ensure_wave_prompts_for_ecmwf_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.credentials import DownloadCredentials
+
+    config = DEFAULT_PRESETS.get("wave")
+    config.asset_root = tmp_path
+    downloader = DataDownloader(config)
+    valid_time = datetime(2022, 9, 16, 6)
+    cache = tmp_path / "wave"
+
+    def fake_download(cache_dir: Path, day: str):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        paths = expected_paths(config.source, valid_time, cache_dir)
+        for path in paths.values():
+            path.write_bytes(b"data")
+        return paths
+
+    monkeypatch.delenv("ECMWF_API_KEY", raising=False)
+    monkeypatch.delenv("ECMWF_API_EMAIL", raising=False)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("flash_aurora.engine.ingress.download.paths.user_home", lambda: fake_home)
+
+    with patch(
+        "flash_aurora.engine.ingress.download.backends.weatherbench2.download_hres_t0_day",
+        side_effect=fake_download,
+    ), patch(
+        "flash_aurora.engine.ingress.download.backends.mars.download_wave_grib",
+        side_effect=lambda cache_dir, day: (cache_dir / f"{day}-wave.grib").write_bytes(b"grib"),
+    ), patch(
+        "flash_aurora.engine.ingress.download.downloader.prompt_ecmwf_credentials",
+        return_value=DownloadCredentials(ecmwf_api_key="prompt-key", ecmwf_email="prompt@example.com"),
+    ) as prompted:
+        result = downloader.ensure(valid_time, cache_dir=cache, prompt=True)
+
+    prompted.assert_called_once()
+    assert result.complete
 
 
 def test_fetch_bytes_retries_without_verify_on_ucar_ssl_error(monkeypatch: pytest.MonkeyPatch) -> None:

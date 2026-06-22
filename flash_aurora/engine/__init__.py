@@ -6,7 +6,7 @@ from flash_aurora.engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from flash_aurora.engine.ingress.adapters import IngestRequest
 from flash_aurora.engine.ingress.build_ic import InitialConditionBuilder
 from flash_aurora.engine.ingress.download import DataDownloader, DownloadBackendError, DownloadRequest, DownloadResult
-from flash_aurora.engine.ingress.download.credentials import DownloadCredentials
+from flash_aurora.engine.ingress.download.credentials import DownloadCredentials, ecmwf_credential_status
 
 __all__ = [
     "AuroraEngine",
@@ -16,6 +16,7 @@ __all__ = [
     "DownloadCredentials",
     "DownloadRequest",
     "DownloadResult",
+    "ecmwf_credential_status",
     "EngineConfig",
     "HF_MIRROR_ENDPOINT",
     "HubDownloadOptions",

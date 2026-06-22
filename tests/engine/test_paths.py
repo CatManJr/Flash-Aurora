@@ -75,7 +75,6 @@ def test_library_source_has_no_autodl_paths() -> None:
         root / "tests",
         root / "docs",
     )
-    generator = root / "scripts" / "generate_example_notebooks.py"
     hits: list[str] = []
     for scan_root in scan_roots:
         if not scan_root.is_dir():
@@ -87,8 +86,6 @@ def test_library_source_has_no_autodl_paths() -> None:
                 continue
             if path.resolve() == Path(__file__).resolve():
                 continue
-            if path.resolve() == generator.resolve():
-                continue
             if _is_tutorial_notebook(path, root):
                 continue
             text = path.read_text(encoding="utf-8")
@@ -97,10 +94,14 @@ def test_library_source_has_no_autodl_paths() -> None:
     assert hits == []
 
 
-def test_tutorial_notebooks_default_to_portable_assets() -> None:
+def test_tutorial_notebooks_support_portable_assets() -> None:
+    """Setup cells keep a None default and fall back to ./assets when unset."""
     root = Path(__file__).resolve().parents[2]
-    era5 = root / "docs" / "example_era5.ipynb"
-    assert era5.is_file()
-    text = era5.read_text(encoding="utf-8")
-    assert "ASSET_ROOT: Path | str | None = None" in text
-    assert "# ASSET_ROOT = Path(" in text
+    notebooks = sorted((root / "docs").glob("example_*.ipynb"))
+    assert notebooks, "expected example notebooks under docs/"
+    for path in notebooks:
+        text = path.read_text(encoding="utf-8")
+        assert "ASSET_ROOT: Path | str | None = None" in text, path.name
+        assert "Path.cwd()" in text and "assets" in text, path.name
+        assert "ASSET_ROOT.mkdir" in text, path.name
+        assert "ASSET_ROOT = Path(" in text, path.name

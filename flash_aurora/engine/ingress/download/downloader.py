@@ -13,6 +13,7 @@ from flash_aurora.engine.ingress.download.backends import DownloadBackendError, 
 from flash_aurora.engine.ingress.download.credentials import (
     DownloadCredentials,
     merge_credentials,
+    prompt_ecmwf_credentials,
     use_download_credentials,
 )
 from flash_aurora.engine.ingress.download.layout import cache_subdir, expected_paths, missing_keys
@@ -111,8 +112,9 @@ class DataDownloader:
         ecmwf_api_key: str | None = None,
         ecmwf_api_url: str | None = None,
         ecmwf_email: str | None = None,
+        prompt: bool = False,
     ) -> DownloadCredentials:
-        return merge_credentials(
+        creds = merge_credentials(
             self._credentials,
             credentials,
             DownloadCredentials(
@@ -125,6 +127,13 @@ class DataDownloader:
                 ecmwf_email=ecmwf_email,
             ),
         )
+        if prompt and self.config.source.name == "wb2_wam" and creds.ecmwf_settings() is None:
+            creds = prompt_ecmwf_credentials(creds)
+        if self.config.source.name == "wb2_wam" and creds.ecmwf_settings() is None:
+            from flash_aurora.engine.ingress.download.mars import _mars_config_error
+
+            raise _mars_config_error()
+        return creds
 
     def resolve_cache_dir(self, request: DownloadRequest | None = None) -> Path:
         if request is not None and request.cache_dir is not None:
@@ -168,6 +177,7 @@ class DataDownloader:
         ecmwf_api_key: str | None = None,
         ecmwf_api_url: str | None = None,
         ecmwf_email: str | None = None,
+        prompt: bool = False,
     ) -> DownloadResult:
         directory = ensure_directory(
             normalize_path(cache_dir)
@@ -193,6 +203,7 @@ class DataDownloader:
             ecmwf_api_key=ecmwf_api_key,
             ecmwf_api_url=ecmwf_api_url,
             ecmwf_email=ecmwf_email,
+            prompt=prompt,
         )
         backend = get_backend(self.config.source)
         try:
@@ -239,6 +250,7 @@ class DataDownloader:
         ecmwf_api_key: str | None = None,
         ecmwf_api_url: str | None = None,
         ecmwf_email: str | None = None,
+        prompt: bool = False,
     ) -> IngestRequest:
         directory = normalize_path(cache_dir) if cache_dir is not None else self.resolve_cache_dir(
             DownloadRequest(valid_time=valid_time)
@@ -255,6 +267,7 @@ class DataDownloader:
                 ecmwf_api_key=ecmwf_api_key,
                 ecmwf_api_url=ecmwf_api_url,
                 ecmwf_email=ecmwf_email,
+                prompt=prompt,
             )
         return IngestRequest(
             valid_time=valid_time,

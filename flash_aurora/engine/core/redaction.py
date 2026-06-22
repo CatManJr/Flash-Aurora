@@ -91,14 +91,14 @@ def _redaction_literals() -> tuple[str, ...]:
         if value and len(value) >= 4 and _is_sensitive_env_key(key)
     )
 
-    from flash_aurora.engine.ingress.download.paths import cdsapirc_path, ecmwfapirc_path
+    from flash_aurora.engine.ingress.download.paths import cdsapirc_path, read_ecmwfapirc
 
     cds_key = _config_secret(cdsapirc_path(), ("key",))
     if cds_key:
         literals.append(cds_key)
-    ecmwf_key = _config_secret(ecmwfapirc_path(), ("key",))
-    if ecmwf_key:
-        literals.append(ecmwf_key)
+    ecmwf = read_ecmwfapirc()
+    if ecmwf and ecmwf.get("key"):
+        literals.append(ecmwf["key"])
 
     return tuple(sorted(set(literals), key=len, reverse=True))
 

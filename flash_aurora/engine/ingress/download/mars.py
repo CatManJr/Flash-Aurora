@@ -15,6 +15,7 @@ from flash_aurora.engine.ingress.download.credentials import (
 )
 from flash_aurora.engine.ingress.download.paths import ecmwfapirc_path, ensure_directory, normalize_path
 
+
 WAVE_MARS_PARAMS: dict[str, str] = {
     "swh": "229.140",
     "pp1d": "231.140",
@@ -53,8 +54,8 @@ def require_ecmwfapi():
 
 
 @contextmanager
-def _ecmwf_api_config(path: Path) -> Iterator[None]:
-    env_key = "ECMWF_API_CONFIG"
+def _ecmwf_rc_file(path: Path) -> Iterator[None]:
+    env_key = "ECMWF_API_RC_FILE"
     previous = os.environ.get(env_key)
     os.environ[env_key] = str(path)
     try:
@@ -67,41 +68,72 @@ def _ecmwf_api_config(path: Path) -> Iterator[None]:
 
 
 @contextmanager
+def _ecmwf_env_credentials(url: str, key: str, email: str) -> Iterator[None]:
+    """Expose credentials via the env vars read by ``ecmwf-api-client``."""
+    overrides = {
+        "ECMWF_API_KEY": key,
+        "ECMWF_API_URL": url or ECMWF_DEFAULT_URL,
+        "ECMWF_API_EMAIL": email,
+    }
+    previous = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _mars_config_error() -> MarsConfigError:
+    rc_path = ecmwfapirc_path()
+    if rc_path.is_file():
+        return MarsConfigError(
+            f"Invalid ECMWF credentials in {safe_config_label(rc_path)}. "
+            "The file must be JSON with non-empty 'key' and 'email' fields "
+            "(see https://api.ecmwf.int/v1/key). "
+            "Alternatively pass ecmwf_api_key and ecmwf_email to DataDownloader.ensure(), "
+            "set ECMWF_API_KEY and ECMWF_API_EMAIL, or call ensure(..., prompt=True)."
+        )
+    return MarsConfigError(
+        "Missing ECMWF credentials. Pass ecmwf_api_key and ecmwf_email to DataDownloader.ensure(), "
+        f"set ECMWF_API_KEY and ECMWF_API_EMAIL, create {safe_config_label(rc_path)} "
+        "(see https://api.ecmwf.int/v1/key), or call ensure(..., prompt=True). "
+        "If you used getpass(), the string in parentheses is only a prompt—not your API key."
+    )
+
+
+@contextmanager
+def _mars_client_from_settings(url: str, key: str, email: str) -> Iterator[object]:
+    ecmwfapi = require_ecmwfapi()
+    payload = json.dumps({"url": url or ECMWF_DEFAULT_URL, "key": key, "email": email}, indent=4) + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
+        handle.write(payload)
+        config_path = Path(handle.name)
+    try:
+        with _ecmwf_env_credentials(url, key, email), _ecmwf_rc_file(config_path):
+            try:
+                client = ecmwfapi.ECMWFService("mars")
+            except Exception as exc:
+                raise RuntimeError(f"Failed to initialize MARS client: {sanitize_exception(exc)}") from None
+            yield client
+    finally:
+        config_path.unlink(missing_ok=True)
+
+
+@contextmanager
 def mars_service() -> Iterator[object]:
     """Yield an initialized MARS client for the duration of a download."""
     active = active_download_credentials()
     merged = merge_credentials(active)
     settings = merged.ecmwf_settings()
-    ecmwfapi = require_ecmwfapi()
-
-    if settings is not None:
-        url, key, email = settings
-        payload = json.dumps(
-            {"url": url or ECMWF_DEFAULT_URL, "key": key, "email": email},
-            indent=4,
-        ) + "\n"
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
-            handle.write(payload)
-            config_path = Path(handle.name)
-        try:
-            with _ecmwf_api_config(config_path):
-                yield ecmwfapi.ECMWFService("mars")
-        except Exception as exc:
-            raise RuntimeError(f"Failed to initialize MARS client: {sanitize_exception(exc)}") from None
-        finally:
-            config_path.unlink(missing_ok=True)
-        return
-
-    if not ecmwfapirc_path().is_file():
-        raise MarsConfigError(
-            "Missing ECMWF credentials. Pass ecmwf_api_key and ecmwf_email to DataDownloader.ensure(), "
-            f"set ECMWF_API_KEY and ECMWF_API_EMAIL, or create {safe_config_label(ecmwfapirc_path())} "
-            "(see https://api.ecmwf.int/v1/key)."
-        )
-    try:
-        yield ecmwfapi.ECMWFService("mars")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to initialize MARS client: {sanitize_exception(exc)}") from None
+    if settings is None:
+        raise _mars_config_error()
+    url, key, email = settings
+    with _mars_client_from_settings(url, key, email) as client:
+        yield client
 
 
 def download_wave_grib(cache_dir: Path | str, day: str) -> Path:
@@ -129,7 +161,18 @@ def download_wave_grib(cache_dir: Path | str, day: str) -> Path:
                 str(target),
             )
         except Exception as exc:
+            message = sanitize_exception(exc)
+            if "no access to services/mars" in message.lower():
+                raise RuntimeError(
+                    "MARS wave download failed: your ECMWF account is authenticated but "
+                    "not authorised for the MARS archive service. Microsoft Aurora uses the "
+                    "same MARS request; a registered API key alone may be insufficient. "
+                    "See https://www.ecmwf.int/en/forecasts/accessing-forecasts and "
+                    "https://confluence.ecmwf.int/display/UDOC/ecmwf.API+error+1%3A+User+has+no+access+to+services+mars+-+Web+API+FAQ. "
+                    "Workaround: place the GRIB at "
+                    f"{safe_path(target)} and re-run ensure()."
+                ) from None
             raise RuntimeError(
-                f"MARS wave download failed for {day}: {sanitize_exception(exc)}"
+                f"MARS wave download failed for {day}: {message}"
             ) from None
     return target

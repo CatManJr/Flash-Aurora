@@ -626,6 +626,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cdsapi" },
+    { name = "ecmwf-api-client" },
     { name = "einops" },
     { name = "gcsfs" },
     { name = "huggingface-hub" },
@@ -668,6 +669,7 @@ requires-dist = [
     { name = "cdsapi" },
     { name = "cfgrib", marker = "extra == 'grib'" },
     { name = "eccodes", marker = "extra == 'grib'" },
+    { name = "ecmwf-api-client", specifier = ">=1.7.0" },
     { name = "ecmwf-api-client", marker = "extra == 'download'" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "gcsfs", specifier = ">=2026.6.0" },
