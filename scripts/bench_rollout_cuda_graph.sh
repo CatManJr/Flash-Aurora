@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-export AURORA_HF_LOCAL_DIR="${AURORA_HF_LOCAL_DIR:-/root/autodl-tmp/aurora}"
+export AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-./assets}"
 
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-4}"
 WARMUP="${WARMUP:-6}"

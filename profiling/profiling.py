@@ -821,12 +821,16 @@ def main() -> None:
             "(or pass --inference-precision with a graph-capable preset)."
         ),
     )
+    import os
+    from pathlib import Path
+
+    _default_ckpt_dir = os.environ.get("AURORA_ASSET_ROOT") or os.environ.get("AURORA_HF_LOCAL_DIR")
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
-        default="/root/autodl-tmp/aurora",
+        default=_default_ckpt_dir or str(Path.cwd() / "assets"),
         metavar="DIR",
-        help="Directory for Aurora .ckpt files (default: /root/autodl-tmp/aurora).",
+        help="Directory for Aurora .ckpt files (default: AURORA_ASSET_ROOT or ./assets).",
     )
     parser.add_argument(
         "--checkpoint",

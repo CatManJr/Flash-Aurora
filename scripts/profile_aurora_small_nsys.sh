@@ -45,7 +45,7 @@ else
   OUT_BASE="$OUT_DIR/aurora_${INFERENCE_PRECISION}_${STAMP}"
 fi
 export AURORA_NVTX="${AURORA_NVTX:-1}"
-AURORA_HF_LOCAL_DIR="${AURORA_HF_LOCAL_DIR:-/root/autodl-tmp/aurora}"
+AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-./assets}"
 export AURORA_HF_LOCAL_DIR
 
 echo "[nsys] using: ${NSYS_BIN}"

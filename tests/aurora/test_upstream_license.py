@@ -27,8 +27,9 @@ def test_repo_root_license_present() -> None:
     license_path = repo_root / "LICENSE"
     assert license_path.is_file()
     text = license_path.read_text(encoding="utf-8")
-    assert "Catman Jr." in text
-    assert "flash_aurora/aurora/LICENSE.txt" in text
+    assert text.startswith("MIT License\n")
+    assert "Copyright (c) Catman Jr." in text
+    assert "Permission is hereby granted" in text
 
 
 def test_flash_aurora_package_license_present() -> None:

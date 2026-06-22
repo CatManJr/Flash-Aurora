@@ -20,7 +20,9 @@ from flash_aurora.engine.bootstrap import ensure_repo_paths  # noqa: E402
 
 ensure_repo_paths()
 
-_DEFAULT_ASSET_ROOT = Path("/root/autodl-tmp/aurora")
+from _asset_root import default_asset_root
+
+_DEFAULT_ASSET_ROOT = default_asset_root()
 _CHECKPOINT_NAME = "aurora-0.25-pretrained.ckpt"
 _PYTORCH_BASELINE_KEY = "pytorch_backbone_fp32_encoder_decoder_fp32"
 

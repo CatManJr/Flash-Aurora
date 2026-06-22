@@ -35,6 +35,7 @@ _REPO = _BENCH_DIR.parent
 if str(_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_BENCH_DIR))
 import _bootstrap  # noqa: F401, E402
+from _asset_root import default_asset_root
 
 
 from bench_small_pretrained import _load_batch, _purge_gpu  # noqa: E402
@@ -169,7 +170,7 @@ def _analyze_kineto_gaps(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=Path("/root/autodl-tmp/aurora"))
+    parser.add_argument("--data-dir", type=Path, default=default_asset_root())
     parser.add_argument("--tier", type=str, default="bf16_mixed")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=3)

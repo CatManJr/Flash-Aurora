@@ -25,6 +25,7 @@ _BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BENCH_DIR not in sys.path:
     sys.path.insert(0, _BENCH_DIR)
 import _bootstrap  # noqa: F401, E402
+from _asset_root import default_asset_root
 
 
 import numpy as np
@@ -32,7 +33,9 @@ import torch
 
 from _pretrained_era5 import cuda_oom_like, purge_gpu, recover_cuda_after_oom
 
-_DEFAULT_ASSET_ROOT = Path("/root/autodl-tmp/aurora")
+from _asset_root import default_asset_root
+
+_DEFAULT_ASSET_ROOT = default_asset_root()
 _CHECKPOINT_NAME = "aurora-0.1-finetuned.ckpt"
 _STATIC_NAME = "aurora-0.1-static.pickle"
 _STANDARD_LEVELS = (50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000)

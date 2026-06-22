@@ -36,6 +36,7 @@ _BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BENCH_DIR not in sys.path:
     sys.path.insert(0, _BENCH_DIR)
 import _bootstrap  # noqa: F401, E402
+from _asset_root import default_asset_root
 
 
 import numpy as np
@@ -43,7 +44,9 @@ import torch
 
 _REPO = Path(__file__).resolve().parents[1]
 
-_DEFAULT_DATA_DIR = "/root/autodl-tmp/aurora"
+from _asset_root import default_asset_root
+
+_DEFAULT_DATA_DIR = str(default_asset_root())
 _CHECKPOINT_NAME = "aurora-0.25-small-pretrained.ckpt"
 _INPUT_NAME = "aurora-0.25-small-pretrained-test-input.pickle"
 _STATIC_NAME = "aurora-0.25-static.pickle"

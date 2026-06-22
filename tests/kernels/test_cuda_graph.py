@@ -37,14 +37,20 @@ def _smoke_batch(*, batch_size: int = 1, h: int = 32, w: int = 64) -> "Batch":
     reason="CuTe tf32 preset targets recent NVIDIA GPUs",
 )
 def test_backbone_cuda_graph_capture_tf32() -> None:
+    import os
+
     from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
     from flash_aurora.aurora.model.checkpoint_local import resolve_checkpoint_path
     from flash_aurora.aurora.model.inference_tensors import clear_constant_tensor_cache
 
+    asset_root = os.environ.get("AURORA_ASSET_ROOT") or os.environ.get("AURORA_HF_LOCAL_DIR")
+    if not asset_root:
+        pytest.skip("Set AURORA_ASSET_ROOT to a directory with aurora-0.25-small-pretrained.ckpt")
+
     clear_constant_tensor_cache()
     ckpt = resolve_checkpoint_path(
         filename="aurora-0.25-small-pretrained.ckpt",
-        checkpoint_dir="/root/autodl-tmp/aurora",
+        checkpoint_dir=asset_root,
         allow_hub_download=False,
     )
     batch = _smoke_batch()

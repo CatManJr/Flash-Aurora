@@ -31,6 +31,7 @@ _REPO = _BENCH_DIR.parent
 if str(_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_BENCH_DIR))
 import _bootstrap  # noqa: F401, E402
+from _asset_root import default_asset_root
 
 
 from profiling_swin3d import (  # noqa: E402
@@ -328,7 +329,7 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("/root/autodl-tmp/aurora"),
+        default=default_asset_root(),
     )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=5)

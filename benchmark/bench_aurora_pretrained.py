@@ -13,7 +13,7 @@ times ``forward``, and compares outputs against the PyTorch FP32 baseline.
 Examples::
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_pretrained.py \\
-        --asset-root /root/autodl-tmp/aurora
+        --asset-root /path/to/assets
 
     uv run python benchmark/bench_aurora_pretrained.py --suite legacy --warmup 1 --repeat 1
     uv run python benchmark/bench_aurora_pretrained.py --tiers tf32 bf16_mixed@fp32

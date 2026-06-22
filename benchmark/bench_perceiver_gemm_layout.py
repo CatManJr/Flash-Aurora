@@ -7,7 +7,7 @@ problem sizes for layout work (flat M, weight TN, fusion candidates).
 
 Examples::
 
-    CUTE_DSL_ARCH=sm_120a AURORA_HF_LOCAL_DIR=/root/autodl-tmp/aurora \\
+    CUTE_DSL_ARCH=sm_120a AURORA_ASSET_ROOT=/path/to/assets \\
       uv run python benchmark/bench_perceiver_gemm_layout.py
 
     uv run python benchmark/bench_perceiver_gemm_layout.py --micro-iters 100
@@ -28,6 +28,7 @@ _BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BENCH_DIR not in sys.path:
     sys.path.insert(0, _BENCH_DIR)
 import _bootstrap  # noqa: F401, E402
+from _asset_root import default_asset_root
 
 
 import torch
@@ -178,7 +179,7 @@ def main() -> None:
     from bench_small_pretrained import _build_model, _load_batch
 
     p = argparse.ArgumentParser(description="level_decoder GEMM layout catalog + microbench")
-    p.add_argument("--data-dir", type=Path, default=Path(os.environ.get("AURORA_HF_LOCAL_DIR", "/root/autodl-tmp/aurora")))
+    p.add_argument("--data-dir", type=Path, default=default_asset_root())
     p.add_argument("--checkpoint", type=Path, default=None)
     p.add_argument("--precision", default="bf16_mixed")
     p.add_argument("--warmup", type=int, default=20)

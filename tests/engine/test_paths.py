@@ -49,11 +49,28 @@ def test_ensure_root_creates_directory(tmp_path: Path) -> None:
 
 
 def test_library_source_has_no_autodl_paths() -> None:
-    root = Path(__file__).resolve().parents[2] / "flash_aurora"
+    root = Path(__file__).resolve().parents[2]
     forbidden = "/root/autodl-tmp"
+    scan_roots = (
+        root / "flash_aurora",
+        root / "benchmark",
+        root / "scripts",
+        root / "profiling",
+        root / "tests",
+        root / "docs",
+    )
     hits: list[str] = []
-    for path in root.rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if forbidden in text:
-            hits.append(str(path.relative_to(root)))
+    for scan_root in scan_roots:
+        if not scan_root.is_dir():
+            continue
+        for path in scan_root.rglob("*"):
+            if path.suffix not in {".py", ".md", ".sh", ".ipynb"}:
+                continue
+            if any(part in {".venv", "__pycache__", "node_modules"} for part in path.parts):
+                continue
+            if path.resolve() == Path(__file__).resolve():
+                continue
+            text = path.read_text(encoding="utf-8")
+            if forbidden in text:
+                hits.append(str(path.relative_to(root)))
     assert hits == []

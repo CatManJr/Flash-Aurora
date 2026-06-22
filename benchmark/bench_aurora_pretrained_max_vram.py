@@ -7,7 +7,7 @@ Binary-searches the largest batch size in ``[1, cap]`` for which one forward
 Examples::
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_pretrained_max_vram.py \\
-        --asset-root /root/autodl-tmp/aurora
+        --asset-root /path/to/assets
 
     uv run python benchmark/bench_aurora_pretrained_max_vram.py --suite legacy --cap 8
     uv run python benchmark/bench_aurora_pretrained_max_vram.py --tiers tf32 bf16 --report-peak-mb
