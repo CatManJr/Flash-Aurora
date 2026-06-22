@@ -1,12 +1,4 @@
-"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
-
-This file includes modifications and original contributions by Catman Jr.;
-those portions are licensed under the MIT License (see LICENSE).
-
-Pytest coverage for Triton window layout and fused AdaLN used by Swin3D inference.
-
-Requires CUDA and float32; skipped on CPU-only hosts.
-"""
+"""Copyright (c) Catman Jr. Licensed under the MIT license."""
 
 from __future__ import annotations
 

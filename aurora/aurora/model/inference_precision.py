@@ -1,4 +1,6 @@
-"""Inference precision router for Aurora inference presets.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Inference precision router for Aurora inference presets.
 
 Two independent axes (combinable):
 

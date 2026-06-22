@@ -1,3 +1,5 @@
+"""Copyright (c) Catman Jr. Licensed under the MIT license."""
+
 """Tests for Aurora inference precision router presets."""
 
 from __future__ import annotations

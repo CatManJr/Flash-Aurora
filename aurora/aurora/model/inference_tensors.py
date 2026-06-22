@@ -1,4 +1,6 @@
-"""Cached constant GPU tensors for fixed-shape inference (incl. CUDA graph replay).
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Cached constant GPU tensors for fixed-shape inference (incl. CUDA graph replay).
 
 Python scalars / tuples (pressure levels, timestamps, etc.) must not be converted with
 ``torch.tensor(..., device=cuda)`` inside a captured graph — that performs an implicit

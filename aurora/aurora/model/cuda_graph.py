@@ -1,4 +1,6 @@
-"""CUDA graph helpers for fixed-shape inference."""
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+CUDA graph helpers for fixed-shape inference."""
 
 from __future__ import annotations
 

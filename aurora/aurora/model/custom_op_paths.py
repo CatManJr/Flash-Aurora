@@ -1,4 +1,6 @@
-"""Glue between Aurora model forward paths and custom CUDA/Triton/CuTe ops.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Glue between Aurora model forward paths and custom CUDA/Triton/CuTe ops.
 
 Custom Triton/CuTe Swin paths never run inside ``torch.autocast``.
 

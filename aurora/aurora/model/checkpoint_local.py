@@ -1,4 +1,7 @@
-"""Resolve Aurora checkpoints from a local directory (e.g. AutoDL data disk)."""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Resolve Aurora checkpoints from a local directory (e.g. AutoDL data disk).
+"""
 
 from __future__ import annotations
 

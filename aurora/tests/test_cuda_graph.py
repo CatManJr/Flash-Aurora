@@ -1,3 +1,5 @@
+"""Copyright (c) Catman Jr. Licensed under the MIT license."""
+
 """CUDA graph capture tests."""
 
 from __future__ import annotations

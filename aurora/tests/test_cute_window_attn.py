@@ -1,4 +1,6 @@
-"""Pytest coverage for aurora.ops.cute window attention.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Pytest coverage for aurora.ops.cute window attention.
 
 Test matrix
 -----------

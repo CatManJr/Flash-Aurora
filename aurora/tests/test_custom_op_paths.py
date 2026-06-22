@@ -1,3 +1,5 @@
+"""Copyright (c) Catman Jr. Licensed under the MIT license."""
+
 """Tests for custom-op / model-path dtype adapters."""
 
 from __future__ import annotations

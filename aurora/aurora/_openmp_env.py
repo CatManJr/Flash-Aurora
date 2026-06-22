@@ -1,4 +1,7 @@
-"""OpenMP environment fixes (run before importing torch / numpy)."""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+OpenMP environment fixes (run before importing torch / numpy).
+"""
 from __future__ import annotations
 
 import os

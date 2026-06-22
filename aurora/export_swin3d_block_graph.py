@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Export a readable computation graph for one :class:`Swin3DTransformerBlock`.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Export a readable computation graph for one :class:`Swin3DTransformerBlock`.
 
 Uses a thin wrapper so ``res`` / ``rollout_step`` are fixed (TorchScript / export trace
 tensor ops only). Default path matches ``profiling_swin3d_block.py`` (W-MSA, no shift).

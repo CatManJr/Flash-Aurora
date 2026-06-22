@@ -1,4 +1,6 @@
-"""Lightweight NVTX ranges for Nsight Systems (``--trace=nvtx``)."""
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Lightweight NVTX ranges for Nsight Systems (``--trace=nvtx``)."""
 
 from __future__ import annotations
 
