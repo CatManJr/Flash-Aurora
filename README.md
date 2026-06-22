@@ -1,16 +1,18 @@
 # Flash-Aurora: Design and Implement High-Performance Computing Framework for Numerical Field based GFMS
 
-## Install CuTe DSL
+## Install
+
+### Default (PyPI via `uv`)
+
+Most users only need the stable CuTe DSL wheel — no CUTLASS source checkout or CMake build.
 
 ```bash
 git clone ...
-source .venv/bin/activate
-chmod +x cutlass/python/CuTeDSL/setup.sh   # 仅当没有执行权限时
-# For CUDA Toolkit 12.9:
-./cutlass/python/CuTeDSL/setup.sh --cu12
-# For CUDA Toolkit 13.1:
-./cutlass/python/CuTeDSL/setup.sh --cu13
+cd flash-aurora
+uv sync
 ```
+
+This installs `nvidia-cutlass-dsl[cu13]` and `quack-kernels` from PyPI (see `pyproject.toml` for pinned versions).
 
 Set `CUTE_DSL_ARCH=sm_120a` when compiling on Blackwell (SM120). Enable the CuTe path with `AURORA_CUTE_WINDOW_ATTN=1`.
 
@@ -116,3 +118,75 @@ Profile snapshot (`uv run python aurora/profiling_swin3d.py --compare-d2d3 --com
 | D2+D3 | 151.93 | 1.048× | 1414 / 1495 MB |
 
 D2 provides the main gain (speed + large memory drop). D3 (`InferenceWorkspacePool`) is near-neutral for end-to-end latency here and mainly helps allocation stability.
+### CuTe DSL from CUTLASS source code
+
+Use this when you are hacking CuTe DSL itself or need to track [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) `main` instead of the PyPI pin.
+
+#### 1. Clone CUTLASS
+
+Inside the repo (submodule) or as a sibling checkout:
+
+```bash
+cd flash-aurora
+git clone https://github.com/NVIDIA/cutlass.git cutlass
+# optional: git checkout <tag>   # e.g. v4.5.2 to match a release
+```
+
+#### 2. Seed runtime / MLIR from a PyPI wheel
+
+The git tree ships Python sources only. Before editable install, vendor the binary bits (`libcute_dsl_runtime.so`, `cutlass._mlir`, …) from the latest wheel:
+
+```bash
+cd cutlass/python/CuTeDSL
+uv run python prep_editable_install.py
+```
+
+This writes `lib/` and `VERSION.EDITABLE` under `python/CuTeDSL/` (network required).
+
+#### 3. Editable install into the project venv
+
+From `flash-aurora` (with `uv sync` already done once):
+
+```bash
+mkdir -p cutlass/build
+export CUTLASS_IR_BUILD_DIR=$PWD/cutlass/build    # required by setup.sh; use built tree if you ran step 4
+cd cutlass/python/CuTeDSL
+chmod +x setup.sh
+./setup.sh --editable --cu13
+```
+
+`setup.sh --editable` runs `pip install -e ".[dev]"` and wires `CUTE_DSL_LIBS` via the `.pth` hook. If you only edit Aurora/CuTe **Python** (not the IR compiler), `prep_editable_install.py` plus this step is usually enough. Rebuild IR (step 4) when you change `cutlass._mlir` or `libcute_dsl_runtime.so`.
+
+Verify:
+
+```bash
+cd /path/to/flash-aurora
+uv run python -c "import cutlass; import cutlass.cute as cute; print(cutlass.__version__)"
+uv run pytest aurora/tests/test_cute_window_attn.py -q
+```
+
+#### 4. `quack-kernels` version note
+
+| CuTe DSL | Compatible `quack-kernels` |
+|----------|---------------------------|
+| PyPI `4.5.2` (default `uv sync`) | `>=0.5.0,<0.5.1` |
+| dev / `main` (`4.6.0.dev0+`) | `>=0.5.1` (pins dev CuTe DSL) |
+
+After a source install, align quack if needed:
+
+```bash
+uv pip install 'quack-kernels>=0.5.1'
+```
+
+#### Non-editable install from source tree
+
+If you want a normal (non-editable) install from the CUTLASS tree after `prep_editable_install.py`:
+
+```bash
+cd cutlass/python/CuTeDSL
+uv pip install .
+```
+
+This overrides the PyPI `nvidia-cutlass-dsl` pin in the venv until you run `uv sync` again.
+
+See also [CuTe DSL quick start](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html) and `cutlass/python/CuTeDSL/setup.sh --help`.
