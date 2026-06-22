@@ -84,18 +84,18 @@ Production inference uses N=144 windows on the default 0.25-degree grid. BF16 Cu
 
 Measured with `benchmark/bench_aurora_pretrained.py` on **AuroraPretrained** at **721 x 1440**, batch size 1, ERA5 initial conditions (2023-01-01 06:00 UTC). All custom tiers below include the Triton fusion base described above.
 
-| Tier | Forward (ms) | Speedup vs PyTorch FP32 ref | Mean abs error vs ref |
-|------|--------------|----------------------------|------------------------|
-| `bf16_mixed@fp32` | 681.9 | 3.15x | 0.115 |
-| `bf16_mixed@tf32` | 681.4 | 3.16x | 0.115 |
-| `bf16@fp32` | 680.5 | 3.16x | 0.191 |
-| `tf32@tf32` | 931.0 | 2.31x | 0.060 |
-| `tf32@fp32` | 1093.3 | 1.97x | 0.018 |
-| `fp32@fp32` | 1988.9 | 1.08x | 5.4e-05 |
-| PyTorch autocast (backbone) | 1013.7 | 2.12x | 0.140 |
-| PyTorch FP32 ref | 2151.0 | base | 0 |
+| Tier | Forward (ms) | Speedup vs PyTorch FP32 ref | Mean abs error vs ref | Cosine sim vs ref |
+|------|--------------|----------------------------|------------------------|-------------------|
+| `bf16_mixed@fp32` | 681.9 | 3.15x | 0.115 | 1.000 |
+| `bf16_mixed@tf32` | 681.4 | 3.16x | 0.115 | 1.000 |
+| `bf16@fp32` | 680.5 | 3.16x | 0.191 | 1.000 |
+| `tf32@tf32` | 931.0 | 2.31x | 0.060 | 1.000 |
+| `tf32@fp32` | 1093.3 | 1.97x | 0.018 | 1.000 |
+| `fp32@fp32` | 1988.9 | 1.08x | 5.4e-05 | 1.000 |
+| PyTorch autocast (backbone) | 1013.7 | 2.12x | 0.140 | 1.000 |
+| PyTorch FP32 ref | 2151.0 | base | 0 | 1.000 |
 
-The PyTorch FP32 reference uses no custom kernels. Every other custom tier uses Triton layout and AdaLN fusion; `tf32` and BF16 tiers additionally use CuTe window attention and the corresponding backbone matmul mode. All custom tiers pass per-variable mean relative-error tolerances from the upstream golden tests on this ERA5 sample when compared to the PyTorch FP32 reference. Recommended production preset on this hardware: `bf16_mixed@fp32` or `bf16_mixed@tf32` (about 3x speedup with bounded drift).
+The PyTorch FP32 reference uses no custom kernels. Every other custom tier uses Triton layout and AdaLN fusion; `tf32` and BF16 tiers additionally use CuTe window attention and the corresponding backbone matmul mode. Cosine similarity is computed over the flattened output tensor (all surface and atmospheric variables) relative to the PyTorch FP32 reference. All custom tiers pass per-variable mean relative-error tolerances from the upstream golden tests on this ERA5 sample. Recommended production preset on this hardware: `bf16_mixed@fp32` or `bf16_mixed@tf32` (about 3x speedup with bounded drift).
 
 ## AuroraEngine
 
@@ -120,6 +120,15 @@ predictions = engine.run_from_netcdf("/path/to/era5.nc", steps=1)
 ## Testing notes
 
 `test_aurora_small` compares FP64 forward outputs to Microsoft Hugging Face reference pickles. On recent PyTorch builds (for example 2.12.x), a small drift on a few surface variables can appear even with the official `microsoft-aurora` wheel. The test passes and emits a `UserWarning` when drift exceeds upstream tolerances. Use the [vanilla microsoft-aurora library](https://microsoft.github.io/aurora) to verify on your stack.
+
+## License
+
+This repository is licensed under the [MIT License](LICENSE).
+
+Third-party components bundled in the library:
+
+- `flash_aurora.aurora` is derived from [Microsoft Aurora](https://github.com/microsoft/aurora) (MIT). See [`flash_aurora/aurora/LICENSE.txt`](flash_aurora/aurora/LICENSE.txt) and [`flash_aurora/aurora/NOTICE.md`](flash_aurora/aurora/NOTICE.md).
+- Some source files include additional notices (for example NVIDIA BSD-3-Clause in `flash_aurora/aurora/ops/cute/_dense_gemm_sm120.py`). See per-file headers.
 
 ## Reference
 
