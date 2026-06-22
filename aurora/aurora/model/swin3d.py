@@ -360,8 +360,7 @@ class WindowAttention(nn.Module):
                     if q.dtype == torch.bfloat16
                     else WinAttnPrecision.TF32_ACC_FP32
                 )
-                # Bias kept as float32: the CuTeDSL kernel explicitly takes FP32 bias,
-                # and the SDPA fallback path also works with FP32 attn_mask for FP32 Q.
+                # Bias kept as float32: the CuTeDSL kernel takes FP32 bias.
                 bias = None
                 if mask is not None:
                     bias = mask.to(

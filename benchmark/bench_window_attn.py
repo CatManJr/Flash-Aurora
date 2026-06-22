@@ -438,11 +438,9 @@ def main() -> None:
         return
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    cute_on = os.environ.get("AURORA_CUTE_WINDOW_ATTN", "1") != "0"
     print(
         f"GPU {props.name} SM{props.major}{props.minor} | "
-        f"CuTe={_CUTE_AVAILABLE} kernel={_CUTE_KERNEL_VERSION} "
-        f"cute_attn={cute_on} | measured={MEASURED}"
+        f"CuTe={_CUTE_AVAILABLE} kernel={_CUTE_KERNEL_VERSION} | measured={MEASURED}"
     )
 
     coverage_ok = run_checkpoint_coverage()

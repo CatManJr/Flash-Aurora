@@ -2,7 +2,6 @@
 # Compare multi-step rollout with/without backbone CUDA graph (bf16_mixed, bf16, or tf32).
 #
 # Usage (repo root):
-#   export CUTE_DSL_ARCH=sm_120a
 #   ./aurora/scripts/bench_rollout_cuda_graph.sh
 #   ROLLOUT_STEPS=6 INFERENCE_PRECISION=tf32 ./aurora/scripts/bench_rollout_cuda_graph.sh
 
@@ -12,7 +11,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
 export AURORA_HF_LOCAL_DIR="${AURORA_HF_LOCAL_DIR:-/root/autodl-tmp/aurora}"
 
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-4}"

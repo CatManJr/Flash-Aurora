@@ -2,8 +2,8 @@
 # Paired Nsight Systems captures: bf16_mixed vs tf32 (same stamp, NVTX ranges on).
 #
 # Usage (repo root):
-#   export CUTE_DSL_ARCH=sm_120a
 #   ./aurora/scripts/profile_aurora_nsys_pair.sh
+# Optional: export CUTE_DSL_ARCH=sm_120a  # only for cross-compiling to another GPU arch
 #
 # Outputs:
 #   profiling/nsight/aurora_bf16_mixed_<stamp>.nsys-rep
@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
+# CuTe DSL JIT targets the current GPU unless CUTE_DSL_ARCH is set explicitly.
 export AURORA_NVTX=1
 export AURORA_HF_LOCAL_DIR="${AURORA_HF_LOCAL_DIR:-/root/autodl-tmp/aurora}"
 

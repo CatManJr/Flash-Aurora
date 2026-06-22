@@ -1,7 +1,7 @@
 """Nsight profile for CuTe BF16 window attention (v1 single-pass path).
 
 Run from repo root:
-    CUTE_DSL_ARCH=sm_120a uv run python benchmark/profile_nsight_window_attn.py
+    uv run python benchmark/profile_nsight_window_attn.py
 
 Outputs under profiling/nsight/ (nsys .nsys-rep + summary; ncu .ncu-rep if run).
 """
@@ -43,7 +43,6 @@ def _make_tensors(Bwin: int, H: int, N: int, Dh: int):
 
 
 def _run_kernel(tag: str, Bwin: int, H: int, N: int, Dh: int, iters: int) -> None:
-    os.environ.setdefault("AURORA_CUTE_WINDOW_ATTN", "1")
     q, k, v = _make_tensors(Bwin, H, N, Dh)
     # Compile + warmup
     for _ in range(5):

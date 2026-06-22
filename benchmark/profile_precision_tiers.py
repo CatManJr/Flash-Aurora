@@ -39,7 +39,6 @@ _AURORA_ROOT = _REPO / "aurora"
 if _AURORA_ROOT.is_dir():
     sys.path.insert(0, str(_AURORA_ROOT))
 
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_120a")
 
 from profiling_swin3d import (  # noqa: E402
     _aggregate_full_table_kpis,

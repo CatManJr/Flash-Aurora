@@ -14,7 +14,9 @@ uv sync
 
 This installs `nvidia-cutlass-dsl[cu13]` and `quack-kernels` from PyPI (see `pyproject.toml` for pinned versions).
 
-Set `CUTE_DSL_ARCH=sm_120a` when compiling on Blackwell (SM120). Enable the CuTe path with `AURORA_CUTE_WINDOW_ATTN=1`.
+CuTe DSL **JIT-compiles for the current GPU** by default; you do not need `CUTE_DSL_ARCH` unless cross-compiling for another architecture (e.g. `CUTE_DSL_ARCH=sm_120a`). Window-attention kernels use **SM80-style MMA / cp.async** (not tcgen05); the multi-pass BF16 stream path adds **SM120 TMA** warp specialization when the device is Blackwell.
+
+Enable CuTe window attention via model `use_cute_window_attn=True` (inference presets `tf32` / `bf16_mixed` / `bf16` do this automatically).
 
 ## Notes (this repo)
 
@@ -97,7 +99,7 @@ Production Aurora inference uses **`N = 144`** tokens per window (`window_size =
 | Repro | Isolated `window_attn_fwd_cute` / qkv-packed BF16 at `N = 16`; TF32 CuTe at the same shape is fine. |
 | Root cause | BF16 **v1** single-pass prefetches **V** with **K** via **cp.async** before QK. For short `N`, the 128-thread MMA tile covers more rows/cols than `seqlen`; unpredicated V/K gmem copies can **read past valid memory**. TF32 v2 avoids this by loading V **after** QK+softmax with a sync, predicated path. |
 | Why not fixed | A dedicated short-window kernel was explored; padding to 32×32 tiles caused correctness issues on some `N`. User decision: **ignore** — these windows will not appear in target deployments. |
-| Workaround | Use `TF32_ACC_FP32`, PyTorch SDPA, or `AURORA_CUTE_WINDOW_ATTN=0` if you must run architectures with merged windows `N < 32`. |
+| Workaround | Use `TF32_ACC_FP32` or disable `use_cute_window_attn` on architectures with merged windows `N < 32`. |
 
 If you add new patch resolutions or window layouts, confirm **`N ≥ 32`** (ideally `N = 144`) on every stage that enables `use_cute_window_attn` + `cute_window_attn_dtype=bfloat16`.
 

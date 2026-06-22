@@ -4,9 +4,9 @@ Pytest coverage for aurora.ops.cute window attention.
 
 Test matrix
 -----------
-TF32_ACC_FP32  – stable FP32-logits path (TF32 matmul allowed) vs strict-FP32 SDPA.
-BF16_MIXED     – stable path vs FP32 SDPA reference.
-window_attn_dispatch – CUDA stable path or SDPA (strict / use_cute=False / CPU).
+TF32_ACC_FP32  – vs PyTorch SDPA (TF32 matmul when applicable).
+BF16_MIXED     – vs PyTorch SDPA at BF16 I/O.
+window_attn_dispatch – CuTeDSL wrapper (dtype to precision).
 
 Shape coverage
 --------------
@@ -15,8 +15,7 @@ N = 288  2×6×24 or 4×6×12  (double spatial resolution)
 N = 576  2×12×24            (quadruple spatial resolution)
 Dh = 64  uniform across all Aurora encoder heads
 
-CuTeDSL GEMM tests: set ``AURORA_CUTE_WINDOW_ATTN=1`` (optional); most tests need
-only CUDA (``requires_cuda``).
+CuTeDSL GEMM tests require CUDA (``requires_cuda`` / ``requires_cute``).
 """
 from __future__ import annotations
 
@@ -29,7 +28,6 @@ import torch.nn.functional as F
 
 from aurora.ops.cute.window_attn_fwd import (
     _CUTE_AVAILABLE,
-    _attention_window_stable,
     _expand_bias_for_sdpa,
     _choose_tile_n,
     _choose_tile_n_tf32,
@@ -52,10 +50,6 @@ requires_cuda = pytest.mark.skipif(
 requires_cute = pytest.mark.skipif(
     not torch.cuda.is_available() or not _CUTE_AVAILABLE,
     reason="CUDA + CuTeDSL (cutlass + quack) required",
-)
-requires_cute_env = pytest.mark.skipif(
-    not torch.cuda.is_available() or not _CUTE_AVAILABLE,
-    reason="CUDA + CuTeDSL + AURORA_CUTE_WINDOW_ATTN=1",
 )
 
 # ---------------------------------------------------------------------------
@@ -89,6 +83,31 @@ def _make_bias(nW: int, N: int, device: str, seed: int = 7) -> torch.Tensor:
     return bias
 
 
+def _sdpa_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    scale: float,
+    *,
+    allow_tf32: bool = False,
+) -> torch.Tensor:
+    """PyTorch SDPA at the same dtype as q/k/v (TF32 matmul only for FP32 inputs)."""
+    Bwin, H, N, _ = q.shape
+    attn_mask = _expand_bias_for_sdpa(bias, Bwin, H, N) if bias is not None else None
+    if attn_mask is not None and attn_mask.dtype != q.dtype:
+        attn_mask = attn_mask.to(dtype=q.dtype)
+
+    use_tf32 = allow_tf32 and q.dtype == torch.float32
+    old = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+    try:
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old
+    return out
+
+
 def _fp32_sdpa_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -97,18 +116,10 @@ def _fp32_sdpa_reference(
     scale: float,
     allow_tf32: bool = False,
 ) -> torch.Tensor:
-    """Strict-FP32 or TF32 SDPA reference (inputs cast to float32)."""
-    qf, kf, vf = q.float(), k.float(), v.float()
-    Bwin, H, N, _ = qf.shape
-    attn_mask = _expand_bias_for_sdpa(bias, Bwin, H, N) if bias is not None else None
-
-    old = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-    try:
-        out = F.scaled_dot_product_attention(qf, kf, vf, attn_mask=attn_mask, scale=scale)
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = old
-    return out
+    """FP32 SDPA reference (inputs promoted to float32)."""
+    return _sdpa_reference(
+        q.float(), k.float(), v.float(), bias, scale, allow_tf32=allow_tf32
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -194,40 +205,32 @@ def test_tf32_output_shape_dtype() -> None:
 
 _LARGE_ACT_SCALES = (1.0, 4.0, 5.0)
 
-# vs torch SDPA (TF32 matmul allowed) — tight at small logits, looser at production scale
+# vs torch SDPA at the same precision — tight at small logits, looser at production scale
 _TF32_VS_SDPA_MAX_ABS = {1.0: 0.05, 4.0: 0.16, 5.0: 0.26}
-# vs explicit stable softmax — guards mask regression (was O(10) before fix)
-_TF32_VS_STABLE_MAX_ABS = {1.0: 0.05, 4.0: 0.16, 5.0: 0.26}
-_BF16_VS_STABLE_MAX_ABS = {1.0: 0.02, 4.0: 0.8, 5.0: 1.7}
+_BF16_VS_SDPA_MAX_ABS = {1.0: 0.02, 4.0: 0.8, 5.0: 1.7}
 
 
 @requires_cute
 @pytest.mark.parametrize("activation_scale", _LARGE_ACT_SCALES)
 def test_tf32_swin_mask_large_activations(activation_scale: float) -> None:
-    """CuTe TF32 + Swin -100 mask: no O(10) drift vs SDPA/stable at large logits."""
+    """CuTe TF32 + Swin -100 mask: align with PyTorch SDPA (TF32 matmul) at large logits."""
     Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
     q, k, v = _make_qkv(
         Bwin, H, N, Dh, torch.float32, "cuda", activation_scale=activation_scale
     )
     bias = _make_bias(nW, N, "cuda")
     scale = 1.0 / math.sqrt(Dh)
-    tol_sdpa = _TF32_VS_SDPA_MAX_ABS[activation_scale]
-    tol_stable = _TF32_VS_STABLE_MAX_ABS[activation_scale]
+    tol = _TF32_VS_SDPA_MAX_ABS[activation_scale]
 
     with torch.no_grad():
-        ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=True)
-        stable = _attention_window_stable(q, k, v, bias, scale, strict_fp32=False)
+        ref = _sdpa_reference(q, k, v, bias, scale, allow_tf32=True)
         out = window_attn_fwd_cute(
             q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
         )
 
-    max_sdpa = (out - ref).abs().max().item()
-    max_stable = (out - stable).abs().max().item()
-    assert max_sdpa < tol_sdpa, (
-        f"vs SDPA activation_scale={activation_scale} max_err={max_sdpa} tol={tol_sdpa}"
-    )
-    assert max_stable < tol_stable, (
-        f"vs stable activation_scale={activation_scale} max_err={max_stable} tol={tol_stable}"
+    max_err = (out - ref).abs().max().item()
+    assert max_err < tol, (
+        f"vs SDPA activation_scale={activation_scale} max_err={max_err} tol={tol}"
     )
 
 
@@ -264,25 +267,24 @@ def test_tf32_qkvpacked_swin_mask_large_activations(activation_scale: float) -> 
 @requires_cute
 @pytest.mark.parametrize("activation_scale", _LARGE_ACT_SCALES)
 def test_bf16_swin_mask_large_activations(activation_scale: float) -> None:
-    """BF16 CuTe + mask must track FP32 stable (catches mask regression, allows BF16 MMA slack)."""
+    """BF16 CuTe + mask: align with PyTorch SDPA at BF16 I/O."""
     Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
-    q_f, k_f, v_f = _make_qkv(
-        Bwin, H, N, Dh, torch.float32, "cuda", activation_scale=activation_scale
+    q, k, v = _make_qkv(
+        Bwin, H, N, Dh, torch.bfloat16, "cuda", activation_scale=activation_scale
     )
     bias = _make_bias(nW, N, "cuda")
     scale = 1.0 / math.sqrt(Dh)
-    q, k, v = q_f.bfloat16(), k_f.bfloat16(), v_f.bfloat16()
-    tol = _BF16_VS_STABLE_MAX_ABS[activation_scale]
+    tol = _BF16_VS_SDPA_MAX_ABS[activation_scale]
 
     with torch.no_grad():
-        stable = _attention_window_stable(q_f, k_f, v_f, bias, scale, strict_fp32=False)
+        ref = _sdpa_reference(q, k, v, bias, scale)
         out = window_attn_fwd_cute(
             q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.BF16_MIXED
         )
 
-    max_err = (out.float() - stable).abs().max().item()
+    max_err = (out - ref).abs().max().item()
     assert max_err < tol, (
-        f"vs stable activation_scale={activation_scale} max_err={max_err} tol={tol}"
+        f"vs SDPA activation_scale={activation_scale} max_err={max_err} tol={tol}"
     )
 
 
@@ -466,7 +468,7 @@ def test_tf32_qkvpacked_bnc_output_matches_regular_cute(has_bias: bool) -> None:
 # window_attn_dispatch — routing tests
 # ===========================================================================
 
-@requires_cuda
+@requires_cute
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_dispatch_output_shape_and_dtype(dtype: torch.dtype) -> None:
     Bwin, H, N, Dh = 4, 8, 64, 64
@@ -477,71 +479,31 @@ def test_dispatch_output_shape_and_dtype(dtype: torch.dtype) -> None:
     assert out.dtype == dtype
 
 
-@requires_cuda
-def test_dispatch_fp32_tf32_vs_strict_numerically_close() -> None:
-    """TF32 CuTe kernel and strict-FP32 SDPA produce results within tolerance.
-
-    fp32_precision="tf32"   → CuTeDSL TF32 kernel (or SDPA if CuTe unavailable)
-    fp32_precision="strict" → torch SDPA with TF32 disabled (Aurora's native path)
-    """
+@requires_cute
+def test_dispatch_matches_fwd_cute() -> None:
     Bwin, H, N, Dh = 4, 8, 64, 64
     q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
     with torch.no_grad():
-        tf32_out   = window_attn_dispatch(q, k, v, fp32_precision="tf32")
-        strict_out = window_attn_dispatch(q, k, v, fp32_precision="strict")
-    # TF32 truncates mantissa to 10 bits; differences should be small but non-zero
-    torch.testing.assert_close(tf32_out, strict_out, rtol=1e-3, atol=1e-3)
-
-
-@requires_cuda
-def test_dispatch_strict_fp32_matches_sdpa() -> None:
-    """fp32_precision='strict' must exactly match torch SDPA (TF32 disabled)."""
-    Bwin, H, N, Dh = 4, 8, 64, 64
-    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
-    scale = 1.0 / math.sqrt(Dh)
-    with torch.no_grad():
-        strict_out = window_attn_dispatch(
-            q, k, v, scale_qk=scale, fp32_precision="strict"
+        via_dispatch = window_attn_dispatch(q, k, v)
+        via_cute = window_attn_fwd_cute(
+            q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32
         )
-        ref = _fp32_sdpa_reference(q, k, v, None, scale, allow_tf32=False)
-    torch.testing.assert_close(strict_out, ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(via_dispatch, via_cute, rtol=0, atol=0)
 
 
-@requires_cuda
+@requires_cute
 def test_dispatch_bias_broadcast_correctness() -> None:
-    """(nW, N, N) bias must produce same result as manually expanded (Bwin,1,N,N).
-
-    Uses the strict-FP32 SDPA path for bit-exact comparison.
-    """
+    """(nW, N, N) bias must match SDPA with manually expanded (Bwin, 1, N, N)."""
     Bwin, H, N, Dh, nW = 8, 4, 64, 64, 4
     q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
-    bias_nW = _make_bias(nW, N, "cuda")           # (nW, N, N)
-
-    win_ids = torch.arange(Bwin, device="cuda") % nW
-    bias_full = bias_nW[win_ids].unsqueeze(1)     # (Bwin, 1, N, N)
+    bias_nW = _make_bias(nW, N, "cuda")
     scale = 1.0 / math.sqrt(Dh)
 
     with torch.no_grad():
-        out = window_attn_dispatch(
-            q, k, v, bias=bias_nW, scale_qk=scale, fp32_precision="strict"
-        )
-        ref = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=bias_full, scale=scale
-        )
+        out = window_attn_dispatch(q, k, v, bias=bias_nW, scale_qk=scale)
+        ref = _sdpa_reference(q, k, v, bias_nW, scale, allow_tf32=True)
 
-    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-
-
-@requires_cuda
-def test_dispatch_no_cute_fallback_to_sdpa() -> None:
-    """use_cute=False must give the same result as plain SDPA."""
-    Bwin, H, N, Dh = 4, 8, 64, 64
-    q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
-    scale = 1.0 / math.sqrt(Dh)
-    with torch.no_grad():
-        no_cute = window_attn_dispatch(q, k, v, scale_qk=scale, use_cute=False)
-        sdpa    = F.scaled_dot_product_attention(q, k, v, scale=scale)
-    torch.testing.assert_close(no_cute, sdpa, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
 
 
 # ===========================================================================
@@ -594,12 +556,12 @@ def test_bf16_mixed_dtype_guard() -> None:
         )
 
 
-def test_dispatch_cpu_fallback_returns_correct_shape() -> None:
-    """CPU tensors must fall through to plain SDPA without error."""
+def test_dispatch_requires_cuda() -> None:
+    """CuTe window attention requires CUDA SM120 tensors."""
     Bwin, H, N, Dh = 2, 4, 16, 16
     q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cpu")
-    out = window_attn_dispatch(q, k, v)
-    assert out.shape == (Bwin, H, N, Dh)
+    with pytest.raises(RuntimeError, match="CUDA"):
+        window_attn_dispatch(q, k, v)
 
 
 # ===========================================================================

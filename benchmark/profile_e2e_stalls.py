@@ -43,7 +43,6 @@ _AURORA_ROOT = _REPO / "aurora"
 if _AURORA_ROOT.is_dir():
     sys.path.insert(0, str(_AURORA_ROOT))
 
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_120a")
 
 from bench_small_pretrained import _load_batch, _purge_gpu  # noqa: E402
 from profile_precision_tiers import _aggregate_buckets, _bucket_tier_profile  # noqa: E402

@@ -31,7 +31,6 @@ if _BENCH_DIR not in sys.path:
     sys.path.insert(0, _BENCH_DIR)
 import _bootstrap  # noqa: F401, E402
 
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_120a")
 
 import torch
 

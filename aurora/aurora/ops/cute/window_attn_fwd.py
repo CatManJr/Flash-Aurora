@@ -3,22 +3,19 @@
 This file includes modifications and original contributions by Catman Jr.;
 those portions are licensed under the MIT License (see LICENSE).
 
-Window attention forward: stable softmax reference + optional CuTe kernels.
+Window attention forward via CuTeDSL kernels (SM80+ MMA; SM120 TMA stream when available).
 
-``AURORA_CUTE_WINDOW_ATTN=1`` selects CuTeDSL in ``_kernel_bf16.py`` /
-``_kernel_fp32.py``. Tile sizes: ``_smem_utils.py``.
+Kernels: ``_kernel_bf16.py`` / ``_kernel_fp32.py``. Tile sizes: ``_smem_utils.py``.
 
 References:
 - flash-attn ``flash_attn/cute/interface.py`` — dispatch / compile-cache patterns (Tri Dao).
 """
-import contextlib
 import math
 import os
 from enum import Enum
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from ._smem_utils import (  # noqa: F401
     _get_smem_budget_bytes,
@@ -52,16 +49,10 @@ except ImportError:
 class WinAttnPrecision(Enum):
     """Precision mode for :func:`window_attn_fwd_cute`.
 
-    By default :func:`window_attn_fwd_cute` uses an explicit FP32 softmax path
-    (BF16 or FP32 I/O).  With ``AURORA_CUTE_WINDOW_ATTN=1`` and CuTeDSL available:
-
     ``BF16_MIXED``
         BF16 I/O, FP32 accumulators — SM80 ``mma.sync.m16n8k16.bf16.bf16.f32``.
     ``TF32_ACC_FP32``
         FP32 I/O, TF32 matmul — SM80 ``mma.sync.m16n8k8.tf32.tf32.f32``.
-
-    For strict FP32 (no TF32 in torch matmuls) use
-    ``fp32_precision="strict"`` with :func:`window_attn_dispatch`.
     """
 
     BF16_MIXED    = "bf16_mixed"
@@ -69,18 +60,15 @@ class WinAttnPrecision(Enum):
 
 
 # ---------------------------------------------------------------------------
-# Torch-side helpers (SDPA fallback path)
+# Torch-side helpers (SDPA reference for tests / benchmarks)
 # ---------------------------------------------------------------------------
 
-@contextlib.contextmanager
-def _tf32_disabled():
-    """Temporarily disable TF32 for torch matmuls (strict FP32 path)."""
-    old = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-    try:
-        yield
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = old
+def _require_cute_available() -> None:
+    if not _CUTE_AVAILABLE:
+        raise RuntimeError(
+            "Aurora CuTe window attention requires CuTeDSL (nvidia-cutlass-dsl + quack). "
+            "Use the original Aurora model path with use_cute_window_attn=False instead."
+        )
 
 
 def _expand_bias_for_sdpa(
@@ -107,45 +95,10 @@ def _expand_bias_for_sdpa(
     return bias_expanded
 
 
-def _attention_window_stable(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    scale_qk: float,
-    *,
-    strict_fp32: bool = False,
-) -> torch.Tensor:
-    """Scaled softmax attention with explicit stable softmax (FP32 logits).
-
-    Same recipe as a merged sliding-window reference: logits, row max subtract,
-    ``exp``, L1 normalize rows, weighted sum of ``V``.  Output dtype matches ``q``.
-    """
-    dtype = q.dtype
-    qf = q.float()
-    kf = k.float()
-    vf = v.float()
-    Bwin, H, N, Dh = q.shape
-    ctx = _tf32_disabled() if strict_fp32 else contextlib.nullcontext()
-    with ctx:
-        logits = torch.matmul(qf, kf.transpose(-1, -2)) * scale_qk
-    if bias is not None:
-        logits = logits + _expand_bias_for_sdpa(bias, Bwin, H, N)
-    logits_max = logits.max(dim=-1, keepdim=True).values
-    logits = logits - logits_max
-    weights = torch.exp(logits)
-    denom = weights.sum(dim=-1, keepdim=True)
-    weights = weights / denom
-    with ctx:
-        out = torch.matmul(weights, vf)
-    return out.to(dtype)
-
-
 # ---------------------------------------------------------------------------
 # CuTeDSL entry point
 # ---------------------------------------------------------------------------
 
-_ENV_CUTE_WINDOW = "AURORA_CUTE_WINDOW_ATTN"
 # Single-pass BF16 (tile_n >= N, e.g. production N=144) routing.
 # Default OFF: the 128-thread cp.async kernel beats the TMA Stream kernel here.
 # With a single KV tile there is nothing for the dedicated DMA warp to prefetch,
@@ -179,24 +132,10 @@ def _bf16_tile_n(seq_len: int, head_dim: int, tile_m: int, tile_n: Optional[int]
     return _choose_tile_n(seq_len, head_dim=head_dim, tile_m=tile_m)
 
 
-def _require_sm120_cute(q: torch.Tensor) -> None:
-    """CuTe kernels are built for sm_120a; fail on other arches."""
+def _require_cuda_for_cute(q: torch.Tensor) -> None:
+    """CuTe kernels require CUDA; arch is picked by CuTe DSL from the current device."""
     if not q.is_cuda:
         raise RuntimeError("Aurora CuTe window attention requires CUDA tensors.")
-
-    major, minor = torch.cuda.get_device_capability(q.device)
-    if major * 10 + minor != 120:
-        raise RuntimeError(
-            "Aurora CuTe window attention targets sm_120 only; "
-            f"got compute capability {major}.{minor}."
-        )
-
-    cute_arch = os.environ.get("CUTE_DSL_ARCH")
-    if cute_arch is not None and cute_arch not in {"sm_120", "sm_120a"}:
-        raise RuntimeError(
-            "Aurora CuTe window attention expects CUTE_DSL_ARCH=sm_120 "
-            f"or sm_120a when set; got {cute_arch!r}."
-        )
 
 
 def window_attn_fwd_cute(
@@ -227,8 +166,9 @@ def window_attn_fwd_cute(
     precision:
         See :class:`WinAttnPrecision`.
     tile_m, tile_n:
-        GEMM tile sizes for the CuTeDSL path (set ``AURORA_CUTE_WINDOW_ATTN=0`` to opt out).
+        GEMM tile sizes for the CuTeDSL kernel.
     """
+    _require_cute_available()
     if precision == WinAttnPrecision.TF32_ACC_FP32:
         assert q.dtype == torch.float32, "TF32_ACC_FP32 requires float32 tensors"
     else:
@@ -238,17 +178,7 @@ def window_attn_fwd_cute(
     if scale_qk is None:
         scale_qk = 1.0 / math.sqrt(Dh)
 
-    use_cute_kernel = os.environ.get(_ENV_CUTE_WINDOW, "1") != "0"
-    if use_cute_kernel and not _CUTE_AVAILABLE:
-        raise RuntimeError(
-            "Aurora CuTe window attention is enabled but CuTeDSL is unavailable. "
-            f"Set {_ENV_CUTE_WINDOW}=0 to explicitly use the torch fallback."
-        )
-    if not use_cute_kernel:
-        return _attention_window_stable(
-            q, k, v, bias, scale_qk, strict_fp32=False,
-        )
-    _require_sm120_cute(q)
+    _require_cuda_for_cute(q)
 
     if not q.is_contiguous():
         q = q.contiguous()
@@ -351,28 +281,15 @@ def window_attn_fwd_cute_qkvpacked(
     if output_layout not in {"bhnd", "bnc"}:
         raise ValueError(f"output_layout must be 'bhnd' or 'bnc', got {output_layout!r}")
 
+    _require_cute_available()
+
     Bwin, N, three_c = qkv.shape
     Dh = three_c // (3 * num_heads)
     H = num_heads
     if scale_qk is None:
         scale_qk = 1.0 / math.sqrt(Dh)
 
-    use_cute_kernel = os.environ.get(_ENV_CUTE_WINDOW, "1") != "0"
-    if use_cute_kernel and not _CUTE_AVAILABLE:
-        raise RuntimeError(
-            "Aurora CuTe window attention is enabled but CuTeDSL is unavailable. "
-            f"Set {_ENV_CUTE_WINDOW}=0 to explicitly use the torch fallback."
-        )
-    if not use_cute_kernel:
-        qkv_view = qkv.view(Bwin, N, 3, H, Dh)
-        q = qkv_view[:, :, 0].permute(0, 2, 1, 3)
-        k = qkv_view[:, :, 1].permute(0, 2, 1, 3)
-        v = qkv_view[:, :, 2].permute(0, 2, 1, 3)
-        out = _attention_window_stable(q, k, v, bias, scale_qk, strict_fp32=False)
-        if output_layout == "bnc":
-            return out.permute(0, 2, 1, 3).reshape(Bwin, N, H * Dh)
-        return out
-    _require_sm120_cute(qkv)
+    _require_cuda_for_cute(qkv)
 
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
@@ -447,73 +364,31 @@ def window_attn_dispatch(
     bias: Optional[torch.Tensor] = None,
     *,
     scale_qk: Optional[float] = None,
-    use_cute: bool = True,
-    fp32_precision: str = "tf32",
     tile_m: int = 64,
     tile_n: Optional[int] = None,
 ) -> torch.Tensor:
-    """Dispatch window attention to the best available backend.
+    """Run window attention via CuTeDSL (CUDA; arch from current GPU or ``CUTE_DSL_ARCH``).
 
-    Routing table
-    -------------
-    ``use_cute=True`` + CUDA + BF16                        →  :func:`window_attn_fwd_cute` (stable)
-    ``use_cute=True`` + CUDA + FP32 + ``fp32_precision="tf32"``
-                                                           →  :func:`window_attn_fwd_cute` (stable; TF32 allowed in torch matmuls)
-    ``fp32_precision="strict"`` or ``use_cute=False``      →  torch SDPA
-
-    CuTeDSL GEMM kernels run only when ``AURORA_CUTE_WINDOW_ATTN=1`` inside
-    :func:`window_attn_fwd_cute`.
-
-    Parameters
-    ----------
-    q, k, v:
-        Shape ``(Bwin, H, N, Dh)``.  Dtype must be ``float32`` or
-        ``bfloat16``.
-    bias:
-        Optional ``(nW, N, N)`` float32 shifted-window mask.
-    scale_qk:
-        Attention scale.  Defaults to ``1 / sqrt(Dh)``.
-    use_cute:
-        If ``True`` (default), use the stable explicit-softmax path on CUDA.
-        If ``False``, use torch SDPA.
-    fp32_precision:
-        For float32 inputs only.
-        ``"tf32"``    Stable path with TF32 allowed in matmuls (default).
-        ``"strict"``  torch SDPA with TF32 disabled.
-    tile_m, tile_n:
-        Forwarded to CuTeDSL only when ``AURORA_CUTE_WINDOW_ATTN=1``.
+    Thin wrapper around :func:`window_attn_fwd_cute` that picks precision from
+    ``q.dtype`` (``bfloat16`` -> ``BF16_MIXED``, ``float32`` -> ``TF32_ACC_FP32``).
     """
     if scale_qk is None:
         scale_qk = 1.0 / math.sqrt(q.shape[-1])
 
-    Bwin, H, N, _ = q.shape
-
-    use_cute_kernel = (
-        use_cute
-        and q.is_cuda
-        and q.dtype in (torch.float32, torch.bfloat16)
-        and not (q.dtype == torch.float32 and fp32_precision == "strict")
+    precision = (
+        WinAttnPrecision.BF16_MIXED
+        if q.dtype == torch.bfloat16
+        else WinAttnPrecision.TF32_ACC_FP32
     )
-
-    if use_cute_kernel:
-        precision = (
-            WinAttnPrecision.BF16_MIXED
-            if q.dtype == torch.bfloat16
-            else WinAttnPrecision.TF32_ACC_FP32
-        )
-        has_bias = bias is not None
-        is_bf16 = q.dtype == torch.bfloat16
-        return window_attn_fwd_cute(
-            q, k, v, bias,
-            scale_qk=scale_qk,
-            precision=precision,
-            tile_m=_best_tile_m(is_bf16, has_bias),
-            tile_n=tile_n,
-        )
-
-    # Fallback: Aurora's native SDPA path (strict FP32 / CPU / use_cute=False).
-    attn_mask = _expand_bias_for_sdpa(bias, Bwin, H, N) if bias is not None else None
-    use_tf32  = not (q.dtype == torch.float32 and fp32_precision == "strict")
-    ctx = contextlib.nullcontext() if use_tf32 else _tf32_disabled()
-    with ctx:
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale_qk)
+    has_bias = bias is not None
+    is_bf16 = q.dtype == torch.bfloat16
+    return window_attn_fwd_cute(
+        q,
+        k,
+        v,
+        bias,
+        scale_qk=scale_qk,
+        precision=precision,
+        tile_m=_best_tile_m(is_bf16, has_bias) if tile_m == 64 else tile_m,
+        tile_n=tile_n,
+    )
