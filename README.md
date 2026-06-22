@@ -1,4 +1,4 @@
-# Flash-Aurora
+# Flash-Aurora: One More Step Toward Efficient Geospatial FOundation Models Inference Service
 
 High-performance inference stack for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model. The repository packages the upstream model under `flash_aurora.aurora`, custom CUDA kernels (Triton and CuTeDSL), precision routing, and `flash_aurora.engine` for data ingress, checkpoints, rollout, and export.
 
@@ -119,7 +119,7 @@ predictions = engine.run_from_netcdf("/path/to/era5.nc", steps=1)
 
 ## Testing notes
 
-`test_aurora_small` compares FP64 forward outputs to Microsoft Hugging Face reference pickles. On recent PyTorch builds (for example 2.12.x), a small drift on a few surface variables can appear even with the official `microsoft-aurora` wheel. The test passes and emits a `UserWarning` when drift exceeds upstream tolerances. Use `scripts/compare_upstream_golden.py` to verify on your stack.
+`test_aurora_small` compares FP64 forward outputs to Microsoft Hugging Face reference pickles. On recent PyTorch builds (for example 2.12.x), a small drift on a few surface variables can appear even with the official `microsoft-aurora` wheel. The test passes and emits a `UserWarning` when drift exceeds upstream tolerances. Use the [vanilla microsoft-aurora library](https://microsoft.github.io/aurora) to verify on your stack.
 
 ## Reference
 
