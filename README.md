@@ -1,204 +1,128 @@
-# Flash-Aurora: Design and Implement High-Performance Computing Framework for Numerical Field based GFMS
+# Flash-Aurora
+
+High-performance inference stack for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model. The repository packages the upstream model under `flash_aurora.aurora`, custom CUDA kernels (Triton and CuTeDSL), precision routing, and `flash_aurora.engine` for data ingress, checkpoints, rollout, and export.
 
 ## Install
 
-### Default (PyPI via `uv`)
-
-Most users only need the stable CuTe DSL wheel — no CUTLASS source checkout or CMake build.
-
 ```bash
-git clone ...
+git clone <repository-url>
 cd flash-aurora
 uv sync
 ```
 
-This installs `nvidia-cutlass-dsl[cu13]` and `quack-kernels` from PyPI (see `pyproject.toml` for pinned versions).
+Dependencies include PyTorch, `nvidia-cutlass-dsl[cu13]`, and `quack-kernels` (see `pyproject.toml`). CuTe DSL JIT-compiles for the local GPU by default.
 
-CuTe DSL **JIT-compiles for the current GPU** by default; you do not need `CUTE_DSL_ARCH` unless cross-compiling for another architecture (e.g. `CUTE_DSL_ARCH=sm_120a`). Window-attention kernels use **SM80-style MMA / cp.async** (not tcgen05); the multi-pass BF16 stream path adds **SM120 TMA** warp specialization when the device is Blackwell.
+## Repository layout
 
-Enable CuTe window attention via model `use_cute_window_attn=True` (inference presets `tf32` / `bf16_mixed` / `bf16` do this automatically).
+| Path | Role |
+|------|------|
+| `flash_aurora/aurora/` | Aurora model fork (upstream README preserved in place). See `NOTICE.md` and `LICENSE.txt`. |
+| `flash_aurora/engine/` | `AuroraEngine`, presets, NetCDF ingress, rollout, export. |
+| `flash_aurora/aurora/ops/triton/` | Fused Swin layout and AdaLN kernels. |
+| `flash_aurora/aurora/ops/cute/` | CuTeDSL window self-attention kernels. |
+| `benchmark/` | Kernel- and model-level timing scripts. |
+| `tests/` | `tests/aurora`, `tests/kernels`, `tests/engine`. |
 
-## Notes (this repo)
+Run tests: `./scripts/run_tests.sh`
 
-The [`flash_aurora/aurora/`](flash_aurora/aurora/) package is the [Microsoft Aurora](https://github.com/microsoft/aurora) model code with local changes for inference-oriented performance experiments. See [`LICENSE.txt`](flash_aurora/aurora/LICENSE.txt) and [`NOTICE.md`](flash_aurora/aurora/NOTICE.md).
+## Inference precision tiers
 
-- **Triton ops** (CUDA inference) under [`flash_aurora/aurora/ops/`](flash_aurora/aurora/ops/): window **layout**, **AdaLN**, **Perceiver LN**. MLP uses PyTorch/cuBLAS; planned fusion in [`cute/mlp_ffn.py`](flash_aurora/aurora/ops/cute/mlp_ffn.py) (CuTe / [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/develop/python/cudnn)). Legacy tanh GELU: `triton_gelu.py` via `use_triton_mlp=True`.
-- **D2 (fused AdaLN + residual)**: used from `AdaptiveLayerNorm` and `Swin3DTransformerBlock` when enabled; see tests in [`tests/kernels/test_triton_swin3d.py`](tests/kernels/test_triton_swin3d.py).
-- **D3 (inference workspace pool)**: [`InferenceWorkspacePool`](flash_aurora/aurora/model/workspace_pool.py) reuses a scratch buffer for the backbone's final decoder `concat` (`torch.cat(..., out=buf)`), optional on [`Swin3DTransformerBackbone`](flash_aurora/aurora/model/swin3d.py) / [`Aurora`](flash_aurora/aurora/model/aurora.py). Tests: [`tests/kernels/test_inference_workspace_pool.py`](tests/kernels/test_inference_workspace_pool.py).
-- **CuTe window attention** (SM120): [`flash_aurora/aurora/ops/cute/`](flash_aurora/aurora/ops/cute/) - custom CuTeDSL kernels for Swin3D window attention, wired through [`window_attn_fwd.py`](flash_aurora/aurora/ops/cute/window_attn_fwd.py). Tests: [`tests/kernels/test_cute_window_attn.py`](tests/kernels/test_cute_window_attn.py). Benchmarks: [`benchmark/bench_window_attn.py`](benchmark/bench_window_attn.py), [`benchmark/bench_swin_block.py`](benchmark/bench_swin_block.py).
-- **Profiling write-ups** (local): [`profiling/`](profiling/). Backbone **D2 vs D2+D3** (from repo root, CUDA): default `--compare-d2d3` is **light** (batch=1, repeat=4). **`--preset stress`** uses `L=2048`, batch=4 (8192 tokens/step, `warmup`/`repeat` raised). **`--preset stress-heavy`** is batch=8, `L=8192` (very large VRAM). Example:  
-  `uv run python profiling/profiling_swin3d.py --compare-d2d3 --preset stress --compare-report-out profiling/swin3d_d2d3_stress.md`
+Presets are labeled `backbone@encoder_decoder`, for example `bf16_mixed@fp32`.
 
-## Testing
+**Left token (backbone):** matmul and window-attention mode for Swin3D.
 
-```bash
-./scripts/run_tests.sh
-# or: 
-uv run pytest tests/aurora tests/kernels tests/engine -m "not integration"
+| Token | Backbone |
+|-------|----------|
+| `fp32` | Strict FP32 matmul; PyTorch SDPA for attention unless a higher tier replaces it. |
+| `tf32` | TF32 tensor-core matmul; CuTe window attention (FP32 I/O). |
+| `bf16_mixed` | Hybrid BF16 on attention QKV/proj and MLP; TF32 elsewhere; CuTe window attention (BF16). |
+| `bf16` | Full backbone BF16 matmul with fused CuTe attention chain. |
+
+**Right token (encoder/decoder):** Perceiver matmul precision, `fp32` (strict) or `tf32` (tensor cores).
+
+Set tiers on the model (`inference_precision=...`) or on `EngineConfig` when using `AuroraEngine`.
+
+### Triton fusion on every custom tier
+
+All custom `inference_precision` tiers (`fp32@*`, `tf32@*`, `bf16_mixed@*`, `bf16@*`) enable the same Triton fusion base:
+
+- **Fused window layout** (`use_triton_layout`): roll, pad, partition, and reverse layout in fused kernels instead of many small eager allocations.
+- **Fused AdaLN and residual** (`use_triton_adaln`): LayerNorm and FiLM modulation fused with the residual add on the Swin hot path.
+
+These kernels are active regardless of whether the backbone runs FP32, TF32, or BF16 matmul. They lower peak activation memory and improve bandwidth efficiency relative to the decomposed PyTorch Swin path. CuTe window attention and backbone matmul precision are layered on top of this Triton base for `tf32` and BF16 tiers. The pure PyTorch reference in benchmarks (`pytorch_backbone_fp32_encoder_decoder_fp32`) deliberately disables Triton and CuTe for accuracy baselining only.
+
+Optional `InferenceWorkspacePool` reuses a scratch buffer for the backbone decoder concat to avoid repeated large allocations on fixed-shape inference.
+
+## Window attention kernel performance
+
+Measured with `benchmark/bench_window_attn.py` on an **NVIDIA RTX PRO 6000 Blackwell Server Edition** (trimmed mean of 200 runs per shape).
+
+**0.25-degree ERA5 encoder stages** (unmasked, N=144 per window):
+
+| Stage | Bwin | Heads | BF16 CuTe (ms) | BF16 SDPA (ms) | Speedup |
+|-------|------|-------|----------------|----------------|---------|
+| 1 | 1800 | 8 | 0.727 | 0.785 | 1.08x |
+| 2 | 450 | 16 | 0.373 | 0.406 | 1.09x |
+| 3 | 128 | 32 | 0.221 | 0.241 | 1.09x |
+
+| Stage | Bwin | Heads | TF32 CuTe (ms) | FP32 SDPA (ms) | Speedup |
+|-------|------|-------|----------------|----------------|---------|
+| 1 | 1800 | 8 | 1.612 | 2.612 | 1.62x |
+| 2 | 450 | 16 | 0.817 | 1.315 | 1.61x |
+| 3 | 128 | 32 | 0.473 | 0.765 | 1.62x |
+
+**Shifted-window mask** (Swin bias -100):
+
+| Mode | Stage-1 (Bwin=1800, H=8) | Speedup vs SDPA |
+|------|--------------------------|-----------------|
+| BF16 CuTe | 0.829 ms vs 1.031 ms | 1.24x |
+| TF32 CuTe | 1.936 ms vs 3.042 ms | 1.57x |
+
+Production inference uses N=144 windows on the default 0.25-degree grid. BF16 CuTe attention is not supported for N below 32; use `tf32` or PyTorch SDPA on downsampled stages with very small windows.
+
+## End-to-end forward performance
+
+Measured with `benchmark/bench_aurora_pretrained.py` on **AuroraPretrained** at **721 x 1440**, batch size 1, ERA5 initial conditions (2023-01-01 06:00 UTC). All custom tiers below include the Triton fusion base described above.
+
+| Tier | Forward (ms) | Speedup vs PyTorch FP32 ref | Mean abs error vs ref |
+|------|--------------|----------------------------|------------------------|
+| `bf16_mixed@fp32` | 681.9 | 3.15x | 0.115 |
+| `bf16_mixed@tf32` | 681.4 | 3.16x | 0.115 |
+| `bf16@fp32` | 680.5 | 3.16x | 0.191 |
+| `tf32@tf32` | 931.0 | 2.31x | 0.060 |
+| `tf32@fp32` | 1093.3 | 1.97x | 0.018 |
+| `fp32@fp32` | 1988.9 | 1.08x | 5.4e-05 |
+| PyTorch FP32 ref (no Triton/CuTe) | 2151.0 | 1.00x | 0 |
+| PyTorch autocast BF16 backbone | 1013.7 | 2.12x | 0.140 |
+
+The PyTorch FP32 reference uses no custom kernels. Every other custom tier uses Triton layout and AdaLN fusion; `tf32` and BF16 tiers additionally use CuTe window attention and the corresponding backbone matmul mode. All custom tiers pass per-variable mean relative-error tolerances from the upstream golden tests on this ERA5 sample when compared to the PyTorch FP32 reference. Recommended production preset on this hardware: `bf16_mixed@fp32` or `bf16_mixed@tf32` (about 3x speedup with bounded drift).
+
+## AuroraEngine
+
+`AuroraEngine` integrates the model, precision presets, and I/O into one API:
+
+1. **Preset registry** -- Named bundles (for example `era5_pretrained`) pair a model variant, checkpoint, and data source profile (CDS ERA5, WeatherBench2 HRES, CAMS, wave).
+2. **Checkpoint resolution** -- Local `asset_root` with optional Hugging Face Hub download and mirror support.
+3. **Precision wiring** -- `EngineConfig.inference_precision` enables the Triton fusion base and, when selected, TF32/BF16 matmul and CuTe attention consistently across the forward path.
+4. **Ingress and validation** -- `InitialConditionBuilder` and `BatchValidator` for NetCDF and adapter inputs.
+5. **Rollout and export** -- Multi-step `rollout_stream` and optional `cuda_graph` warmup for fixed-shape backbone replay.
+
+```python
+from flash_aurora import AuroraEngine
+
+engine = AuroraEngine.from_preset("era5_pretrained", asset_root="/path/to/assets")
+engine.config.inference_precision = "bf16_mixed@fp32"
+engine.load()
+engine.warmup()
+predictions = engine.run_from_netcdf("/path/to/era5.nc", steps=1)
 ```
 
-**Official reference drift:** [`test_aurora_small`](tests/aurora/test_model.py) runs the small pretrained model in FP64 (`model.double()`, `use_lora=True`) and compares outputs to Microsoft Hugging Face reference pickles. On recent PyTorch stacks (e.g. 2.12.x) and RTX PRO6000 Blackwell Server Edition, a small mean relative error can appear on a few surface variables (`2t` ~1.5×10⁻⁴ vs upstream tolerance 1×10⁻⁴; `10u`/`10v` similarly) even with the official [`microsoft-aurora`](https://pypi.org/project/microsoft-aurora/) wheel — same checkpoint and inputs, different accumulated FP64 rounding. The test **passes** and emits a **UserWarning** when drift exceeds upstream tolerances so you know this is an environment mismatch, not a flash-aurora regression.
+## Testing notes
 
-## CuTe Window Attention — current state
+`test_aurora_small` compares FP64 forward outputs to Microsoft Hugging Face reference pickles. On recent PyTorch builds (for example 2.12.x), a small drift on a few surface variables can appear even with the official `microsoft-aurora` wheel. The test passes and emits a `UserWarning` when drift exceeds upstream tolerances. Use `scripts/compare_upstream_golden.py` to verify on your stack.
 
-We've been replacing Aurora's per-window SDPA with hand-written CuTeDSL kernels on Blackwell (SM120). The work lives entirely in our `ops/cute` layer — upstream Aurora torch code is untouched.
+## Reference
 
-Two precision modes:
+Bodnar et al., *A Foundation Model for the Earth System*, Nature (2025). [doi:10.1038/s41586-025-09005-y](https://doi.org/10.1038/s41586-025-09005-y)
 
-| Mode | I/O | Matmul | Kernel file |
-|------|-----|--------|-------------|
-| `BF16_MIXED` | BF16 | FP32 accum (`mma.sync.m16n8k16.bf16.bf16.f32`) | `_kernel_bf16.py` (single-pass + stream) |
-| `TF32_ACC_FP32` | FP32 Q/K, BF16 V in smem | TF32 (`mma.sync.m16n8k8.tf32.tf32.f32`) | `_kernel_fp32.py` |
-
-Dispatch in `window_attn_fwd.py` picks the BF16 kernel by KV-pass count: `WindowAttnFwdBf16` (128-thread cp.async) when `tile_n ≥ N`, else `WindowAttnFwdBf16Stream` (160-thread TMA + DMA warp).
-
-For TF32 single-pass we recently fused the host-side `v.to(bfloat16)` into the kernel: V stays FP32 in global memory and converts to BF16 on the gmem→register→smem load. That removed ~27% overhead on large `Bwin` and is the main reason TF32 now pulls ahead of FP32 SDPA by a wide margin.
-
-Output buffers use `torch.empty_like` (no memset). BF16 single-pass vs stream is chosen from `tile_n` and `seq_len`.
-
-Correctness: 56/56 tests in `test_cute_window_attn.py` pass. Full Swin3D block integration (`bench_swin_block.py`) shows bitwise match against the respective baselines (BF16 OPT vs BF16 PyTorch, TF32 OPT vs FP32 strict SDPA).
-
-### Benchmarks — attention kernel only
-
-Hardware: **NVIDIA RTX PRO 6000 Blackwell Server Edition** (SM120).  
-Run: `uv run python benchmark/bench_window_attn.py` (1000 samples, trimmed mean).
-
-**Realistic Aurora shapes** (all single-pass, `N=144`):
-
-| Shape | Mode | CuTe | SDPA | Speedup |
-|-------|------|------|------|---------|
-| Stage1 enc, Bwin=1800, H=8 | BF16 | 0.729 ms | 0.783 ms | **1.07×** |
-| Stage2 enc, Bwin=450, H=16 | BF16 | 0.374 ms | 0.402 ms | **1.07×** |
-| Stage3 enc, Bwin=128, H=32 | BF16 | 0.222 ms | 0.242 ms | **1.09×** |
-| Stage1 enc, Bwin=1800, H=8 | TF32 | 1.642 ms | 2.583 ms | **1.57×** |
-| Stage2 enc, Bwin=450, H=16 | TF32 | 0.838 ms | 1.310 ms | **1.56×** |
-| Stage3 enc, Bwin=128, H=32 | TF32 | 0.490 ms | 0.762 ms | **1.56×** |
-
-Micro-shapes (`N=144`, `H=8/16/32`) sit around 1.08–1.09× for BF16 and ~1.50× for TF32. The one outlier is `N=576` streaming (8 KV passes, `tile_n=80`) at ~0.86× — SDPA's fused kernel wins on long multi-pass sequences, and Aurora doesn't hit that shape in practice.
-
-### Benchmarks — full Swin3D block
-
-Run: `uv run python benchmark/bench_swin_block.py` (B=1, warmup=20, measured=100).
-
-TF32 OPT = CuTe TF32 attention + Triton projections (`allow_tf32=True`). Compared against PyTorch FP32 with `allow_tf32=True` on linear layers (same projection speed; attention kernel differs):
-
-| Shape | FP32 strict (µs) | FP32-TF32* (µs) | TF32 OPT (µs) | vs TF32* | vs strict |
-|-------|------------------|-----------------|---------------|----------|-----------|
-| Stage1 W | 42585 | 26285 | 23270 | 1.13× | 1.83× |
-| Stage2 W | 33917 | 16808 | 15327 | 1.10× | 2.21× |
-| Stage3 W | 31729 | 13380 | 12409 | 1.08× | 2.56× |
-| Stage1 SW | 47633 | 31281 | 24272 | 1.29× | 1.96× |
-| Stage2 SW | 36168 | 19240 | 15883 | 1.21× | 2.28× |
-| Stage3 SW | 33050 | 14613 | 12744 | 1.15× | 2.59× |
-
-BF16 OPT vs BF16 PyTorch baseline: 1.04–1.26× depending on stage/shift. Stage3 regular window is roughly parity (~0.99×) — launch overhead dominates when `Bwin` is small.
-
-Peak extra memory drops roughly in half on TF32 OPT (e.g. Stage1: 5064 → 2531 MB) because V no longer needs a full FP32 copy on the host.
-
-Note: `allow_tf32` speeds up Triton/cuBLAS linear projections but has no effect on PyTorch's FP32 SDPA backend (mem-efficient/math ignores the flag). The TF32 OPT speedup over FP32-TF32* comes almost entirely from our attention kernel.
-
-### Known limitation: small windows (`N < 32`)
-
-Production Aurora inference uses **`N = 144`** tokens per window (`window_size = 2×6×12` on the default patch grid). All encoder/decoder stages in our benchmarks and tests use that size or larger; BF16/TF32 CuTe paths are validated there.
-
-**Downsampled stages can shrink the window** (e.g. patch merge → `N = 16`). We do **not** support BF16 CuTe attention for `N < 32` and have no plan to fix it: those shapes are out of scope for production inference in this repo.
-
-| Observation | Detail |
-|-------------|--------|
-| Symptom | `bf16_mixed` can crash with `cudaErrorIllegalAddress` the first time CuTe BF16 runs on a small window (often misreported at the next CUDA sync, e.g. Triton AdaLN). |
-| Repro | Isolated `window_attn_fwd_cute` / qkv-packed BF16 at `N = 16`; TF32 CuTe at the same shape is fine. |
-| Root cause | BF16 **v1** single-pass prefetches **V** with **K** via **cp.async** before QK. For short `N`, the 128-thread MMA tile covers more rows/cols than `seqlen`; unpredicated V/K gmem copies can **read past valid memory**. TF32 v2 avoids this by loading V **after** QK+softmax with a sync, predicated path. |
-| Why not fixed | A dedicated short-window kernel was explored; padding to 32×32 tiles caused correctness issues on some `N`. User decision: **ignore** — these windows will not appear in target deployments. |
-| Workaround | Use `TF32_ACC_FP32` or disable `use_cute_window_attn` on architectures with merged windows `N < 32`. |
-
-If you add new patch resolutions or window layouts, confirm **`N ≥ 32`** (ideally `N = 144`) on every stage that enables `use_cute_window_attn` + `cute_window_attn_dtype=bfloat16`.
-
-### What's next
-
-Attention alone is a small slice of block time (QKV + MLP dominate). BF16 still has headroom — Stage3 parity and shifted-window gap are the obvious places to look. Multi-pass streaming (`N=576`) is a lower priority since Aurora's encoder/decoder stages all use `N=144`.
-
-## Earlier benchmark notes (D2 / D3, different hardware)
-
-These numbers are from a **GeForce RTX 5070 Ti Laptop GPU** and predate the CuTe attention work.
-
-Profile snapshot (`uv run python aurora/profiling_swin3d.py --compare-d2d3 --compare-report-out profiling/swin3d_d2d3.md --preset stress`, with `batch=4`, `patch_res=(4,32,64)`, `L=8192`):
-
-| Config | ms/forward | vs baseline | Peak alloc/reserved |
-|--------|------------|-------------|---------------------|
-| baseline | 159.28 | — | 8417 / 8846 MB |
-| D2 | 152.16 | 1.047× | 1347 / 1428 MB |
-| D2+D3 | 151.93 | 1.048× | 1414 / 1495 MB |
-
-D2 provides the main gain (speed + large memory drop). D3 (`InferenceWorkspacePool`) is near-neutral for end-to-end latency here and mainly helps allocation stability.
-### CuTe DSL from CUTLASS source code
-
-Use this when you are hacking CuTe DSL itself or need to track [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) `main` instead of the PyPI pin.
-
-#### 1. Clone CUTLASS
-
-Inside the repo (submodule) or as a sibling checkout:
-
-```bash
-cd flash-aurora
-git clone https://github.com/NVIDIA/cutlass.git cutlass
-# optional: git checkout <tag>   # e.g. v4.5.2 to match a release
-```
-
-#### 2. Seed runtime / MLIR from a PyPI wheel
-
-The git tree ships Python sources only. Before editable install, vendor the binary bits (`libcute_dsl_runtime.so`, `cutlass._mlir`, …) from the latest wheel:
-
-```bash
-cd cutlass/python/CuTeDSL
-uv run python prep_editable_install.py
-```
-
-This writes `lib/` and `VERSION.EDITABLE` under `python/CuTeDSL/` (network required).
-
-#### 3. Editable install into the project venv
-
-From `flash-aurora` (with `uv sync` already done once):
-
-```bash
-mkdir -p cutlass/build
-export CUTLASS_IR_BUILD_DIR=$PWD/cutlass/build    # required by setup.sh; use built tree if you ran step 4
-cd cutlass/python/CuTeDSL
-chmod +x setup.sh
-./setup.sh --editable --cu13
-```
-
-`setup.sh --editable` runs `pip install -e ".[dev]"` and wires `CUTE_DSL_LIBS` via the `.pth` hook. If you only edit Aurora/CuTe **Python** (not the IR compiler), `prep_editable_install.py` plus this step is usually enough. Rebuild IR (step 4) when you change `cutlass._mlir` or `libcute_dsl_runtime.so`.
-
-Verify:
-
-```bash
-cd /path/to/flash-aurora
-uv run python -c "import cutlass; import cutlass.cute as cute; print(cutlass.__version__)"
-uv run pytest aurora/tests/test_cute_window_attn.py -q
-```
-
-#### 4. `quack-kernels` version note
-
-| CuTe DSL | Compatible `quack-kernels` |
-|----------|---------------------------|
-| PyPI `4.5.2` (default `uv sync`) | `>=0.5.0,<0.5.1` |
-| dev / `main` (`4.6.0.dev0+`) | `>=0.5.1` (pins dev CuTe DSL) |
-
-After a source install, align quack if needed:
-
-```bash
-uv pip install 'quack-kernels>=0.5.1'
-```
-
-#### Non-editable install from source tree
-
-If you want a normal (non-editable) install from the CUTLASS tree after `prep_editable_install.py`:
-
-```bash
-cd cutlass/python/CuTeDSL
-uv pip install .
-```
-
-This overrides the PyPI `nvidia-cutlass-dsl` pin in the venv until you run `uv sync` again.
-
-See also [CuTe DSL quick start](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html) and `cutlass/python/CuTeDSL/setup.sh --help`.
+Upstream model documentation: [microsoft.github.io/aurora](https://microsoft.github.io/aurora)
