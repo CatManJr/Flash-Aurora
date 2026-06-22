@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Copyright (c) Catman Jr. Licensed under the MIT license.
 
-Benchmark Aurora **Perceiver** stacks: FA-4 (``flash_attn.cute``) vs PyTorch SDPA.
+Benchmark Aurora **Perceiver** stacks via PyTorch SDPA.
 
 The encoder / decoder paths exercised here:
 
@@ -13,10 +13,6 @@ The encoder / decoder paths exercised here:
 4. **Full Perceiver strip** — ``aggregate_levels``, then ``deaggregate_levels(main)``, then (if
    enabled) ``deaggregate_levels(alternate)``, matching the chained calls in a realistic forward.
 
-FlashAttention imports in ``perceiver.py``::
-
-    from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
-
 The TFLOPS column uses a dense cross-attention forward estimate:
 ``4 * B_eff * num_heads * L_q * L_k * head_dim × depth`` (MLP/LayerNorm excluded).
 
@@ -24,11 +20,6 @@ Examples::
 
     PYTHONPATH=aurora uv run python benchmark/bench_perceiver_tflops.py
     PYTHONPATH=aurora uv run python benchmark/bench_perceiver_tflops.py --decoder-alternate --warmup 10
-    PYTHONPATH=aurora uv run python benchmark/bench_perceiver_tflops.py --fa-decoder-only
-
-Use ``--fa-decoder-only`` to time FA only on decoder Perceivers (encoder ``level_agg`` stays on SDPA).
-
-FA/CuTe may JIT-compile on the first calls; if timings look noisy, raise ``--warmup`` (e.g. 15–30).
 """
 
 from __future__ import annotations
@@ -78,32 +69,6 @@ def bench_loop(fn, warmup: int, iters: int, device: torch.device) -> float:
     return (time.perf_counter() - t0) / iters
 
 
-def _set_perceiver_flash(mod: torch.nn.Module, use: bool) -> None:
-    for layer in mod.layers:
-        layer[0].use_flash_attn = use
-
-
-def _set_all_flash(modules: list[tuple[str, torch.nn.Module]], use: bool) -> None:
-    for _, mod in modules:
-        _set_perceiver_flash(mod, use)
-
-
-def _apply_flash_mode(modules: list[tuple[str, torch.nn.Module]], mode: str) -> None:
-    """``mode``: ``none`` (all SDPA), ``all`` (all FA), ``decoder_only`` (encoder SDPA, decoder FA)."""
-    by_name = {name: mod for name, mod in modules}
-    if mode == "none":
-        _set_all_flash(modules, False)
-    elif mode == "all":
-        _set_all_flash(modules, True)
-    elif mode == "decoder_only":
-        _set_perceiver_flash(by_name["encoder.level_agg"], False)
-        _set_perceiver_flash(by_name["decoder.level_decoder"], True)
-        if "decoder.level_decoder_alternate" in by_name:
-            _set_perceiver_flash(by_name["decoder.level_decoder_alternate"], True)
-    else:
-        raise ValueError(mode)
-
-
 def iter_perceiver_modules(
     encoder: torch.nn.Module,
     decoder: torch.nn.Module,
@@ -125,7 +90,7 @@ def main() -> None:
     from aurora.model.encoder import Perceiver3DEncoder
 
     p = argparse.ArgumentParser(
-        description="Aurora multi-Perceiver (encoder + decoder [+ alternate]) FA vs SDPA TFLOPS"
+        description="Aurora multi-Perceiver (encoder + decoder [+ alternate]) SDPA TFLOPS"
     )
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--l-grid", type=int, default=512, dest="l_grid", help="sequence length L (e.g. H*W)")
@@ -139,11 +104,6 @@ def main() -> None:
         "--decoder-alternate",
         action="store_true",
         help="Instantiate decoder with separate_perceiver=('z',) so level_decoder_alternate exists.",
-    )
-    p.add_argument(
-        "--fa-decoder-only",
-        action="store_true",
-        help="When timing the FA run, enable flash_attn only on decoder Perceivers; encoder stays SDPA.",
     )
     p.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     p.add_argument("--warmup", type=int, default=15, help="Dry-run iterations before timing (each target).")
@@ -179,7 +139,6 @@ def main() -> None:
         head_dim=head_dim_enc,
         depth=args.depth_enc,
         drop_rate=0.0,
-        use_flash_attn=False,
     ).to(device=device, dtype=dtype)
 
     decoder = Perceiver3DDecoder(
@@ -190,7 +149,6 @@ def main() -> None:
         head_dim=head_dim_dec,
         num_heads=args.num_heads,
         drop_rate=0.0,
-        use_flash_attn=False,
         separate_perceiver=sep,
     ).to(device=device, dtype=dtype)
 
@@ -221,8 +179,6 @@ def main() -> None:
     )
 
     modules = list(iter_perceiver_modules(encoder, decoder))
-
-    # Sum attention FLOPs for the chained strip (same units as per-block, for a rough headline)
     flops_strip = flops_enc + flops_dec * (2 if args.decoder_alternate else 1)
 
     print(f"device={torch.cuda.get_device_name(0)} dtype={args.dtype}")
@@ -234,8 +190,6 @@ def main() -> None:
         f"context ({B},{L},{c_agg},{embed_dec}) depth={args.depth_dec}"
     )
     print(f"decoder alternate Perceiver: {'yes (separate_perceiver=z)' if args.decoder_alternate else 'no'}")
-    if args.fa_decoder_only:
-        print("FA timed path: decoder stacks only (encoder.level_agg remains SDPA).")
     print(f"registered Perceiver stacks: {[n for n, _ in modules]}")
 
     def enc_only():
@@ -253,7 +207,6 @@ def main() -> None:
             )
 
     def strip_all_perceivers():
-        """Encoder agg + decoder main [+ decoder alt]."""
         with torch.no_grad():
             encoder.aggregate_levels(x_enc)
             decoder.deaggregate_levels(level_embed, x_dec_context, decoder.level_decoder)
@@ -284,31 +237,14 @@ def main() -> None:
         )
     )
 
-    fa_mode = "decoder_only" if args.fa_decoder_only else "all"
-    sdpa_label = "SDPA (all stacks SDPA)"
-    fa_label = (
-        "FA    (decoder stacks only; enc SDPA)"
-        if args.fa_decoder_only
-        else "FA    (all stacks FA)  "
-    )
-
     for title, fn, flops in targets:
-        _apply_flash_mode(modules, "none")
         t_sdpa = bench_loop(fn, args.warmup, args.iters, device)
         gc.collect()
         torch.cuda.empty_cache()
-        _apply_flash_mode(modules, fa_mode)
-        t_fa = bench_loop(fn, args.warmup, args.iters, device)
-        gc.collect()
-        torch.cuda.empty_cache()
-        _apply_flash_mode(modules, "none")
 
         print(f"\n## {title}")
         print(f"  approx_attn_flops={flops:.3e}")
-        report_ms_tflops(sdpa_label, t_sdpa, flops)
-        report_ms_tflops(fa_label, t_fa, flops)
-        if t_sdpa > 0:
-            print(f"  speedup (walltime): {t_sdpa / t_fa:.3f}x")
+        report_ms_tflops("SDPA", t_sdpa, flops)
 
 
 if __name__ == "__main__":

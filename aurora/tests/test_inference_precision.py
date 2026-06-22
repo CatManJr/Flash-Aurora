@@ -48,7 +48,6 @@ def test_fp32_preset_is_strict_pytorch() -> None:
     assert cfg.autocast_backbone is False
     assert cfg.use_cute_window_attn is False
     assert cfg.use_triton_layout is False
-    assert cfg.use_perceiver_flash_attn is False
     assert cfg.autocast_encoder_decoder is False
     assert cfg.backbone_matmul_bf16 is False
 
@@ -60,7 +59,6 @@ def test_pytorch_autocast_preset() -> None:
     assert cfg.backbone_matmul_level == BackboneMatmulLevel.FP32
     assert cfg.encoder_decoder_use_tensor_core is False
     assert cfg.use_triton_layout is False
-    assert cfg.use_perceiver_flash_attn is False
     assert cfg.autocast_encoder_decoder is False
     assert cfg.backbone_matmul_bf16 is False
 
@@ -75,7 +73,6 @@ def test_fast_fp32_preset_is_triton_with_native_perceiver() -> None:
     assert cfg.use_triton_adaln is True
     assert cfg.use_triton_mlp is False
     assert cfg.use_cute_window_attn is False
-    assert cfg.use_perceiver_flash_attn is False
     assert cfg.autocast_encoder_decoder is False
     assert cfg.backbone_matmul_bf16 is False
 
@@ -90,7 +87,6 @@ def test_tf32_preset_adds_cute() -> None:
     assert cfg.backbone_matmul_bf16 is False
     assert cfg.backbone_matmul_tf32 is True
     assert cfg.window_attn_compute_dtype == "float32"
-    assert cfg.use_perceiver_flash_attn is False
     assert cfg.encoder_decoder_use_tensor_core is True
     assert cfg.cuda_graph_scope == "backbone"
 
@@ -117,7 +113,6 @@ def test_bf16_preset_is_full_bf16_linears() -> None:
     assert cfg.backbone_matmul_tf32 is False
     assert cfg.use_cute_window_attn is True
     assert cfg.autocast_backbone is False
-    assert cfg.use_perceiver_flash_attn is False
     assert cfg.encoder_decoder_use_tensor_core is True
     assert cfg.autocast_encoder_decoder is False
     assert cfg.cuda_graph_scope == "backbone"
@@ -186,7 +181,6 @@ def test_apply_inference_config_expands_constructor_kwargs() -> None:
         "use_triton_mlp": False,
         "use_cute_window_attn": False,
         "use_triton_perceiver_ln_fusion": False,
-        "use_perceiver_flash_attn": False,
         "autocast_encoder_decoder": False,
         "encoder_decoder_use_tensor_core": False,
         "backbone_matmul_level": "fp32",

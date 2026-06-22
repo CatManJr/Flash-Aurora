@@ -97,7 +97,6 @@ def main() -> None:
     p.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=40)
-    p.add_argument("--flash", action="store_true", help="Enable FlashAttention in Perceiver (default off).")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -139,7 +138,6 @@ def main() -> None:
             head_dim=head_dim_enc,
             depth=args.depth_enc,
             drop_rate=0.0,
-            use_flash_attn=args.flash,
             use_triton_perceiver_ln_fusion=use_fusion,
         ).to(device=device, dtype=dtype)
 
@@ -151,7 +149,6 @@ def main() -> None:
             head_dim=head_dim_dec,
             num_heads=args.num_heads,
             drop_rate=0.0,
-            use_flash_attn=args.flash,
             use_triton_perceiver_ln_fusion=use_fusion,
         ).to(device=device, dtype=dtype)
         enc.eval()
@@ -174,7 +171,6 @@ def main() -> None:
         depth=args.depth_enc,
         head_dim=head_dim_enc,
         num_heads=args.num_heads,
-        use_flash_attn=args.flash,
         use_triton_ln_residual_fusion=False,
     ).to(device=device, dtype=dtype)
     rs_on = PerceiverResampler(
@@ -183,7 +179,6 @@ def main() -> None:
         depth=args.depth_enc,
         head_dim=head_dim_enc,
         num_heads=args.num_heads,
-        use_flash_attn=args.flash,
         use_triton_ln_residual_fusion=True,
     ).to(device=device, dtype=dtype)
     rs_on.load_state_dict(rs_off.state_dict())

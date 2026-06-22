@@ -97,7 +97,6 @@ class _KernelProfileSpec:
     use_triton_mlp: bool
     use_cute_window_attn: bool
     use_triton_perceiver_ln_fusion: bool
-    use_perceiver_flash_attn: bool
     cuda_graph_scope: CudaGraphScope
     cuda_graph_recommended: bool
 
@@ -112,7 +111,6 @@ _KERNEL_PROFILES: dict[KernelProfile, _KernelProfileSpec] = {
         use_triton_mlp=False,
         use_cute_window_attn=False,
         use_triton_perceiver_ln_fusion=False,
-        use_perceiver_flash_attn=False,
         cuda_graph_scope="off",
         cuda_graph_recommended=False,
     ),
@@ -125,7 +123,6 @@ _KERNEL_PROFILES: dict[KernelProfile, _KernelProfileSpec] = {
         use_triton_mlp=False,
         use_cute_window_attn=False,
         use_triton_perceiver_ln_fusion=False,
-        use_perceiver_flash_attn=False,
         cuda_graph_scope="off",
         cuda_graph_recommended=False,
     ),
@@ -138,7 +135,6 @@ _KERNEL_PROFILES: dict[KernelProfile, _KernelProfileSpec] = {
         use_triton_mlp=False,
         use_cute_window_attn=True,
         use_triton_perceiver_ln_fusion=False,
-        use_perceiver_flash_attn=False,
         cuda_graph_scope="backbone",
         cuda_graph_recommended=True,
     ),
@@ -151,7 +147,6 @@ _KERNEL_PROFILES: dict[KernelProfile, _KernelProfileSpec] = {
         use_triton_mlp=False,
         use_cute_window_attn=True,
         use_triton_perceiver_ln_fusion=False,
-        use_perceiver_flash_attn=False,
         cuda_graph_scope="backbone",
         cuda_graph_recommended=True,
     ),
@@ -230,7 +225,6 @@ class AuroraInferenceConfig:
     use_triton_mlp: bool
     use_cute_window_attn: bool
     use_triton_perceiver_ln_fusion: bool
-    use_perceiver_flash_attn: bool
     autocast_encoder_decoder: bool
     cuda_graph_scope: CudaGraphScope
     cuda_graph_recommended: bool
@@ -284,8 +278,8 @@ class AuroraInferenceConfig:
         ):
             raise ValueError("backbone_matmul_level=fp32 forbids approximate backbone matmul.")
         if self.kernel_profile == "baseline":
-            if uses_custom_swin or self.use_perceiver_flash_attn:
-                raise ValueError("baseline profile must not enable Triton/CuTe/Perceiver FA.")
+            if uses_custom_swin:
+                raise ValueError("baseline profile must not enable Triton/CuTe.")
             if self.autocast_backbone and self.precision != AuroraInferencePrecision.PYTORCH_AUTOCAST:
                 raise ValueError(
                     "baseline profile enables backbone autocast only for PYTORCH_AUTOCAST."
@@ -304,8 +298,8 @@ class AuroraInferenceConfig:
             if not self.use_cute_window_attn or self.window_attn_compute_dtype != "bfloat16":
                 raise ValueError("bf16_mixed_backbone profile requires CuTe BF16 window attention.")
         if self.precision == AuroraInferencePrecision.PYTORCH_AUTOCAST:
-            if uses_custom_swin or self.use_perceiver_flash_attn:
-                raise ValueError("PYTORCH_AUTOCAST must not enable Triton/CuTe/Perceiver FA.")
+            if uses_custom_swin:
+                raise ValueError("PYTORCH_AUTOCAST must not enable Triton/CuTe.")
             if self.encoder_decoder_matmul_level != EncoderDecoderMatmulLevel.FP32:
                 raise ValueError("PYTORCH_AUTOCAST requires encoder_decoder_matmul_level=fp32.")
             if self.backbone_matmul_level != BackboneMatmulLevel.FP32:
@@ -512,7 +506,6 @@ def build_inference_config(
         use_triton_mlp=prof.use_triton_mlp,
         use_cute_window_attn=prof.use_cute_window_attn,
         use_triton_perceiver_ln_fusion=prof.use_triton_perceiver_ln_fusion,
-        use_perceiver_flash_attn=prof.use_perceiver_flash_attn,
         autocast_encoder_decoder=ed_ac,
         cuda_graph_scope=prof.cuda_graph_scope,
         cuda_graph_recommended=prof.cuda_graph_recommended,
@@ -687,7 +680,6 @@ def apply_inference_config(
         "use_triton_mlp": cfg.use_triton_mlp,
         "use_cute_window_attn": cfg.use_cute_window_attn,
         "use_triton_perceiver_ln_fusion": cfg.use_triton_perceiver_ln_fusion,
-        "use_perceiver_flash_attn": cfg.use_perceiver_flash_attn,
         "autocast_encoder_decoder": cfg.autocast_encoder_decoder,
         "encoder_decoder_use_tensor_core": cfg.encoder_decoder_use_tensor_core,
         "backbone_matmul_level": cfg.backbone_matmul_level.value,

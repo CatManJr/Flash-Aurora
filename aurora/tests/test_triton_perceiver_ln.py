@@ -45,10 +45,10 @@ def test_perceiver_resampler_fused_matches_eager_bf16() -> None:
 
     B, Lq, Lk, D = 2, 8, 64, 128
     eager = PerceiverResampler(
-        D, D, depth=2, head_dim=32, num_heads=4, use_flash_attn=False, use_triton_ln_residual_fusion=False
+        D, D, depth=2, head_dim=32, num_heads=4, use_triton_ln_residual_fusion=False
     )
     fused = PerceiverResampler(
-        D, D, depth=2, head_dim=32, num_heads=4, use_flash_attn=False, use_triton_ln_residual_fusion=True
+        D, D, depth=2, head_dim=32, num_heads=4, use_triton_ln_residual_fusion=True
     )
     fused.load_state_dict(eager.state_dict())
     # ``nn.Module`` has no ``.bf16()``; cast parameters/buffers explicitly.

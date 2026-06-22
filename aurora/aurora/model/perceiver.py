@@ -64,23 +64,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-flash_attn_func = None
-flash_attn_varlen_func = None
-try:
-    # FA-4 (CuTe); prefer over classic flash_attn when both exist.
-    from flash_attn.cute import flash_attn_func as _flash_attn_func
-    from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
-
-    flash_attn_func = _flash_attn_func
-    flash_attn_varlen_func = _flash_attn_varlen_func
-except ImportError:
-        try:
-            from flash_attn import flash_attn_func as _flash_attn_legacy
-
-            flash_attn_func = _flash_attn_legacy
-        except ImportError:
-            pass
-
 _TRITON_LN_RESIDUAL_AVAILABLE = False
 layernorm_affine_forward = None
 layernorm_affine_add_residual_forward = None
@@ -99,9 +82,6 @@ except Exception:
     pass
 
 __all__ = ["MLP", "PerceiverResampler"]
-
-# FA-4 CuTe/TMA kernels target longer sequences; Aurora level agg/deagg uses seqlen ≈ 4.
-_MIN_FLASH_ATTN_SEQLEN = 16
 
 
 class MLP(nn.Module):
@@ -138,7 +118,6 @@ class PerceiverAttention(nn.Module):
         head_dim: int = 64,
         num_heads: int = 8,
         ln_k_q: bool = False,
-        use_flash_attn: bool = True,
     ) -> None:
         """Initialise.
 
@@ -148,14 +127,11 @@ class PerceiverAttention(nn.Module):
             head_dim (int): Attention head dimensionality.
             num_heads (int): Number of heads.
             ln_k_q (bool): Apply an extra layer norm. to the keys and queries.
-            use_flash_attn (bool): Use FlashAttention-2 for the attention core when on CUDA
-                (same math as cross-attention: queries from latents, KV from context).
         """
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.inner_dim = head_dim * num_heads
-        self.use_flash_attn = use_flash_attn
 
         self.to_q = nn.Linear(latent_dim, self.inner_dim, bias=False)
         self.to_kv = nn.Linear(context_dim, self.inner_dim * 2, bias=False)
@@ -189,36 +165,9 @@ class PerceiverAttention(nn.Module):
         k = self.ln_k(k)
         q = self.ln_q(q)
 
-        use_fa = (
-            self.use_flash_attn
-            and flash_attn_func is not None
-            and q.is_cuda
-            and latents.shape[1] >= _MIN_FLASH_ATTN_SEQLEN
-            and x.shape[1] >= _MIN_FLASH_ATTN_SEQLEN
-        )
-        if use_fa:
-            # flash_attn_func: (B, seqlen_q, H, D), (B, seqlen_kv, H, D) — standard cross-attn.
-            q = rearrange(q, "b l (h d) -> b l h d", h=h)
-            k = rearrange(k, "b l (h d) -> b l h d", h=h)
-            v = rearrange(v, "b l (h d) -> b l h d", h=h)
-            # FA-4 CuTe accepts fp16/bf16 only; run outside autocast with contiguous tensors.
-            out_dtype = q.dtype
-            if out_dtype == torch.float32:
-                q = q.to(torch.bfloat16)
-                k = k.to(torch.bfloat16)
-                v = v.to(torch.bfloat16)
-            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-            device_type = "cuda" if q.is_cuda else "cpu"
-            with torch.autocast(device_type=device_type, enabled=False):
-                _fa_out = flash_attn_func(q, k, v, causal=False)
-            out = _fa_out[0] if isinstance(_fa_out, tuple) else _fa_out
-            if out_dtype == torch.float32:
-                out = out.to(out_dtype)
-            out = rearrange(out, "b l h d -> b l (h d)")
-        else:
-            q, k, v = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=h), (q, k, v))
-            out = F.scaled_dot_product_attention(q, k, v)
-            out = rearrange(out, "B H L1 D -> B L1 (H D)")  # (B, L1, D)
+        q, k, v = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=h), (q, k, v))
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = rearrange(out, "B H L1 D -> B L1 (H D)")  # (B, L1, D)
         return self.to_out(out)  # (B, L1, Latent_D)
 
 
@@ -237,7 +186,6 @@ class PerceiverResampler(nn.Module):
         residual_latent: bool = True,
         ln_eps: float = 1e-5,
         ln_k_q: bool = False,
-        use_flash_attn: bool = True,
         use_triton_ln_residual_fusion: bool = False,
     ) -> None:
         """Initialise.
@@ -257,8 +205,6 @@ class PerceiverResampler(nn.Module):
                 `1e-5`.
             ln_k_q (bool, optional): Apply an extra layer norm. to the keys and queries of the first
                 resampling layer. Defaults to `False`.
-            use_flash_attn (bool, optional): Use FlashAttention-2 for cross-attention on CUDA.
-                Defaults to `False`.
             use_triton_ln_residual_fusion (bool, optional): Fuse ``LayerNorm + residual`` on CUDA
                 with Triton (same math as PyTorch). Requires Triton. Defaults to ``False``.
         """
@@ -278,7 +224,6 @@ class PerceiverResampler(nn.Module):
                             head_dim=head_dim,
                             num_heads=num_heads,
                             ln_k_q=ln_k_q if i == 0 else False,
-                            use_flash_attn=use_flash_attn,
                         ),
                         MLP(dim=latent_dim, hidden_features=mlp_hidden_dim, dropout=drop),
                         nn.LayerNorm(latent_dim, eps=ln_eps),

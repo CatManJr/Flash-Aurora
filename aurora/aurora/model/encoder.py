@@ -55,7 +55,6 @@ class Perceiver3DEncoder(nn.Module):
         dynamic_vars: bool = False,
         atmos_static_vars: bool = False,
         simulate_indexing_bug: bool = False,
-        use_flash_attn: bool = True,
         use_triton_perceiver_ln_fusion: bool = False,
     ) -> None:
         """Initialise.
@@ -93,8 +92,6 @@ class Perceiver3DEncoder(nn.Module):
             simulate_indexing_bug (bool, optional): Simulate an indexing bug that's present for the
                 air pollution version of Aurora. This is necessary to obtain numerical equivalence
                 to the original implementation. Defaults to `False`.
-            use_flash_attn (bool, optional): Use FA-4 / FlashAttention in ``level_agg``
-                (:class:`~aurora.model.perceiver.PerceiverResampler`). Defaults to ``True``.
             use_triton_perceiver_ln_fusion (bool, optional): Fuse Perceiver LayerNorm + residual on
                 CUDA with Triton in ``level_agg``. Defaults to ``False``.
         """
@@ -166,7 +163,6 @@ class Perceiver3DEncoder(nn.Module):
             mlp_ratio=mlp_ratio,
             ln_eps=perceiver_ln_eps,
             ln_k_q=stabilise_level_agg,
-            use_flash_attn=use_flash_attn,
             use_triton_ln_residual_fusion=use_triton_perceiver_ln_fusion,
         )
 

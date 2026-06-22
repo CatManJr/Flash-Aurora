@@ -1,6 +1,6 @@
 # Flash-Aurora: Design and Implement High-Performance Computing Framework for Numerical Field based GFMS
 
-## Install CuTe DSL & Flash Attention
+## Install CuTe DSL
 
 ```bash
 git clone ...
@@ -10,11 +10,6 @@ chmod +x cutlass/python/CuTeDSL/setup.sh   # 仅当没有执行权限时
 ./cutlass/python/CuTeDSL/setup.sh --cu12
 # For CUDA Toolkit 13.1:
 ./cutlass/python/CuTeDSL/setup.sh --cu13
-
-cd flash-attention
-pip install -e "flash_attn/cute[dev]"       # CUDA 12.x
-pip install -e "flash_attn/cute[dev,cu13]"  # CUDA 13.x (e.g. B200)
-pytest tests/cute/
 ```
 
 Set `CUTE_DSL_ARCH=sm_120a` when compiling on Blackwell (SM120). Enable the CuTe path with `AURORA_CUTE_WINDOW_ATTN=1`.

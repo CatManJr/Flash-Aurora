@@ -209,7 +209,7 @@ class CudaGraphAuroraBackboneRunner:
 class CudaGraphAuroraGpuRunner:
     """Replay encoder → backbone → decoder on fixed-shape batches.
 
-    Perceiver modules remain standard PyTorch (FlashAttention when enabled); this
+    Perceiver modules remain standard PyTorch (SDPA); this
     only removes launch overhead by capturing the GPU stack in one graph.
     """
 
