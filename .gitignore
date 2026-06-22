@@ -25,6 +25,8 @@ cuda-keyring_1.1-1_all.deb
 
 # Default rollout export dir from example notebooks
 output/
+/docs/output
+/docs/assets
 
 # Nsight Systems / Compute profiling outputs (anywhere in the repo)
 *.nsys-rep
