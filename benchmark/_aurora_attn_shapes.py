@@ -8,16 +8,11 @@ from __future__ import annotations
 
 import inspect
 import os
-import sys
 from dataclasses import dataclass
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_AURORA_ROOT = os.path.join(_REPO_ROOT, "aurora")
-for _p in (_REPO_ROOT, _AURORA_ROOT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from aurora.model.aurora import (  # noqa: E402
+from flash_aurora.aurora.model.aurora import (  # noqa: E402
     Aurora,
     Aurora12hPretrained,
     AuroraAirPollution,
@@ -26,7 +21,7 @@ from aurora.model.aurora import (  # noqa: E402
     AuroraSmallPretrained,
     AuroraWave,
 )
-from engine.core.presets import VARIANTS  # noqa: E402
+from flash_aurora.engine.core.presets import VARIANTS  # noqa: E402
 
 # (preset name, model class)
 CHECKPOINT_VARIANTS: tuple[tuple[str, type], ...] = (

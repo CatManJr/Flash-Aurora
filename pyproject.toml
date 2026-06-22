@@ -1,13 +1,17 @@
+[build-system]
+requires = ["hatchling>=1.8.0"]
+build-backend = "hatchling.build"
+
 [project]
 name = "flash-aurora"
 version = "0.1.0"
-description = "Add your description here"
+description = "High-performance Aurora inference (model + engine)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "flash_aurora/LICENSE", "flash_aurora/aurora/LICENSE.txt"]
 requires-python = ">=3.12, <3.14"
 dependencies = [
-    "azure-storage-blob>=12.28.0",
     "einops>=0.8.2",
-    # CuTe DSL + layout helpers for aurora/ops/cute (PyPI wheels; CUDA 13 via [cu13]).
     "nvidia-cutlass-dsl[cu13]==4.5.2",
     "quack-kernels>=0.5.0,<0.5.1",
     "huggingface-hub>=1.8.0",
@@ -15,7 +19,6 @@ dependencies = [
     "numpy",
     "pandas>=3.0.1",
     "pydantic>=2.12.5",
-    "pytest>=9.0.2",
     "requests>=2.33.0",
     "scipy>=1.17.1",
     "timm>=1.0.26",
@@ -24,13 +27,13 @@ dependencies = [
     "xarray",
     "netcdf4",
     "cdsapi",
-    "ipykernel>=7.3.0",
-    "ipywidgets>=8.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0.0",
+    "pytest>=9.0.2",
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.0",
 ]
 download = [
     "gcsfs",
@@ -38,9 +41,16 @@ download = [
     "ecmwf-api-client",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["flash_aurora"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"flash_aurora/LICENSE" = "flash_aurora/LICENSE"
+"flash_aurora/aurora/LICENSE.txt" = "flash_aurora/aurora/LICENSE.txt"
+"flash_aurora/aurora/NOTICE.md" = "flash_aurora/aurora/NOTICE.md"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = [".", "aurora"]
 python_files = ["test_*.py"]
 markers = [
     "gpu: requires CUDA",
@@ -48,15 +58,12 @@ markers = [
     "engine: engine tests",
 ]
 norecursedirs = [
-    "flash-attention",
     "cutlass",
-    "aurora/.venv",
     ".git",
     ".venv",
 ]
 addopts = ["-ra"]
 
-# Default package index only (override via env / global uv.toml if needed).
 [[tool.uv.index]]
 name = "tuna"
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"

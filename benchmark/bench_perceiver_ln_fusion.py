@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Copyright (c) Catman Jr. Licensed under the MIT license.
-
-Benchmark **Triton LayerNorm + residual fusion** in :class:`~aurora.model.perceiver.PerceiverResampler`
+"""Benchmark **Triton LayerNorm + residual fusion** in :class:`~aurora.model.perceiver.PerceiverResampler`
 (``use_triton_ln_residual_fusion`` / encoder & decoder ``use_triton_perceiver_ln_fusion``).
 
 Compared to the eager PyTorch path (``LayerNorm(x)`` then ``+ residual``), the fused kernel aims to
@@ -40,9 +38,6 @@ import _bootstrap  # noqa: F401, E402
 import torch
 
 _REPO = Path(__file__).resolve().parents[1]
-_AURORA_PKG = _REPO / "aurora"
-if _AURORA_PKG.is_dir():
-    sys.path.insert(0, str(_AURORA_PKG))
 
 
 def bench_loop(fn, warmup: int, iters: int, device: torch.device) -> float:
@@ -71,8 +66,8 @@ def bench_peak_allocated_mb(fn, warmup: int, iters: int, device: torch.device) -
 
 
 def main() -> None:
-    from aurora.model.perceiver import PerceiverResampler
-    import aurora.model.perceiver as perceiver_mod
+    from flash_aurora.aurora.model.perceiver import PerceiverResampler
+    import flash_aurora.aurora.model.perceiver as perceiver_mod
 
     p = argparse.ArgumentParser(
         description="Perceiver Triton LN+residual fusion vs eager (latency + peak CUDA MB)"
@@ -125,8 +120,8 @@ def main() -> None:
     print(f"mode={args.mode}")
 
     def build_encoder_decoder(use_fusion: bool):
-        from aurora.model.decoder import Perceiver3DDecoder
-        from aurora.model.encoder import Perceiver3DEncoder
+        from flash_aurora.aurora.model.decoder import Perceiver3DDecoder
+        from flash_aurora.aurora.model.encoder import Perceiver3DEncoder
 
         enc = Perceiver3DEncoder(
             surf_vars=surf_vars,

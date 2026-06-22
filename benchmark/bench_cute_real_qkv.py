@@ -103,7 +103,7 @@ def _split_cute_bnc_from_qkv(
     mask: torch.Tensor | None,
     precision: Any,
 ) -> torch.Tensor:
-    from aurora.ops.cute import window_attn_fwd_cute
+    from flash_aurora.aurora.ops.cute import window_attn_fwd_cute
 
     bwin, n_tokens, three_c = qkv.shape
     head_dim = three_c // (3 * num_heads)
@@ -169,15 +169,15 @@ def _patch_window_attention(
     compare_split: bool,
     alt_tile_m: int | None,
 ) -> tuple[Any, list[AttnRecord]]:
-    from aurora.model import swin3d
-    from aurora.model.custom_op_paths import (
+    from flash_aurora.aurora.model import swin3d
+    from flash_aurora.aurora.model.custom_op_paths import (
         backbone_bf16_matmul_active,
         can_use_cute_qkvpacked,
         can_use_cute_window_attention,
         cast_activation_dtype,
     )
-    from aurora.model.lora import LoRARollout
-    from aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute, window_attn_fwd_cute_qkvpacked
+    from flash_aurora.aurora.model.lora import LoRARollout
+    from flash_aurora.aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute, window_attn_fwd_cute_qkvpacked
 
     original_forward = swin3d.WindowAttention.forward
     names = {
@@ -430,7 +430,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
 
-    from aurora.model import swin3d
+    from flash_aurora.aurora.model import swin3d
 
     device = torch.device("cuda")
     asset_root = args.asset_root.expanduser().resolve()

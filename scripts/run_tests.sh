@@ -6,8 +6,5 @@ cd "$ROOT"
 
 export AURORA_HF_LOCAL_DIR="${AURORA_HF_LOCAL_DIR:-}"
 
-echo "Running aurora model tests..."
-pytest -c aurora/pyproject.toml aurora/tests/
-
-echo "Running engine tests (unit)..."
-pytest tests/ -m "not integration"
+echo "Running flash-aurora library tests..."
+uv run pytest tests/aurora tests/kernels tests/engine -m "not integration" "$@"

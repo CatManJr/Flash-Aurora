@@ -21,14 +21,12 @@ import _bootstrap  # noqa: F401, E402
 
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "aurora"))
-
-from aurora.ops.triton_swin3d_layout import (
+from flash_aurora.aurora.ops.triton_swin3d_layout import (
     crop_roll_unmerge_windows_triton,
     roll_pad_partition_windows_triton,
 )
-from aurora.model.swin3d import crop_3d, pad_3d, window_partition_3d, window_reverse_3d
-from aurora.model.util import maybe_adjust_windows
+from flash_aurora.aurora.model.swin3d import crop_3d, pad_3d, window_partition_3d, window_reverse_3d
+from flash_aurora.aurora.model.util import maybe_adjust_windows
 
 WARMUP = 20
 MEASURED = 500

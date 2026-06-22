@@ -35,9 +35,6 @@ import _bootstrap  # noqa: F401, E402
 import torch
 
 _REPO = Path(__file__).resolve().parents[1]
-_AURORA_PKG = _REPO / "aurora"
-if _AURORA_PKG.is_dir():
-    sys.path.insert(0, str(_AURORA_PKG))
 
 _DEFAULT_DATA_DIR = "/root/autodl-tmp/aurora"
 _CHECKPOINT_NAME = "aurora-0.25-small-pretrained.ckpt"
@@ -69,8 +66,8 @@ def _purge_gpu(*objs: Any) -> None:
 
 
 def _load_batch(data_dir: Path) -> Any:
-    from aurora import Batch, Metadata
-    from aurora.batch import interpolate_numpy
+    from flash_aurora.aurora import Batch, Metadata
+    from flash_aurora.aurora.batch import interpolate_numpy
 
     import numpy as np
 
@@ -106,7 +103,7 @@ def _load_batch(data_dir: Path) -> Any:
 
 
 def _build_model(precision: str, checkpoint: Path, device: torch.device) -> Any:
-    from aurora import AuroraSmallPretrained
+    from flash_aurora.aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(use_lora=False, inference_precision=precision)
     model.load_checkpoint_local(str(checkpoint), strict=True)
@@ -134,7 +131,7 @@ def _tensor_diff(reference: torch.Tensor, candidate: torch.Tensor) -> TensorDiff
 
 
 def _run_encoder(model: Any, batch: Any) -> tuple[tuple[int, int, int], torch.Tensor]:
-    from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
 
     _, transformed, patch_res = model._prepare_encoder_batch(batch)
     with torch.inference_mode():
@@ -182,7 +179,7 @@ def _trace_backbone(
         rollout_step: int,
         patch_res: tuple[int, int, int],
     ) -> torch.Tensor:
-        from aurora.model.fourier import lead_time_expansion
+        from flash_aurora.aurora.model.fourier import lead_time_expansion
 
         all_enc_res, padded_outs = backbone.get_encoder_specs(patch_res)
         lead_hours = lead_time / timedelta(hours=1)
@@ -235,7 +232,7 @@ def _trace_backbone(
 
 
 def _decoder_msl_diff(model: Any, backbone_x: torch.Tensor, batch: Any, patch_res: tuple[int, int, int]) -> TensorDiff:
-    from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
 
     with torch.inference_mode():
         pred = run_with_encoder_decoder_autocast(

@@ -26,11 +26,9 @@ import _bootstrap  # noqa: F401, E402
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "aurora"))
-
-from aurora.ops.cute._smem_utils import _choose_tile_n
-from aurora.ops.cute._kernel_bf16 import _get_or_compile_bf16
-from aurora.ops.cute._kernel_bf16 import _get_or_compile_bf16_stream
+from flash_aurora.aurora.ops.cute._smem_utils import _choose_tile_n
+from flash_aurora.aurora.ops.cute._kernel_bf16 import _get_or_compile_bf16
+from flash_aurora.aurora.ops.cute._kernel_bf16 import _get_or_compile_bf16_stream
 
 WARMUP = 30
 MEASURED = 1000

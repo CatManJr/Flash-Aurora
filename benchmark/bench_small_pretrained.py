@@ -42,9 +42,6 @@ import numpy as np
 import torch
 
 _REPO = Path(__file__).resolve().parents[1]
-_AURORA_PKG = _REPO / "aurora"
-if _AURORA_PKG.is_dir():
-    sys.path.insert(0, str(_AURORA_PKG))
 
 _DEFAULT_DATA_DIR = "/root/autodl-tmp/aurora"
 _CHECKPOINT_NAME = "aurora-0.25-small-pretrained.ckpt"
@@ -86,7 +83,7 @@ def _custom_matmul_combo_tiers(
     backbone_levels: tuple[str, ...],
     encoder_decoder_levels: tuple[str, ...],
 ) -> tuple[tuple[str, str, str], ...]:
-    from aurora.model.inference_precision import (
+    from flash_aurora.aurora.model.inference_precision import (
         DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS,
         DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS,
         describe_inference_config,
@@ -107,7 +104,7 @@ def _full_default_suite(
     backbone_levels: tuple[str, ...] = (),
     encoder_decoder_levels: tuple[str, ...] = (),
 ) -> tuple[tuple[str, str, str], ...]:
-    from aurora.model.inference_precision import (
+    from flash_aurora.aurora.model.inference_precision import (
         DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS,
         DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS,
     )
@@ -125,7 +122,7 @@ def _tier_entry(name: str) -> tuple[str, str, str]:
     for key, precision, label in _LEGACY_NAMED_TIERS:
         if name == key:
             return key, precision, label
-    from aurora.model.inference_precision import describe_inference_config, resolve_inference_config
+    from flash_aurora.aurora.model.inference_precision import describe_inference_config, resolve_inference_config
 
     cfg = resolve_inference_config(name)
     if cfg is None:
@@ -190,8 +187,8 @@ def _purge_gpu(*objs: Any) -> None:
 
 
 def _load_batch(data_dir: Path) -> Any:
-    from aurora import Batch, Metadata
-    from aurora.batch import interpolate_numpy
+    from flash_aurora.aurora import Batch, Metadata
+    from flash_aurora.aurora.batch import interpolate_numpy
 
     input_path = data_dir / _INPUT_NAME
     static_path = data_dir / _STATIC_NAME
@@ -340,7 +337,7 @@ def _build_model(
     *,
     use_cute_window_attn: bool | None = None,
 ) -> Any:
-    from aurora import AuroraSmallPretrained
+    from flash_aurora.aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(use_lora=False, inference_precision=precision)
     if use_cute_window_attn is not None:

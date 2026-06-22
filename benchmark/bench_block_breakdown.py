@@ -23,10 +23,8 @@ import _bootstrap  # noqa: F401, E402
 
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "aurora"))
-
-from aurora.model.swin3d import Swin3DTransformerBlock
-from aurora.model.workspace_pool import InferenceWorkspacePool
+from flash_aurora.aurora.model.swin3d import Swin3DTransformerBlock
+from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
 
 WARMUP = 20
 MEASURED = 200
@@ -86,7 +84,7 @@ def run_stage(C, H, W, D, nh, label, shift):
         timings["qkv proj"] = bench(lambda: attn.qkv(x_norm))
 
         # attention core (window_attn_fwd_cute) at (Bwin,H,N,Dh)
-        from aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+        from flash_aurora.aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
         Bwin = L // (WINDOW_SIZE[0] * WINDOW_SIZE[1] * WINDOW_SIZE[2])
         N = WINDOW_SIZE[0] * WINDOW_SIZE[1] * WINDOW_SIZE[2]
         Dh = D // nh
@@ -110,11 +108,11 @@ def run_stage(C, H, W, D, nh, label, shift):
         )
 
         # layout: roll/pad/partition + crop/unmerge (x1 each)
-        from aurora.ops.triton_swin3d_layout import (
+        from flash_aurora.aurora.ops.triton_swin3d_layout import (
             roll_pad_partition_windows_triton,
             crop_roll_unmerge_windows_triton,
         )
-        from aurora.model.swin3d import maybe_adjust_windows
+        from flash_aurora.aurora.model.swin3d import maybe_adjust_windows
         ws, ss = maybe_adjust_windows(WINDOW_SIZE, (1, 3, 6) if shift else (0, 0, 0), res)
         x_5d = x.view(B, C, H, W, D)
         xw = roll_pad_partition_windows_triton(x_5d, res, WINDOW_SIZE,

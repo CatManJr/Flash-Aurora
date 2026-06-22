@@ -32,13 +32,6 @@ if str(_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_BENCH_DIR))
 import _bootstrap  # noqa: F401, E402
 
-_AURORA_PKG = _REPO / "aurora"
-if _AURORA_PKG.is_dir():
-    sys.path.insert(0, str(_AURORA_PKG))
-_AURORA_ROOT = _REPO / "aurora"
-if _AURORA_ROOT.is_dir():
-    sys.path.insert(0, str(_AURORA_ROOT))
-
 
 from profiling_swin3d import (  # noqa: E402
     _aggregate_full_table_kpis,
@@ -136,7 +129,7 @@ def _prepare_backbone_input(
     """Run encoder once; return ``(patch_res, tokens, rollout_step)`` for backbone loops."""
     import torch
 
-    from aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
 
     _, transformed, patch_res = model._prepare_encoder_batch(batch)
     with torch.inference_mode():
@@ -163,7 +156,7 @@ def _profile_tier(
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from aurora import AuroraSmallPretrained
+    from flash_aurora.aurora import AuroraSmallPretrained
 
     dev = torch.device(device)
     model = AuroraSmallPretrained(use_lora=False, inference_precision=tier)

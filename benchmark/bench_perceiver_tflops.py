@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Copyright (c) Catman Jr. Licensed under the MIT license.
-
-Benchmark Aurora **Perceiver** stacks via PyTorch SDPA.
+"""Benchmark Aurora **Perceiver** stacks via PyTorch SDPA.
 
 The encoder / decoder paths exercised here:
 
@@ -40,9 +38,6 @@ import _bootstrap  # noqa: F401, E402
 import torch
 
 _REPO = Path(__file__).resolve().parents[1]
-_AURORA_PKG = _REPO / "aurora"
-if _AURORA_PKG.is_dir():
-    sys.path.insert(0, str(_AURORA_PKG))
 
 
 def estimate_cross_attn_fwd_flops(
@@ -86,8 +81,8 @@ def report_ms_tflops(name: str, t_sec: float, flops_attn_approx: float) -> None:
 
 
 def main() -> None:
-    from aurora.model.decoder import Perceiver3DDecoder
-    from aurora.model.encoder import Perceiver3DEncoder
+    from flash_aurora.aurora.model.decoder import Perceiver3DDecoder
+    from flash_aurora.aurora.model.encoder import Perceiver3DEncoder
 
     p = argparse.ArgumentParser(
         description="Aurora multi-Perceiver (encoder + decoder [+ alternate]) SDPA TFLOPS"

@@ -34,9 +34,6 @@ import torch
 import torch.nn.functional as F
 
 _REPO = Path(__file__).resolve().parents[1]
-_AURORA_PKG = _REPO / "aurora"
-if _AURORA_PKG.is_dir():
-    sys.path.insert(0, str(_AURORA_PKG))
 
 
 @dataclass(frozen=True)

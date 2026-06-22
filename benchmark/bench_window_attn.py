@@ -26,15 +26,13 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "aurora"))
-
 from _aurora_attn_shapes import (
     CHECKPOINT_VARIANTS,
     SHAPES_ALL_CHECKPOINTS,
     SHAPES_ERA5_025,
     all_unique_attn_shapes,
 )
-from aurora.ops.cute.window_attn_fwd import (
+from flash_aurora.aurora.ops.cute.window_attn_fwd import (
     _best_tile_m,
     _choose_tile_n,
     _CUTE_AVAILABLE,
