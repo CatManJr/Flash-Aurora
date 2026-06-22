@@ -14,7 +14,7 @@ ECMWF_DEFAULT_URL = "https://api.ecmwf.int/v1"
 class DownloadCredentials:
     """Optional API credentials for ingress downloads.
 
-    Resolution order for CDS: explicit fields here → ``CDSAPI_*`` env vars →
+    Resolution order for CDS: explicit fields here -> ``CDSAPI_*`` env vars ->
     ``~/.cdsapirc``. Keys are never logged when ``use_download_credentials`` is active.
     """
 

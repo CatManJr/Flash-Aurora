@@ -156,7 +156,7 @@ def _analyze_kineto_gaps(
 
     largest_gaps.sort(key=lambda x: -x[0])
 
-  # Span of traced GPU work vs wall clock (gaps on compute streams ≈ launch bubbles).
+  # Span of traced GPU work vs wall clock (gaps on compute streams ~ launch bubbles).
     trace_span_us = max(t_max - t_min, wall_us)
     unaccounted_us = max(0.0, wall_us - trace_span_us)
     category_ms = {k: v / 1e3 for k, v in category_us.items()}

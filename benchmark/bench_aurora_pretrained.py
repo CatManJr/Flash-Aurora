@@ -4,7 +4,7 @@
 Loads cached CDS NetCDF under ``<asset-root>/era5/``, runs each inference tier,
 times ``forward``, and compares outputs against the PyTorch FP32 baseline.
 
-**Default suite (10 tiers)** — same grid as ``bench_small_pretrained.py``:
+**Default suite (10 tiers)** - same grid as ``bench_small_pretrained.py``:
 
 1. PyTorch: ``backbone=fp32, encoder/decoder=fp32`` (accuracy baseline)
 2. PyTorch: ``backbone=autocast_bf16, encoder/decoder=fp32``

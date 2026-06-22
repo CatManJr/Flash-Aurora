@@ -9,7 +9,7 @@ TF32 QK MMA; FP32 softmax; BF16 V in smem. Direct O epilogue to gmem.
 uint8 Swin mask read directly from gmem (L2-resident).
 
 References:
-- flash-attn ``flash_attn/cute/flash_fwd.py`` (Tri Dao) — FMHA mainloop / masking layout.
+- flash-attn ``flash_attn/cute/flash_fwd.py`` (Tri Dao) - FMHA mainloop / masking layout.
 - :mod:`aurora.ops.cute._cute_local`, :mod:`aurora.ops.cute._window_softmax` (see those modules).
 """
 import math
@@ -198,7 +198,7 @@ class WindowAttnFwdTF32:
         gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_store, _tv(_sQK_dim1), vQK)
 
         # Single-pass: V enters the kernel as FP32 and is converted to BF16 during the
-        # gmem→smem load (fuses away the host-side v.to(bfloat16) cast — ~27% of the
+        # gmem->smem load (fuses away the host-side v.to(bfloat16) cast - ~27% of the
         # TF32 path for large Bwin).  Uses the SAME TV as the BF16 smem store copy so
         # the per-thread element mapping matches; the load is a plain (non-async) LDG
         # since cp.async cannot convert dtypes.  Multi-pass keeps the host cast +
@@ -471,11 +471,11 @@ class WindowAttnFwdTF32:
         )
 
         if cutlass.const_expr(self.single_kv_tile):
-            # Convert-on-load: FP32 V (gmem) → registers → BF16 → BF16 smem.  This
+            # Convert-on-load: FP32 V (gmem) -> registers -> BF16 -> BF16 smem.  This
             # fuses the host-side v.to(bfloat16) cast into the kernel.  No cp.async
             # (it cannot convert dtypes); Q/K cp.async groups are already drained, so
             # a single sync_threads makes the BF16 V visible before the PV LdMatrix.
-            # Single-pass ⇒ tile_n == seqlen (no partial-n tile); requires aligned
+            # Single-pass => tile_n == seqlen (no partial-n tile); requires aligned
             # head_dim (not check_hdim_oob), which the dispatch guarantees.
             tVrV_f32 = cute.make_rmem_tensor_like(tVgV[None, None, None, 0], Float32)
             cute.autovec_copy(tVgV[None, None, None, 0], tVrV_f32)

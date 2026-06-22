@@ -13,7 +13,7 @@ import torch
 def _get_smem_budget_bytes() -> int:
     """Return the per-block dynamic SMEM limit (with optin) in bytes.
 
-    SM-architecture → optin SMEM per block
+    SM-architecture -> optin SMEM per block
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     SM70 (V100)                           :  96 KB
     SM80 / SM86 (A100, RTX 3090)          : 100 KB
@@ -22,7 +22,7 @@ def _get_smem_budget_bytes() -> int:
     SM100 (B100/B200, sm_100)             : 256 KB (safe tile sizing)
     SM120 (Blackwell GeForce, sm_120)     :  99 KB
 
-    ``major * 10 + minor`` from PyTorch: 10.0 → 100, 12.0 → 120.  SM120 must use
+    ``major * 10 + minor`` from PyTorch: 10.0 -> 100, 12.0 -> 120.  SM120 must use
     the smaller budget; treating it like SM100 would oversubscribe shared memory.
     """
     if not torch.cuda.is_available():
@@ -58,14 +58,14 @@ def _choose_tile_n(
 
     SMEM layout (num_stages=1)::
 
-        sQ : tile_m  × head_dim × 2B
-        sK : tile_n  × head_dim × 2B
-        sV : tile_n  × head_dim × 2B
+        sQ : tile_m  x head_dim x 2B
+        sK : tile_n  x head_dim x 2B
+        sV : tile_n  x head_dim x 2B
 
     Strategy
     --------
     Single-pass (seq_len fits in one tile)
-        Fill the full SMEM budget — there is only one pass so high occupancy
+        Fill the full SMEM budget - there is only one pass so high occupancy
         is not critical, and a larger tile means fewer MMA fragments overall.
 
     Multi-pass (streaming)
@@ -128,9 +128,9 @@ def _choose_tile_n_tf32(
 
     SMEM layout (matches ``WindowAttnFwdTF32``)::
 
-        sQ : tile_m  × head_dim × 4B
-        sK : tile_n  × head_dim × 4B × num_stages
-        sV : tile_n  × head_dim × 2B × num_stages
+        sQ : tile_m  x head_dim x 4B
+        sK : tile_n  x head_dim x 4B x num_stages
+        sV : tile_n  x head_dim x 2B x num_stages
 
     Single-pass uses ``num_stages=1``; streaming uses ``num_stages=2`` (K/V
     double-buffer) with half the SMEM budget for occupancy, same as BF16.

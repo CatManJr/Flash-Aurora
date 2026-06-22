@@ -27,7 +27,7 @@ def normalize_hub_endpoint(endpoint: str | None) -> str | None:
 
 
 def resolve_hub_endpoint(explicit: str | None = None) -> str:
-    """Resolve Hub API base URL: explicit arg → ``HF_ENDPOINT`` env → official HF."""
+    """Resolve Hub API base URL: explicit arg -> ``HF_ENDPOINT`` env -> official HF."""
     if explicit is not None:
         normalized = normalize_hub_endpoint(explicit)
         if normalized is not None:

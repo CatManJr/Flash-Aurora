@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Probe AuroraHighRes (0.1°) forward with synthetic IC — OOM smoke test.
+"""Probe AuroraHighRes (0.1°) forward with synthetic IC - OOM smoke test.
 
-Uses fake Gaussian fields + official static pickle (1801×3600). Does not
+Uses fake Gaussian fields + official static pickle (1801x3600). Does not
 require HRES NetCDF ingress.
 
 Examples::

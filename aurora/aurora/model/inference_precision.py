@@ -4,19 +4,19 @@ Inference precision router for Aurora inference presets.
 
 Two independent axes (combinable):
 
-* **Backbone** — :class:`BackboneMatmulLevel`: ``fp32`` | ``tf32`` | ``bf16_mixed`` | ``bf16``
-* **Encoder/decoder** — :class:`EncoderDecoderMatmulLevel`: ``fp32`` | ``tf32`` only
+* **Backbone** - :class:`BackboneMatmulLevel`: ``fp32`` | ``tf32`` | ``bf16_mixed`` | ``bf16``
+* **Encoder/decoder** - :class:`EncoderDecoderMatmulLevel`: ``fp32`` | ``tf32`` only
   (no E/D BF16 autocast: Perceiver needs FP32 ``lat``/``lon`` and AdaLN paths).
 
 Named presets (``fp32``, ``fast_fp32``, ``tf32``, ``bf16_mixed``, ``bf16``, …) set both axes.
 Override either axis explicitly or use a combo string (``backbone@encoder_decoder``).
 The left token is always a **backbone matmul level**; the right is **encoder/decoder only**:
 
-* ``bf16_mixed@fp32`` — hybrid backbone (BF16 attention QKV/proj + MLP) + strict FP32 Perceiver
-* ``bf16@fp32`` — full backbone BF16 linears + strict FP32 Perceiver
-* ``bf16_mixed@tf32`` — hybrid backbone + Perceiver TF32 tensor cores (same E/D as preset ``bf16_mixed``)
-* ``bf16@tf32`` — full backbone BF16 + Perceiver TF32 (same E/D as preset ``bf16``)
-* ``backbone=bf16_mixed,encoder_decoder=fp32`` — equivalent to ``bf16_mixed@fp32``
+* ``bf16_mixed@fp32`` - hybrid backbone (BF16 attention QKV/proj + MLP) + strict FP32 Perceiver
+* ``bf16@fp32`` - full backbone BF16 linears + strict FP32 Perceiver
+* ``bf16_mixed@tf32`` - hybrid backbone + Perceiver TF32 tensor cores (same E/D as preset ``bf16_mixed``)
+* ``bf16@tf32`` - full backbone BF16 + Perceiver TF32 (same E/D as preset ``bf16``)
+* ``backbone=bf16_mixed,encoder_decoder=fp32`` - equivalent to ``bf16_mixed@fp32``
 
 Do not confuse backbone ``bf16`` / ``bf16_mixed`` with a non-existent encoder/decoder ``bf16`` level.
 
@@ -51,7 +51,7 @@ class EncoderDecoderMatmulLevel(str, Enum):
 
 
 class AuroraInferencePrecision(str, Enum):
-    """Named presets bundling kernel profile + default backbone × E/D matmul levels."""
+    """Named presets bundling kernel profile + default backbone x E/D matmul levels."""
 
     FP32 = "fp32"
     PYTORCH_AUTOCAST = "pytorch_autocast"
@@ -480,7 +480,7 @@ def build_inference_config(
     autocast_encoder_decoder: bool | None = None,
     autocast_backbone: bool | None = None,
 ) -> AuroraInferenceConfig:
-    """Compose config from kernel profile × backbone level × encoder/decoder level."""
+    """Compose config from kernel profile x backbone level x encoder/decoder level."""
     prof = _KERNEL_PROFILES[kernel_profile]
     bb_bf16, bb_tf32 = backbone_matmul_flags(backbone_matmul_level)
     ed_tc, ed_ac = encoder_decoder_matmul_flags(encoder_decoder_matmul_level)
@@ -562,7 +562,7 @@ def resolve_inference_config(
     encoder_decoder_use_tensor_core: bool | None = None,
     kernel_profile: KernelProfile | str | None = None,
 ) -> AuroraInferenceConfig | None:
-    """Resolve config from a named preset and/or independent backbone × E/D levels."""
+    """Resolve config from a named preset and/or independent backbone x E/D levels."""
     if precision is None and backbone_matmul_level is None and encoder_decoder_matmul_level is None:
         return None
 
@@ -636,7 +636,7 @@ def expand_precision_combos(
     backbone_levels: list[str] | tuple[str, ...],
     encoder_decoder_levels: list[str] | tuple[str, ...],
 ) -> list[tuple[str, AuroraInferenceConfig]]:
-    """Cartesian product of backbone × encoder/decoder matmul levels for benchmarking."""
+    """Cartesian product of backbone x encoder/decoder matmul levels for benchmarking."""
     combos: list[tuple[str, AuroraInferenceConfig]] = []
     for bb in backbone_levels:
         for ed in encoder_decoder_levels:
@@ -647,7 +647,7 @@ def expand_precision_combos(
     return combos
 
 
-# Default 4×2 custom matmul grid (Triton/CuTe Swin + native Perceiver).
+# Default 4x2 custom matmul grid (Triton/CuTe Swin + native Perceiver).
 DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS: tuple[str, ...] = ("fp32", "tf32", "bf16_mixed", "bf16")
 DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS: tuple[str, ...] = ("fp32", "tf32")
 

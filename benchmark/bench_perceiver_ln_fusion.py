@@ -9,8 +9,8 @@ reduce peak activation traffic (fewer intermediate tensors).
 
 Reports:
 
-- Wall time per forward (``ms/iter``) — baseline (fusion off) vs fused (fusion on).
-- Peak CUDA allocated memory during the timed loop — ``torch.cuda.max_memory_allocated``.
+- Wall time per forward (``ms/iter``) - baseline (fusion off) vs fused (fusion on).
+- Peak CUDA allocated memory during the timed loop - ``torch.cuda.max_memory_allocated``.
 
 Examples::
 
@@ -164,7 +164,7 @@ def main() -> None:
     enc_on.load_state_dict(enc_off.state_dict())
     dec_on.load_state_dict(dec_off.state_dict())
 
-    # Micro: standalone resampler — same weights for fair compare
+    # Micro: standalone resampler - same weights for fair compare
     rs_off = PerceiverResampler(
         latent_dim=args.embed_dim,
         context_dim=args.embed_dim,

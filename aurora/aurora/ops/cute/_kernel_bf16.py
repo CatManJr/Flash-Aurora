@@ -10,8 +10,8 @@ WindowAttnFwdBf16Stream: 160-thread TMA path when tile_n < seq_len.
 uint8 Swin mask read directly from gmem (L2-resident) in both kernels.
 
 References:
-- flash-attn ``flash_attn/cute/flash_fwd.py`` (Tri Dao) — FMHA mainloop / masking layout.
-- :mod:`aurora.ops.cute._blackwell_load` — CUTLASS Blackwell GeForce TMA example (see module doc).
+- flash-attn ``flash_attn/cute/flash_fwd.py`` (Tri Dao) - FMHA mainloop / masking layout.
+- :mod:`aurora.ops.cute._blackwell_load` - CUTLASS Blackwell GeForce TMA example (see module doc).
 - :mod:`aurora.ops.cute._cute_local`, :mod:`aurora.ops.cute._window_softmax`.
 """
 import math
@@ -102,7 +102,7 @@ class WindowAttnFwdBf16:
         self.tile_n = min(tile_n, seq_len)
         self.single_kv_tile = self.tile_n >= seq_len
         # Single-pass: 1 stage; K+V preloaded with Q, one cp.async wait before QK.
-        # Multi-pass: 2-stage K+V double-buffer — prefetch K[n+1]+V[n+1] behind compute.
+        # Multi-pass: 2-stage K+V double-buffer - prefetch K[n+1]+V[n+1] behind compute.
         self.num_stages = 1 if self.single_kv_tile else 2
 
         hdim_align = 16
@@ -427,7 +427,7 @@ class WindowAttnFwdBf16:
             tOsVt[None, None, None, 0],
             smem_thr_cp_V,
         )
-        # Epilogue writes sO (reuses sQ); PV only reads sV — separate smem regions, no CTA sync.
+        # Epilogue writes sO (reuses sQ); PV only reads sV - separate smem regions, no CTA sync.
 
         if cutlass.const_expr(not self.single_kv_tile):
             for n_tile in cutlass.range(n_block_max - 1, unroll=1):
@@ -456,7 +456,7 @@ class WindowAttnFwdBf16:
                     smem_thr_cp_K,
                 )
 
-                # Prefetch K[n+1]+V[n+1] into stage_nxt — overlaps with QK GEMM+softmax.
+                # Prefetch K[n+1]+V[n+1] into stage_nxt - overlaps with QK GEMM+softmax.
                 if n_block < n_block_max - 1:
                     self._load_K(
                         gmem_tiled_copy_K,
@@ -991,7 +991,7 @@ class WindowAttnFwdBf16Stream:
         gO = cute.local_tile(mO_cur, blkQ, (m_block, 0))
         gmem_thr_cp_O = gmem_tiled_copy_O.get_slice(tidx)
 
-        # ── Q LOAD ──────────────────────────────────────────────────────────────
+        # -- Q LOAD --------------------------------------------------------------
         # gmem_tiled_copy_Q is sized for 128 threads (MMA warps) only.
         # DMA warp (warp 4, tidx 128-159) must NOT call get_slice(tidx): the TV
         # layout wraps around and would double-write Q elements.  Instead, the DMA
@@ -1020,7 +1020,7 @@ class WindowAttnFwdBf16Stream:
         cute.arch.cp_async_wait_group(0)    # Q fully arrived for MMA warps; NOP for DMA
         cute.arch.sync_threads()            # SYNC-2: all 160 threads
 
-        # ── WARP DIVERGENCE — TWO SEPARATE IF-STATEMENTS ────────────────────────
+        # -- WARP DIVERGENCE - TWO SEPARATE IF-STATEMENTS ------------------------
         #
         # The DSL requires that values at the join point of an if/else are
         # representable as IR values.  SharedStorage is a Python class that fails
@@ -1029,13 +1029,13 @@ class WindowAttnFwdBf16Stream:
         #
         # sync_threads() calls are placed in the FLAT kernel body *between* the
         # two if-blocks so every thread hits the EXACT SAME program-counter
-        # location — a requirement for correct CTA-wide barriers in CUDA.
+        # location - a requirement for correct CTA-wide barriers in CUDA.
         #
         # Barrier counting (must match between the two branches):
         #   Single-pass: DMA=(SYNC-3 + SYNC-4) = 2, MMA=(SYNC-3 + SYNC-4) = 2
         #   Multi-pass:  DMA=(SYNC-4) = 1,          MMA=(SYNC-4) = 1
 
-        # ── DMA PRODUCER WARP (warp 4) ──────────────────────────────────────────
+        # -- DMA PRODUCER WARP (warp 4) ------------------------------------------
         if warp_idx == self._SM120_MMA_WARPS:
             cute.arch.setmaxregister_decrease(self._SM120_LOAD_REGS)
             for n in cutlass.range(n_block_max, unroll=1):
@@ -1061,7 +1061,7 @@ class WindowAttnFwdBf16Stream:
             # Wait until all consumers have released every stage.
             mainloop_pipeline.producer_tail(mainloop_producer_state)
 
-        # ── MMA CONSUMER WARPS (warps 0-3) ──────────────────────────────────────
+        # -- MMA CONSUMER WARPS (warps 0-3) --------------------------------------
         if warp_idx < self._SM120_MMA_WARPS:
             cute.arch.setmaxregister_increase(self._SM120_MMA_REGS)
 
@@ -1106,7 +1106,7 @@ class WindowAttnFwdBf16Stream:
                 cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
                 tScS = thr_mma_qk.partition_C(cS)
 
-            # ── TILE 0 ──────────────────────────────────────────────────────────
+            # -- TILE 0 ----------------------------------------------------------
             mainloop_pipeline.consumer_wait(mainloop_consumer_state)
             stage_cur = mainloop_consumer_state.index
 
@@ -1145,11 +1145,11 @@ class WindowAttnFwdBf16Stream:
             )
 
             # Release stage before the flat-body SYNC-3 (single-pass) so that
-            # producer_tail can unblock the DMA warp — avoids deadlock with SYNC-3.
+            # producer_tail can unblock the DMA warp - avoids deadlock with SYNC-3.
             mainloop_pipeline.consumer_release(mainloop_consumer_state)
             mainloop_consumer_state.advance()
 
-            # ── MULTI-PASS LOOP ──────────────────────────────────────────────────
+            # -- MULTI-PASS LOOP --------------------------------------------------
             if cutlass.const_expr(not self.single_kv_tile):
                 for n_tile in cutlass.range(n_block_max - 1, unroll=1):
                     n_block = n_tile + 1
@@ -1195,7 +1195,7 @@ class WindowAttnFwdBf16Stream:
                     mainloop_pipeline.consumer_release(mainloop_consumer_state)
                     mainloop_consumer_state.advance()
 
-            # ── EPILOGUE (part 1): registers → SMEM ─────────────────────────────
+            # -- EPILOGUE (part 1): registers -> SMEM -----------------------------
             final_row_scale = softmax.finalize(use_fastmath=self.single_kv_tile)
             softmax.rescale_O(acc_O, final_row_scale)
 
@@ -1208,17 +1208,17 @@ class WindowAttnFwdBf16Stream:
             taccOsO = smem_thr_cp_O.partition_D(sO)
             cute.copy(smem_cp_O, taccOrO, taccOsO)
 
-        # ── FLAT BODY: epilogue sync_threads (all 160 threads hit same PC) ───────
+        # -- FLAT BODY: epilogue sync_threads (all 160 threads hit same PC) -------
         # SYNC-3 (single-pass only): guards the sV/sQ SMEM region between the PV
         # GEMM reads and the epilogue stmatrix writes (both happen inside the MMA
         # if-block above). DMA warp reaches here right after producer_tail.
         if cutlass.const_expr(self.single_kv_tile):
             cute.arch.sync_threads()  # SYNC-3
-        # SYNC-4: ensures all stmatrix (O→SMEM) writes are globally visible
+        # SYNC-4: ensures all stmatrix (O->SMEM) writes are globally visible
         # before any thread reads sO for the global copy below.
         cute.arch.sync_threads()  # SYNC-4
 
-        # ── EPILOGUE (part 2): SMEM → global (MMA warps only) ───────────────────
+        # -- EPILOGUE (part 2): SMEM -> global (MMA warps only) -------------------
         # DMA warp skips this block; it has nothing more to do.
         if warp_idx < self._SM120_MMA_WARPS:
             tOsO = gmem_thr_cp_O.partition_S(sO)

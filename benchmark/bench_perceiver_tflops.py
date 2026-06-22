@@ -5,16 +5,16 @@ Benchmark Aurora **Perceiver** stacks via PyTorch SDPA.
 
 The encoder / decoder paths exercised here:
 
-1. **Encoder** ``level_agg`` — the sole :class:`~aurora.model.perceiver.PerceiverResampler` inside
+1. **Encoder** ``level_agg`` - the sole :class:`~aurora.model.perceiver.PerceiverResampler` inside
    ``aggregate_levels``.
-2. **Decoder** ``level_decoder`` — primary ``deaggregate_levels`` path for pressure-level fusion.
-3. **Decoder** ``level_decoder_alternate`` — optional second stack when ``separate_perceiver`` is
+2. **Decoder** ``level_decoder`` - primary ``deaggregate_levels`` path for pressure-level fusion.
+3. **Decoder** ``level_decoder_alternate`` - optional second stack when ``separate_perceiver`` is
    non-empty (enable with ``--decoder-alternate``).
-4. **Full Perceiver strip** — ``aggregate_levels``, then ``deaggregate_levels(main)``, then (if
+4. **Full Perceiver strip** - ``aggregate_levels``, then ``deaggregate_levels(main)``, then (if
    enabled) ``deaggregate_levels(alternate)``, matching the chained calls in a realistic forward.
 
 The TFLOPS column uses a dense cross-attention forward estimate:
-``4 * B_eff * num_heads * L_q * L_k * head_dim × depth`` (MLP/LayerNorm excluded).
+``4 * B_eff * num_heads * L_q * L_k * head_dim x depth`` (MLP/LayerNorm excluded).
 
 Examples::
 
@@ -53,7 +53,7 @@ def estimate_cross_attn_fwd_flops(
     seq_kv: int,
     depth: int,
 ) -> float:
-    """Dense cross-attention forward FLOPs (two matmuls, MAC→FLOPs convention)."""
+    """Dense cross-attention forward FLOPs (two matmuls, MAC->FLOPs convention)."""
     per_layer = 4.0 * b_eff * num_heads * seq_q * seq_kv * head_dim
     return per_layer * float(depth)
 

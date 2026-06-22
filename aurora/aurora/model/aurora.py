@@ -172,13 +172,13 @@ class Aurora(torch.nn.Module):
                 `"all"` uses a different LoRA for every roll-out step. Defaults to `"single"`.
             use_lora_merged_inference (bool, optional): Merge LoRA with backbone linear weights
                 for inference-only fast path. Defaults to `False`.
-            use_triton_layout (bool, optional): Swin backbone — fused roll/pad/window layout
+            use_triton_layout (bool, optional): Swin backbone - fused roll/pad/window layout
                 (CUDA float32). Defaults to ``False``.
-            use_triton_adaln (bool, optional): Swin backbone — fused AdaptiveLayerNorm (CUDA float32).
+            use_triton_adaln (bool, optional): Swin backbone - fused AdaptiveLayerNorm (CUDA float32).
                 Defaults to ``False``.
-            use_triton_mlp (bool, optional): Swin backbone — Triton GELU in MLP for inference FP32.
+            use_triton_mlp (bool, optional): Swin backbone - Triton GELU in MLP for inference FP32.
                 Defaults to ``False``.
-            use_cute_window_attn (bool, optional): Swin backbone — use :mod:`aurora.ops.cute` for
+            use_cute_window_attn (bool, optional): Swin backbone - use :mod:`aurora.ops.cute` for
                 window attention on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel
                 (BF16 I/O, FP32 accumulators); float32 tensors use the TF32 CuTe kernel when
                 enabled. Requires ``attn_drop=0``. Defaults to ``False``.

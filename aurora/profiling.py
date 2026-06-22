@@ -33,7 +33,7 @@ Peak VRAM is often only a few GB here because **AuroraSmall**, **batch=1**, **in
 ``--synthetic --synthetic-h/--synthetic-w`` for a larger grid, or ``--no-autocast-backbone``.
 The Triton window-layout path (``--use-triton-layout``) typically lowers Swin activation footprint
 relative to the default layout, so you can often push ``--batch-size`` higher than with the eager
-layout before OOM—worth trying when stress-testing VRAM or throughput.
+layout before OOM-worth trying when stress-testing VRAM or throughput.
 
 Optional charts (``matplotlib``)::
 

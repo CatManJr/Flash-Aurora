@@ -7,10 +7,10 @@ Fused LayerNorm (no affine) + FiLM modulation for :class:`AdaptiveLayerNorm` inf
 Optional fused residual add: ``out = residual + film(ln(x))`` in one kernel.
 
 The ``output_fp32`` path loads BF16 (or FP32) activations, computes in FP32, and
-stores FP32 — avoiding a separate ``tensor.to(float32)`` before the norm boundary.
+stores FP32 - avoiding a separate ``tensor.to(float32)`` before the norm boundary.
 
 References:
-- flash-attn ``flash_attn/ops/triton/layer_norm.py`` — row-wise Triton norm patterns (Tri Dao).
+- flash-attn ``flash_attn/ops/triton/layer_norm.py`` - row-wise Triton norm patterns (Tri Dao).
 """
 
 from __future__ import annotations

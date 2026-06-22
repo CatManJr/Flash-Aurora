@@ -32,7 +32,7 @@ def gelu_forward_triton(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# Tanh-approx GELU — same formulation as flash_attn k_activations.py::gelu_approx
+# Tanh-approx GELU - same formulation as flash_attn k_activations.py::gelu_approx
 @triton.jit
 def _gelu_tanh_kernel(
     x_ptr,

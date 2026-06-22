@@ -9,9 +9,9 @@ Extracted from the BF16 Stream kernel so the TMA K/V load recipe lives in one pl
 dtype-generic so any precision (BF16 today, others later) can reuse them.
 
 References:
-- CUTLASS ``cutlass/examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py`` —
+- CUTLASS ``cutlass/examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py`` -
   TMA atoms, swizzled SMEM layouts, ``PipelineTmaAsync`` mainloop.
-- CUTLASS ``cutlass.utils.hopper_helpers`` — SM90 bulk-tensor helpers.
+- CUTLASS ``cutlass.utils.hopper_helpers`` - SM90 bulk-tensor helpers.
 """
 from __future__ import annotations
 

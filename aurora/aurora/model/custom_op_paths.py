@@ -4,10 +4,10 @@ Glue between Aurora model forward paths and custom CUDA/Triton/CuTe ops.
 
 Custom Triton/CuTe Swin paths never run inside ``torch.autocast``.
 
-* ``bf16_mixed`` — hybrid: BF16 WindowAttention QKV/proj + MLP; other linears TF32.
-* ``bf16`` — speed / quant-prep tier: all backbone ``F.linear`` in BF16, fused CuTe
+* ``bf16_mixed`` - hybrid: BF16 WindowAttention QKV/proj + MLP; other linears TF32.
+* ``bf16`` - speed / quant-prep tier: all backbone ``F.linear`` in BF16, fused CuTe
   attention chain (no mid-attn FP32 cast), entry cast to BF16; AdaLN/residual stay FP32.
-* ``tf32`` — FP32 activations, TF32 backbone + E/D linears.
+* ``tf32`` - FP32 activations, TF32 backbone + E/D linears.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def use_bf16_fused_attention_chain(
     cute_window_attn_dtype: torch.dtype,
     is_cuda: bool,
 ) -> bool:
-    """QKV → CuTe attn → proj without an intermediate FP32 cast."""
+    """QKV -> CuTe attn -> proj without an intermediate FP32 cast."""
     if not (
         use_cute_window_attn
         and cute_window_attn_dtype == torch.bfloat16

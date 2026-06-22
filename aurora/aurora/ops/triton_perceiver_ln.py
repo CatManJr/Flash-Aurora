@@ -9,7 +9,7 @@ Matches ``nn.LayerNorm(D)`` with ``elementwise_affine=True`` for tensors ``(B, L
 Fuses ``layer_norm(x) + residual`` for :class:`~aurora.model.perceiver.PerceiverResampler``.
 
 References:
-- flash-attn ``flash_attn/ops/triton/layer_norm.py`` — row-wise Triton norm patterns (Tri Dao).
+- flash-attn ``flash_attn/ops/triton/layer_norm.py`` - row-wise Triton norm patterns (Tri Dao).
 """
 
 from __future__ import annotations

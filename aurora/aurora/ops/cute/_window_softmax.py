@@ -8,7 +8,7 @@ Row-wise online softmax over attention logits (CuTeDSL).
 Fixed ``arch=80`` reduction style: avoids SM100 packed paths that mismatch SM120 + SM80 MMA.
 
 References:
-- flash-attn ``flash_attn/cute/softmax.py`` (Tri Dao) — online softmax structure.
+- flash-attn ``flash_attn/cute/softmax.py`` (Tri Dao) - online softmax structure.
 """
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def apply_swin_bias_mask(
     n_start: Int32,
     seqlen: Int32,
 ) -> None:
-    """Apply Swin shifted-window mask: disallowed pairs → large negative, allowed keep matmul."""
+    """Apply Swin shifted-window mask: disallowed pairs -> large negative, allowed keep matmul."""
     neg_inf = -Float32.inf
     masked_logit = Float32(WINDOW_ATTN_MASKED_LOGIT)
     threshold = Float32(WINDOW_ATTN_MASK_THRESHOLD)

@@ -61,7 +61,7 @@ SHAPES_MICRO = [
 # All unique (Bwin, H, N, Dh) across the seven Aurora checkpoints (enc + dec).
 SHAPES_ALL = SHAPES_ALL_CHECKPOINTS
 
-# 0.25° family encoder stages — kept for focused ERA5 perf titles.
+# 0.25° family encoder stages - kept for focused ERA5 perf titles.
 SHAPES_ERA5 = SHAPES_ERA5_025
 
 

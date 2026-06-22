@@ -5,11 +5,11 @@ those portions are licensed under the MIT License (see LICENSE).
 
 Minimal CuTeDSL helpers for window attention (vendored; no flash_attn import).
 
-Torch ↔ CuTe bridge, SMEM swizzle atom, and SMEM GEMM loops (Ampere-style MMA).
+Torch <-> CuTe bridge, SMEM swizzle atom, and SMEM GEMM loops (Ampere-style MMA).
 
 References:
-- flash-attn ``flash_attn/cute/ampere_helpers.py`` (Tri Dao) — SMEM layout atoms and GEMM loops.
-- CUTLASS CuTe DSL (NVIDIA) — ``cutlass.cute`` / ``cutlass.utils`` APIs.
+- flash-attn ``flash_attn/cute/ampere_helpers.py`` (Tri Dao) - SMEM layout atoms and GEMM loops.
+- CUTLASS CuTe DSL (NVIDIA) - ``cutlass.cute`` / ``cutlass.utils`` APIs.
 """
 from __future__ import annotations
 

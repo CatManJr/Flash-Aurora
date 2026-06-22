@@ -4,15 +4,15 @@ Pytest coverage for aurora.ops.cute window attention.
 
 Test matrix
 -----------
-TF32_ACC_FP32  – vs PyTorch SDPA (TF32 matmul when applicable).
-BF16_MIXED     – vs PyTorch SDPA at BF16 I/O.
-window_attn_dispatch – CuTeDSL wrapper (dtype to precision).
+TF32_ACC_FP32  - vs PyTorch SDPA (TF32 matmul when applicable).
+BF16_MIXED     - vs PyTorch SDPA at BF16 I/O.
+window_attn_dispatch - CuTeDSL wrapper (dtype to precision).
 
 Shape coverage
 --------------
-N = 144  aurora-pretrain-small (window 2×6×12)
-N = 288  2×6×24 or 4×6×12  (double spatial resolution)
-N = 576  2×12×24            (quadruple spatial resolution)
+N = 144  aurora-pretrain-small (window 2x6x12)
+N = 288  2x6x24 or 4x6x12  (double spatial resolution)
+N = 576  2x12x24            (quadruple spatial resolution)
 Dh = 64  uniform across all Aurora encoder heads
 
 CuTeDSL GEMM tests require CUDA (``requires_cuda`` / ``requires_cute``).
@@ -128,23 +128,23 @@ def _fp32_sdpa_reference(
 
 # (Bwin, H, N, Dh, nW)
 #
-# N=144 : aurora-pretrain-small (window_size 2×6×12)
-# N=288 : 2×6×24 or 4×6×12  — single-pass for BF16 on 99 KB SMEM
-# N=576 : 2×12×24            — 2-pass streaming for BF16 on 99 KB SMEM
+# N=144 : aurora-pretrain-small (window_size 2x6x12)
+# N=288 : 2x6x24 or 4x6x12  - single-pass for BF16 on 99 KB SMEM
+# N=576 : 2x12x24            - 2-pass streaming for BF16 on 99 KB SMEM
 AURORA_SHAPES = [
     (16,  8, 144, 64, 4),   # encoder stage H=8,  N=144 (small model default)
     ( 8, 16, 144, 64, 4),   # encoder stage H=16, N=144
     ( 4, 32, 144, 64, 4),   # encoder stage H=32, N=144
-    ( 8,  8, 288, 64, 4),   # 2× spatial res, H=8  — tests larger-N single-pass (BF16)
-    ( 4, 16, 288, 64, 4),   # 2× spatial res, H=16
-    ( 2, 32, 576, 64, 4),   # 4× spatial res, H=32 — tests streaming (2 KV passes)
+    ( 8,  8, 288, 64, 4),   # 2x spatial res, H=8  - tests larger-N single-pass (BF16)
+    ( 4, 16, 288, 64, 4),   # 2x spatial res, H=16
+    ( 2, 32, 576, 64, 4),   # 4x spatial res, H=32 - tests streaming (2 KV passes)
 ]
 
 EXTRA_SHAPES = [
     ( 4,  8,  64, 64, 2),   # smaller N (sub-tile)
     ( 6,  4,  96, 64, 3),   # non-power-of-2 N
-    ( 4,  8, 256, 64, 2),   # N=256 — 2×8×16 window
-    ( 2,  8, 400, 64, 2),   # N=400 — 2×10×20 window (streaming for TF32, single-pass BF16)
+    ( 4,  8, 256, 64, 2),   # N=256 - 2x8x16 window
+    ( 2,  8, 400, 64, 2),   # N=400 - 2x10x20 window (streaming for TF32, single-pass BF16)
 ]
 
 
@@ -205,7 +205,7 @@ def test_tf32_output_shape_dtype() -> None:
 
 _LARGE_ACT_SCALES = (1.0, 4.0, 5.0)
 
-# vs torch SDPA at the same precision — tight at small logits, looser at production scale
+# vs torch SDPA at the same precision - tight at small logits, looser at production scale
 _TF32_VS_SDPA_MAX_ABS = {1.0: 0.05, 4.0: 0.16, 5.0: 0.26}
 _BF16_VS_SDPA_MAX_ABS = {1.0: 0.02, 4.0: 0.8, 5.0: 1.7}
 
@@ -465,7 +465,7 @@ def test_tf32_qkvpacked_bnc_output_matches_regular_cute(has_bias: bool) -> None:
 
 
 # ===========================================================================
-# window_attn_dispatch — routing tests
+# window_attn_dispatch - routing tests
 # ===========================================================================
 
 @requires_cute
@@ -628,7 +628,7 @@ class TestChooseTileN:
     def test_tf32_n144_single_pass_99kb(self) -> None:
         """N=144 must select tile_n=144 (single-pass) on 99 KB device."""
         tile_n = _choose_tile_n_tf32(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
-        # sQ=16KB, sK+sV=144×64×(4+2)B=54KB → 70KB < 99KB
+        # sQ=16KB, sK+sV=144x64x(4+2)B=54KB -> 70KB < 99KB
         assert tile_n == 144
         assert _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=1) <= 99 * 1024
 

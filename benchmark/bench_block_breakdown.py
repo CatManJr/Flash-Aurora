@@ -32,7 +32,7 @@ WARMUP = 20
 MEASURED = 200
 WINDOW_SIZE = (2, 6, 12)
 
-# (C, H, W, D, num_heads, label)  — Aurora ERA5 encoder stages
+# (C, H, W, D, num_heads, label)  - Aurora ERA5 encoder stages
 SHAPES = [
     (4, 180, 360,  512,  8, "Stage1 D=512  H=8"),
     (4,  90, 180, 1024, 16, "Stage2 D=1024 H=16"),
@@ -104,12 +104,12 @@ def run_stage(C, H, W, D, nh, label, shift):
         # MLP
         timings["MLP"] = bench(lambda: blk.mlp(x))
 
-        # adaLN + residual (×2 in block)
+        # adaLN + residual (x2 in block)
         timings["adaLN+res (1 of 2)"] = bench(
             lambda: blk.norm1.forward_add_residual(x, x_attn, c)
         )
 
-        # layout: roll/pad/partition + crop/unmerge (×1 each)
+        # layout: roll/pad/partition + crop/unmerge (x1 each)
         from aurora.ops.triton_swin3d_layout import (
             roll_pad_partition_windows_triton,
             crop_roll_unmerge_windows_triton,

@@ -8,7 +8,7 @@ Window attention forward via CuTeDSL kernels (SM80+ MMA; SM120 TMA stream when a
 Kernels: ``_kernel_bf16.py`` / ``_kernel_fp32.py``. Tile sizes: ``_smem_utils.py``.
 
 References:
-- flash-attn ``flash_attn/cute/interface.py`` — dispatch / compile-cache patterns (Tri Dao).
+- flash-attn ``flash_attn/cute/interface.py`` - dispatch / compile-cache patterns (Tri Dao).
 """
 import math
 import os
@@ -50,9 +50,9 @@ class WinAttnPrecision(Enum):
     """Precision mode for :func:`window_attn_fwd_cute`.
 
     ``BF16_MIXED``
-        BF16 I/O, FP32 accumulators — SM80 ``mma.sync.m16n8k16.bf16.bf16.f32``.
+        BF16 I/O, FP32 accumulators - SM80 ``mma.sync.m16n8k16.bf16.bf16.f32``.
     ``TF32_ACC_FP32``
-        FP32 I/O, TF32 matmul — SM80 ``mma.sync.m16n8k8.tf32.tf32.f32``.
+        FP32 I/O, TF32 matmul - SM80 ``mma.sync.m16n8k8.tf32.tf32.f32``.
     """
 
     BF16_MIXED    = "bf16_mixed"
@@ -118,8 +118,8 @@ def _bf16_stream_single_pass_enabled() -> bool:
 def _best_tile_m(is_bf16: bool, has_bias: bool) -> int:
     """Optimal tile_m for single-pass N=144 on sm_120a (benchmark/_sweep_tile_m.py).
 
-    BF16  → 64 always (tile_m=128 is ~2.2x slower when masked).
-    TF32  → 64 when masked (Swin SW-MSA blocks); 128 when unmasked (W-MSA blocks).
+    BF16  -> 64 always (tile_m=128 is ~2.2x slower when masked).
+    TF32  -> 64 when masked (Swin SW-MSA blocks); 128 when unmasked (W-MSA blocks).
     """
     if is_bf16:
         return 64
@@ -156,8 +156,8 @@ def window_attn_fwd_cute(
     q, k, v:
         Shape ``(Bwin, H, N, Dh)`` where ``Bwin = B * nW``.
         Dtype must match ``precision``:
-        * ``BF16_MIXED``    → ``torch.bfloat16``
-        * ``TF32_ACC_FP32`` → ``torch.float32``
+        * ``BF16_MIXED``    -> ``torch.bfloat16``
+        * ``TF32_ACC_FP32`` -> ``torch.float32``
     bias:
         Optional shifted-window attention mask, shape ``(nW, N, N)``,
         dtype ``torch.float32``.  ``None`` means no mask.
@@ -205,7 +205,7 @@ def window_attn_fwd_cute(
         _tile_n = tile_n if tile_n is not None else _choose_tile_n_tf32(N, head_dim=Dh, tile_m=tile_m)
         # PV smem uses BF16 + 8x8x16b transpose (ldmatrix.trans is 16-bit only).
         # Single-pass (+ aligned head_dim): pass V as FP32 and let the kernel convert
-        # to BF16 during the gmem→smem load, fusing away this full-tensor cast.
+        # to BF16 during the gmem->smem load, fusing away this full-tensor cast.
         # Multi-pass: keep the host cast (cp.async V prefetch path stays intact).
         if _tile_n >= N and Dh % 16 == 0:
             v_run = v
@@ -220,7 +220,7 @@ def window_attn_fwd_cute(
         _tile_n = _bf16_tile_n(N, head_dim=Dh, tile_m=tile_m, tile_n=tile_n)
         # Multi-pass (tile_n < N) always uses the TMA Stream kernel. Single-pass
         # (tile_n >= N, e.g. production N=144) uses the 128-thread cp.async kernel
-        # by default — it beats Stream when there is only one KV tile (nothing for
+        # by default - it beats Stream when there is only one KV tile (nothing for
         # the DMA warp to prefetch). Set AURORA_BF16_STREAM_SINGLE_PASS=1 to force
         # Stream on SM120 + Dh=64 for A/B comparison.
         use_stream = _tile_n < N or (

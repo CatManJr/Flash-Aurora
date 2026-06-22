@@ -3,8 +3,8 @@
 Cached constant GPU tensors for fixed-shape inference (incl. CUDA graph replay).
 
 Python scalars / tuples (pressure levels, timestamps, etc.) must not be converted with
-``torch.tensor(..., device=cuda)`` inside a captured graph — that performs an implicit
-CPU→GPU copy.  Populate the cache during eager warmup; replay then reads existing tensors.
+``torch.tensor(..., device=cuda)`` inside a captured graph - that performs an implicit
+CPU->GPU copy.  Populate the cache during eager warmup; replay then reads existing tensors.
 """
 
 from __future__ import annotations

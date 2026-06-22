@@ -1,11 +1,11 @@
-"""Benchmark: Swin3DTransformerBlock — pure PyTorch vs Triton/CuTe optimizations.
+"""Benchmark: Swin3DTransformerBlock - pure PyTorch vs Triton/CuTe optimizations.
 
 Accuracy (same weights; error = |candidate − baseline|):
   A. BF16 OPT  vs  BF16 BL
   B. BF16 OPT  vs  FP32+autocast BL
   C. BF16 OPT  vs  FP32 strict SDPA BL
   D. TF32 OPT  vs  FP32 strict SDPA BL
-  E. TF32 OPT  vs  SDPA-TF32 BL  (1×TF32 fair compare)
+  E. TF32 OPT  vs  SDPA-TF32 BL  (1xTF32 fair compare)
 
 Timing & memory (latency in µs):
   FP32-strict | SDPA-TF32 | TF32-OPT | T32/TF32 | T32/str | BF16-BL | BF16-OPT

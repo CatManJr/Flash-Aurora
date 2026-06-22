@@ -186,7 +186,7 @@ def shapes_for_benchmark(
     ]
 
 
-# 0.25° ERA5 family — enc stages only (legacy name kept for perf section titles).
+# 0.25° ERA5 family - enc stages only (legacy name kept for perf section titles).
 SHAPES_ERA5_025 = [
     (1800, 8, 144, 64, "era5 enc1 1800×8"),
     (450, 16, 144, 64, "era5 enc2 450×16"),

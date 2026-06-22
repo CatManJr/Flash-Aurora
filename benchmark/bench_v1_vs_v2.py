@@ -1,7 +1,7 @@
 """A/B benchmark: BF16 window attention v1 (128-thread cp.async) vs v2 (160-thread TMA + DMA warp).
 
 Goal: isolate whether the v2 heterogeneous pipeline (dedicated DMA warp, TMA loads,
-160 threads) actually beats the simpler v1 (128 threads, cp.async) — especially for
+160 threads) actually beats the simpler v1 (128 threads, cp.async) - especially for
 the single-pass N=144 shapes that dominate real Aurora workloads, where a dedicated
 DMA warp has no prefetch overlap to exploit.
 

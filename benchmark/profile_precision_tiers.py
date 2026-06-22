@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile ``tf32`` vs ``bf16_mixed`` on AuroraSmallPretrained (400×800).
+"""Profile ``tf32`` vs ``bf16_mixed`` on AuroraSmallPretrained (400x800).
 
 Default scope is **Swin backbone only**: encoder runs once to build tokens; the timed
 loop is ``_run_backbone`` only. Perceiver (encoder/decoder) is identical across
@@ -59,7 +59,7 @@ def _bucket_tier_profile(name: str) -> str:
         return "cast_dtype"
     if "aten::copy_" in n or "direct_copy" in n:
         return "copy_tensor"
-    # CuTe shifted-window attention (before generic "cutlass" → gemm_other).
+    # CuTe shifted-window attention (before generic "cutlass" -> gemm_other).
     if "windowattnfwd" in n:
         return "attention_cute_window"
     if (

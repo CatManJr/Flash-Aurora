@@ -5,7 +5,7 @@ Loads ``aurora-0.25-small-pretrained-test-input.pickle`` + ``aurora-0.25-static.
 runs each inference tier, times end-to-end ``forward``, and compares outputs against the
 PyTorch FP32 baseline. Prints per-variable **official tolerances** from ``tests/test_model.py``.
 
-**Default suite (10 tiers)** — no preset shorthand required in output:
+**Default suite (10 tiers)** - no preset shorthand required in output:
 
 1. PyTorch: ``backbone=fp32, encoder/decoder=fp32`` (baseline for accuracy tables)
 2. PyTorch: ``backbone=autocast_bf16, encoder/decoder=fp32``

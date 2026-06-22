@@ -22,7 +22,7 @@ Run from the repository root::
     # If compile stalls or sympy warnings: omit --compile-dynamic (default fixed-shape).
 
 ``--preset baseline`` fixes batch=1 and patch_res=(4, 32, 64), matching :file:`profiling/swin3d.md`.
-``--preset stress`` sets batch=16, patch_res=(4,16,32) (``L``=32768), warmup=8, repeat=16 — same tokens/step
+``--preset stress`` sets batch=16, patch_res=(4,16,32) (``L``=32768), warmup=8, repeat=16 - same tokens/step
 as baseline (8192), heavier than default without the VRAM of ``stress-heavy``.
 ``--preset stress-heavy`` is batch=8 with patch_res=(4,32,64) (``L``=8192); needs very large VRAM.
 Before each timed run, the script calls ``gc.collect`` and ``torch.cuda.empty_cache`` (disable with
@@ -1010,7 +1010,7 @@ def main() -> None:
         args.patch_h = 32
         args.patch_w = 64
     elif args.preset == "stress":
-        # Same tokens/step as baseline (8192): 4 × (4·16·32). Safer for compare-d2d3 baseline path.
+        # Same tokens/step as baseline (8192): 4 x (4.16.32). Safer for compare-d2d3 baseline path.
         args.batch_size = 4
         args.latent_levels = 4
         args.patch_h = 32

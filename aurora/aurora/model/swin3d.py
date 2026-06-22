@@ -660,7 +660,7 @@ class Swin3DTransformerBlock(nn.Module):
             use_lora_merged_inference (bool, optional): Merge LoRA with base linear in
                 attention inference path to reduce extra GEMM/IO. Defaults to `False`.
             use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
-                core on CUDA inference paths (BF16 → CuTeDSL kernel; float32 → torch SDPA).
+                core on CUDA inference paths (BF16 -> CuTeDSL kernel; float32 -> torch SDPA).
                 Defaults to ``False``.
         """
         super().__init__()
@@ -979,7 +979,7 @@ class BasicLayer3D(nn.Module):
             use_lora_merged_inference (bool, optional): Merge LoRA with base linear in
                 attention inference path to reduce extra GEMM/IO. Defaults to `False`.
             use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
-                core on CUDA inference paths (BF16 → CuTeDSL kernel; float32 → torch SDPA).
+                core on CUDA inference paths (BF16 -> CuTeDSL kernel; float32 -> torch SDPA).
                 Defaults to ``False``.
         """
         super().__init__()

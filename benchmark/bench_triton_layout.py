@@ -67,7 +67,7 @@ def bench(fn, warmup=WARMUP, measured=MEASURED):
 
 
 def pt_partition(x, res, ws, ss):
-    """PyTorch: roll + pad + partition → (nW*B, N, D)."""
+    """PyTorch: roll + pad + partition -> (nW*B, N, D)."""
     if not all(s == 0 for s in ss):
         x = torch.roll(x, shifts=(-ss[0], -ss[1], -ss[2]), dims=(1, 2, 3))
     C, H, W = res
@@ -78,7 +78,7 @@ def pt_partition(x, res, ws, ss):
 
 
 def pt_reverse(windows, res, ws, ss):
-    """PyTorch: unpartition + crop (symmetric) + unroll → (B, C, H, W, D)."""
+    """PyTorch: unpartition + crop (symmetric) + unroll -> (B, C, H, W, D)."""
     C, H, W = res
     pad_size = ((-C) % ws[0], (-H) % ws[1], (-W) % ws[2])
     pad_C = C + pad_size[0]

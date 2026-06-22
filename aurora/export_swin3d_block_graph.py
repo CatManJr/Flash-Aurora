@@ -8,11 +8,11 @@ tensor ops only). Default path matches ``profiling_swin3d_block.py`` (W-MSA, no 
 
 Outputs (under ``--out-dir`` by default ``profiling/graphs/``):
 
-  - **``swin3d_block_<slug>_export.txt``** — full ATen graph from ``torch.export`` (best for
-    reading layout → SDPA → AdaLN → MLP). Requires PyTorch 2.x.
-  - ``swin3d_block_<slug>_jit_ir.txt`` — TorchScript IR; often **one** ``CallMethod`` into
+  - **``swin3d_block_<slug>_export.txt``** - full ATen graph from ``torch.export`` (best for
+    reading layout -> SDPA -> AdaLN -> MLP). Requires PyTorch 2.x.
+  - ``swin3d_block_<slug>_jit_ir.txt`` - TorchScript IR; often **one** ``CallMethod`` into
     ``Swin3DTransformerBlock`` (submodule boundary), so prefer ``*_export.txt`` for detail.
-  - ``swin3d_block_<slug>_jit.pt`` — traced wrapper (``torch.jit.load``).
+  - ``swin3d_block_<slug>_jit.pt`` - traced wrapper (``torch.jit.load``).
 
 ``torch.fx.symbolic_trace`` is not used: the block has data-dependent branches.
 

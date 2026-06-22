@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Catalog and microbench **level_decoder** GEMM layouts (512↔1024 MLP + QKV).
+"""Catalog and microbench **level_decoder** GEMM layouts (512<->1024 MLP + QKV).
 
 Use after ``bench_small_pretrained.py`` confirms E2E/accuracy; this script isolates
 :class:`~aurora.model.perceiver.PerceiverResampler` tensor geometry and cuBLAS/CUTLASS
@@ -69,7 +69,7 @@ def _linear_gemm_specs(
     *,
     notes: str = "",
 ) -> GemmSpec:
-    """PyTorch ``F.linear(x, w)`` → GEMM with M=rows, K=in, N=out (TN on weight)."""
+    """PyTorch ``F.linear(x, w)`` -> GEMM with M=rows, K=in, N=out (TN on weight)."""
     return GemmSpec(name, rows, in_features, out_features, notes)
 
 
@@ -108,7 +108,7 @@ def _build_specs(info: dict, attn, mlp) -> list[GemmSpec]:
         _linear_gemm_specs("mlp.fc2", mlp_h, d, bl * l1, notes="1024→512 contraction"),
     ]
     h, dh = attn.num_heads, attn.head_dim
-    _ = (h, dh, l1, l2)  # FMHA: B=BL, seqlen L1/L2 — not a GEMM row; tracked separately
+    _ = (h, dh, l1, l2)  # FMHA: B=BL, seqlen L1/L2 - not a GEMM row; tracked separately
     return specs
 
 
@@ -166,7 +166,7 @@ def _run_microbenches(
         ("to_q  flat", lambda: F.linear(lat2, w_q)),
         ("to_kv nested", lambda: F.linear(ctx, w_kv)),
         ("to_kv flat", lambda: F.linear(ctx2, w_kv)),
-        ("to_out", lambda: F.linear(lat2, w_o)),  # after attn — use flat
+        ("to_out", lambda: F.linear(lat2, w_o)),  # after attn - use flat
         ("fc1", lambda: F.linear(lat2, w1)),
         ("fc2 only", lambda: F.linear(hidden, w2)),
         ("mlp full", lambda: mlp.net(lat2)),
