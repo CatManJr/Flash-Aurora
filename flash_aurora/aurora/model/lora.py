@@ -59,7 +59,9 @@ class LoRA(nn.Module):
         Returns:
             torch.Tensor: Additive correction for the output of the linear layer.
         """
-        x = self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)
+        lora_a = self.lora_A.transpose(0, 1).to(dtype=x.dtype)
+        lora_b = self.lora_B.transpose(0, 1).to(dtype=x.dtype)
+        x = self.lora_dropout(x) @ lora_a @ lora_b
         return x * self.scaling
 
     def delta_weight(

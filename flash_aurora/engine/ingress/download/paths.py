@@ -30,6 +30,19 @@ def cdsapirc_path() -> Path:
     return user_config_file(".cdsapirc")
 
 
+def read_cdsapirc_key() -> str | None:
+    """Read the API key from ``~/.cdsapirc`` without loading the file URL."""
+    path = cdsapirc_path()
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("key:"):
+            value = stripped.split(":", 1)[1].strip()
+            return value or None
+    return None
+
+
 def ecmwfapirc_path() -> Path:
     return user_config_file(".ecmwfapirc")
 

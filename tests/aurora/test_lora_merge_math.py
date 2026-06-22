@@ -42,6 +42,19 @@ def test_lora_forward_matches_matmul_reference() -> None:
 
 
 @requires_cuda
+def test_lora_forward_matches_matmul_reference_bf16_input() -> None:
+    """LoRA(x) stays dtype-aligned when x is BF16 (bf16_mixed backbone path)."""
+    torch.manual_seed(4)
+    lora = LoRA(in_features=16, out_features=32, r=4, alpha=8).cuda().eval()
+    x = torch.randn(2, 10, 16, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        y_lora = lora(x)
+        y_ref = (x @ lora.lora_A.T.to(dtype=x.dtype) @ lora.lora_B.T.to(dtype=x.dtype)) * lora.scaling
+    assert y_lora.dtype == torch.bfloat16
+    torch.testing.assert_close(y_lora, y_ref, rtol=1e-2, atol=1e-2)
+
+
+@requires_cuda
 def test_f_linear_merge_matches_linear_plus_lora_rollout() -> None:
     """F.linear(x, W + ΔW, b) == Linear(x) + LoRARollout(x) for active step."""
     torch.manual_seed(2)

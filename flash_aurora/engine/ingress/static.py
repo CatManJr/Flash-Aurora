@@ -23,10 +23,19 @@ class StaticFieldLoader:
         lon: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         roots = self._assets.allowed_roots(self._config.asset_root, self._config.user_cwd)
+        local = self._assets.join(
+            self._variant.static_pickle,
+            explicit=self._config.asset_root,
+            user_cwd=self._config.user_cwd,
+        )
+        # Ingress NetCDF may be cached locally while HF static pickles are still missing
+        # (common on partial asset mirrors). Fetch missing pickles even when the
+        # checkpoint was resolved locally with allow_hub_download=False.
+        allow_download = self._config.allow_hub_download or not local.is_file()
         path = self._assets.fetch_hub_file(
             self._variant.static_pickle,
             repo=self._variant.hf_repo,
-            allow_download=self._config.allow_hub_download,
+            allow_download=allow_download,
             explicit=self._config.asset_root,
             user_cwd=self._config.user_cwd,
             hub=self._config.hub_download_options(),

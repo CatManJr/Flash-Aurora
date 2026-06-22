@@ -10,7 +10,7 @@ import pytest
 import xarray as xr
 
 from flash_aurora.engine.core.config import CAMS_STATIC, EngineConfig, STANDARD_LEVELS
-from flash_aurora.engine.core.netcdf_codec import NETCDF_ENGINE
+from flash_aurora.engine.core.netcdf_codec import INGRESS_NETCDF_ENGINE, NETCDF_ENGINE
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS
 from flash_aurora.engine.ingress.adapters.cams import CamsAdapter
 from flash_aurora.engine.ingress.adapters.request import IngestRequest
@@ -142,6 +142,37 @@ def test_cams_default_paths_under_cache_dir(tmp_path: Path) -> None:
     )
     batch = adapter.build_initial_batch(request, config)
     assert batch.metadata.time == (datetime(2022, 6, 11, 12),)
+
+
+def test_cams_adapter_reads_netcdf4_cache(tmp_path: Path) -> None:
+    paths = write_cams_fixture(tmp_path / "inputs")
+    config = tiny_cams_config(tmp_path)
+    netcdf4_surface = tmp_path / "inputs" / "2022-06-11-cams-surface-level-netcdf4.nc"
+    with xr.open_dataset(paths["surface"], engine=NETCDF_ENGINE) as src:
+        src.to_netcdf(netcdf4_surface, engine=INGRESS_NETCDF_ENGINE)
+
+    adapter = CamsAdapter()
+    request = IngestRequest(
+        valid_time=datetime(2022, 6, 11, 12),
+        raw_paths={**paths, "surface": netcdf4_surface},
+    )
+    batch = adapter.build_initial_batch(request, config)
+    assert batch.surf_vars["2t"].shape == (1, 2, 5, 8)
+
+
+def test_cams_adapter_reorders_descending_pressure_levels(tmp_path: Path) -> None:
+    descending = tuple(reversed(STANDARD_LEVELS))
+    paths = write_cams_fixture(tmp_path / "inputs", levels=descending)
+    config = tiny_cams_config(tmp_path)
+    adapter = CamsAdapter()
+    request = IngestRequest(
+        valid_time=datetime(2022, 6, 11, 12),
+        raw_paths=paths,
+    )
+
+    batch = adapter.build_initial_batch(request, config)
+
+    assert batch.metadata.atmos_levels == STANDARD_LEVELS
 
 
 def test_cams_missing_inputs_raises(tmp_path: Path) -> None:

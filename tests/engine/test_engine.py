@@ -48,3 +48,12 @@ def test_build_model_applies_inference_precision(tmp_path: Path) -> None:
     assert model.inference_config.config_label == "bf16_mixed@fp32"
     block = model.backbone.encoder_layers[0].blocks[0]
     assert block.attn.use_cute_window_attn is True
+
+
+def test_build_model_enables_lora_merged_inference_for_finetuned_presets(tmp_path: Path) -> None:
+    finetuned = AuroraEngine.from_preset("hres_t0_finetuned", asset_root=tmp_path)
+    pretrained = AuroraEngine.from_preset("era5_pretrained", asset_root=tmp_path)
+    finetuned_attn = finetuned._loader.build_model().backbone.encoder_layers[0].blocks[0].attn
+    pretrained_attn = pretrained._loader.build_model().backbone.encoder_layers[0].blocks[0].attn
+    assert finetuned_attn.use_lora_merged_inference is True
+    assert pretrained_attn.use_lora_merged_inference is False

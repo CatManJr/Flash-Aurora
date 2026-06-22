@@ -16,7 +16,7 @@ from flash_aurora.engine.core.config import (
     STANDARD_ATMOS,
     STANDARD_SURF,
 )
-from flash_aurora.engine.core.netcdf_codec import NETCDF_ENGINE
+from flash_aurora.engine.core.netcdf_codec import INGRESS_NETCDF_ENGINE
 from flash_aurora.engine.core.paths import AssetStore
 from flash_aurora.engine.ingress.adapters.base import resolve_cache_dir
 from flash_aurora.engine.ingress.adapters.era5 import CdsEra5Adapter
@@ -57,7 +57,7 @@ class CamsAdapter:
                     f"Missing CAMS input {path}. Download from ADS or set IngestRequest.raw_paths."
                 )
 
-        open_kwargs = {"engine": NETCDF_ENGINE, "decode_timedelta": True}
+        open_kwargs = {"engine": INGRESS_NETCDF_ENGINE, "decode_timedelta": True}
         with xr.open_dataset(paths.surface, **open_kwargs) as surf_ds, xr.open_dataset(
             paths.atmospheric, **open_kwargs
         ) as atmos_ds:
@@ -100,17 +100,27 @@ class CamsAdapter:
             aurora: torch.from_numpy(np.ascontiguousarray(surf_ds[file_name].values)[None])
             for file_name, aurora in CAMS_SURF_STANDARD_FIELDS + CAMS_SURF_POLLUTION_FIELDS
         }
-        atmos_vars = {
-            aurora: torch.from_numpy(np.ascontiguousarray(atmos_ds[name].values)[None])
-            for name, aurora in CAMS_ATMOS_FIELDS
-        }
 
-        valid_times = atmos_ds.valid_time.values.astype("datetime64[s]").tolist()
         level_coord = (
             atmos_ds["pressure_level"]
             if "pressure_level" in atmos_ds.coords
             else atmos_ds["level"]
         )
+        levels = tuple(int(level) for level in level_coord.values)
+        expected_levels = config.variant.levels
+        if set(levels) != set(expected_levels):
+            raise ValueError(
+                f"CAMS atmospheric levels {levels} do not match expected {expected_levels}"
+            )
+        level_index = [levels.index(level) for level in expected_levels]
+        atmos_vars = {
+            aurora: torch.from_numpy(
+                np.ascontiguousarray(atmos_ds[name].values[:, level_index, ...])[None]
+            )
+            for name, aurora in CAMS_ATMOS_FIELDS
+        }
+
+        valid_times = atmos_ds.valid_time.values.astype("datetime64[s]").tolist()
 
         return Batch(
             surf_vars=surf_vars,
@@ -120,7 +130,7 @@ class CamsAdapter:
                 lat=CdsEra5Adapter._coord_tensor(atmos_ds.latitude.values),
                 lon=CdsEra5Adapter._coord_tensor(atmos_ds.longitude.values),
                 time=(valid_times[-1],),
-                atmos_levels=tuple(int(level) for level in level_coord.values),
+                atmos_levels=expected_levels,
                 rollout_step=0,
             ),
         )

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Protocol
 
 from flash_aurora.engine.core.config import SourceProfile
-from flash_aurora.engine.ingress.download import cds, layout, mars, weatherbench2
+from flash_aurora.engine.ingress.download import cds, cams, layout, mars, weatherbench2
 
 
 class DownloadBackendError(NotImplementedError):
@@ -66,6 +66,18 @@ class Wb2WamBackend:
         return _partition(keys, before, expected)
 
 
+class CamsBackend:
+    def ensure(self, source: SourceProfile, valid_time: datetime, cache_dir: Path) -> DownloadOutcome:
+        day = layout.day_token(valid_time)
+        keys = tuple(layout.expected_paths(source, valid_time, cache_dir))
+        before = {key for key in keys if layout.expected_paths(source, valid_time, cache_dir)[key].is_file()}
+
+        cams.download_cams_day(cache_dir, day)
+
+        expected = layout.expected_paths(source, valid_time, cache_dir)
+        return _partition(keys, before, expected)
+
+
 class UnsupportedBackend:
     label: str
 
@@ -83,10 +95,7 @@ DEFAULT_BACKENDS: dict[str, DownloadBackend] = {
     "cds_era5": CdsEra5Backend(),
     "wb2_hres": Wb2HresBackend(),
     "wb2_wam": Wb2WamBackend(),
-    "cams": UnsupportedBackend(
-        "CAMS",
-        doc="Download from ADS manually (see aurora/docs/example_cams.ipynb).",
-    ),
+    "cams": CamsBackend(),
     "grib_ifs_0.1": UnsupportedBackend(
         "HRES 0.1 GRIB",
         doc="Provide GRIB or NetCDF cache manually (see aurora/docs/example_hres_0.1.ipynb).",

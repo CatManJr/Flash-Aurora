@@ -52,6 +52,7 @@ class CheckpointLoader:
             variant.model_class,
             use_lora=variant.use_lora,
             lora_mode=variant.lora_mode,
+            use_lora_merged_inference=variant.use_lora,
             **model_kwargs,
         )
         model.eval()
