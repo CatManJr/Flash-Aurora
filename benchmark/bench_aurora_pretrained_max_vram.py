@@ -34,10 +34,12 @@ from _pretrained_era5 import (  # noqa: E402
     _CHECKPOINT_NAME,
     _DEFAULT_ASSET_ROOT,
     build_model,
+    format_peak_memory,
     load_era5_batch,
     peak_mb_forward,
     probe_max_batch,
     purge_gpu,
+    print_startup_gpu_state,
     repeat_batch,
     tiers_from_args,
 )
@@ -81,6 +83,8 @@ def main() -> None:
     if args.cap < 1:
         raise SystemExit("--cap must be >= 1")
 
+    print_startup_gpu_state(device=device)
+
     valid_time = datetime.fromisoformat(args.valid_time)
     batch_b1 = load_era5_batch(
         asset_root,
@@ -108,8 +112,8 @@ def main() -> None:
     for key, spec, label in tier_list:
         print(f"  [{key}] {spec!r} — {label}")
 
-    print(f"\n{'tier':<42} {'max_batch':>10} {'peak_MB':>10}")
-    print("-" * 64)
+    print(f"\n{'tier':<42} {'max_batch':>10}  peak")
+    print("-" * 100)
 
     for key, precision, label in tier_list:
         print(f"[probe] {key}...", flush=True)
@@ -124,16 +128,16 @@ def main() -> None:
                 forward_only=forward_only,
                 rollout_steps=args.rollout_steps,
             )
-            peak_mb: float | str = "n/a"
+            peak_s: str = "n/a"
             if args.report_peak_mb and max_batch >= 1:
                 batch_max = repeat_batch(batch_b1, max_batch).to(device)
-                peak_mb = peak_mb_forward(model, batch_max, device)
+                peak_alloc, peak_reserved = peak_mb_forward(model, batch_max, device)
+                peak_s = format_peak_memory(peak_alloc, peak_reserved)
                 purge_gpu(batch_max)
         finally:
             purge_gpu(model)
 
-        peak_s = f"{peak_mb:.0f}" if isinstance(peak_mb, float) else peak_mb
-        print(f"{key:<42} {max_batch:>10} {peak_s:>10}")
+        print(f"{key:<42} {max_batch:>10}  {peak_s}")
         if max_batch == 0:
             print(f"  [warn] {key}: batch=1 failed ({label})")
 

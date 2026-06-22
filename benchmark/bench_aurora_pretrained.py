@@ -43,10 +43,12 @@ from _pretrained_era5 import (  # noqa: E402
     _DEFAULT_ASSET_ROOT,
     _PYTORCH_BASELINE_KEY,
     diff_vs_reference,
+    format_peak_memory,
     load_era5_batch,
     official_tol_rows,
     print_official_tol_table,
     print_per_variable_table,
+    print_startup_gpu_state,
     print_summary_table,
     purge_gpu,
     run_ablate_cute,
@@ -125,6 +127,8 @@ def main() -> None:
     if not checkpoint.is_file():
         raise SystemExit(f"checkpoint not found: {checkpoint}")
 
+    print_startup_gpu_state(device=device)
+
     valid_time = datetime.fromisoformat(args.valid_time)
     batch = load_era5_batch(
         asset_root,
@@ -185,7 +189,7 @@ def main() -> None:
         all_preds[key] = pred
         print(
             f"[run] {key} forward={ms_per:.1f} ms ({1000.0 / ms_per:.2f} fwd/s) "
-            f"peak={peak_alloc:.0f}/{peak_reserved:.0f} MB",
+            f"{format_peak_memory(peak_alloc, peak_reserved)}",
             flush=True,
         )
         if key == baseline_key:

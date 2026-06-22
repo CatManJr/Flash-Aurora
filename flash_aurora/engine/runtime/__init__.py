@@ -1,5 +1,9 @@
 from flash_aurora.engine.runtime.graph_pool import GraphPool
-from flash_aurora.engine.runtime.gpu_budget import estimate_vram_gib, is_exclusive_variant
+from flash_aurora.engine.runtime.gpu_budget import (
+    estimate_vram_allocated_gib,
+    estimate_vram_gib,
+    is_exclusive_variant,
+)
 from flash_aurora.engine.runtime.gpu_guard import (
     GpuGuardRegistry,
     GpuGuardTicket,
@@ -15,6 +19,7 @@ __all__ = [
     "GpuGuardRegistry",
     "GpuGuardTicket",
     "StaticVarsCache",
+    "estimate_vram_allocated_gib",
     "estimate_vram_gib",
     "gpu_guard_enabled",
     "gpu_guard_session",

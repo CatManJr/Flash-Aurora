@@ -14,7 +14,7 @@ from flash_aurora.engine.runtime.gpu_guard import GpuGuardRegistry
 
 def test_estimate_vram_hres_01_is_exclusive() -> None:
     variant = DEFAULT_PRESETS.get("hres_0.1").variant
-    assert estimate_vram_gib(variant, rollout_steps=2) >= 48.0
+    assert estimate_vram_gib(variant, rollout_steps=2) >= 82.5
     assert is_exclusive_variant(variant, rollout_steps=2)
 
 

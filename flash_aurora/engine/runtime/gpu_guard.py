@@ -227,12 +227,21 @@ class GpuGuardRegistry:
         preset: str,
         variant: ModelVariantSpec,
         rollout_steps: int = 1,
+        inference_precision: str | None = None,
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         queue: bool = True,
     ) -> GpuGuardTicket:
         pid = os.getpid()
-        needed = estimate_vram_gib(variant, rollout_steps=rollout_steps)
-        exclusive = is_exclusive_variant(variant, rollout_steps=rollout_steps)
+        needed = estimate_vram_gib(
+            variant,
+            rollout_steps=rollout_steps,
+            inference_precision=inference_precision,
+        )
+        exclusive = is_exclusive_variant(
+            variant,
+            rollout_steps=rollout_steps,
+            inference_precision=inference_precision,
+        )
         deadline = time.time() + timeout
         last_message = ""
 
@@ -372,6 +381,7 @@ def gpu_guard_session(
     preset: str,
     variant: ModelVariantSpec,
     rollout_steps: int = 1,
+    inference_precision: str | None = None,
     timeout: float = _DEFAULT_TIMEOUT_SECONDS,
     enabled: bool | None = None,
 ) -> Iterator[GpuGuardTicket | None]:
@@ -402,6 +412,7 @@ def gpu_guard_session(
         preset=preset,
         variant=variant,
         rollout_steps=rollout_steps,
+        inference_precision=inference_precision,
         timeout=timeout,
     )
     try:

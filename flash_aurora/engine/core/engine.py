@@ -139,6 +139,7 @@ class AuroraEngine:
             preset=preset,
             variant=self.config.variant,
             rollout_steps=steps,
+            inference_precision=self.config.inference_precision,
             timeout=self.config.gpu_guard_timeout,
         )
         return self._gpu_ticket

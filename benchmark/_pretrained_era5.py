@@ -158,6 +158,27 @@ def purge_gpu(*objs: Any) -> None:
             torch.cuda.ipc_collect()
 
 
+def print_startup_gpu_state(*, device: torch.device) -> None:
+    """Log baseline VRAM before loading IC/model (helps spot stale kernels)."""
+    if device.type != "cuda":
+        return
+    from flash_aurora.engine.runtime.gpu_memory import print_cuda_memory_summary
+
+    purge_gpu()
+    print("[gpu] baseline (after purge_gpu, before IC/model):")
+    print_cuda_memory_summary(device_index=device.index or 0)
+
+
+def format_peak_memory(peak_alloc_mb: float, peak_reserved_mb: float) -> str:
+    """Human-readable peak line; reserved often exceeds allocated (CUDA caching pool)."""
+    alloc_gib = peak_alloc_mb / 1024.0
+    reserved_gib = peak_reserved_mb / 1024.0
+    return (
+        f"peak allocated={peak_alloc_mb:.0f} MB ({alloc_gib:.1f} GiB tensors), "
+        f"reserved={peak_reserved_mb:.0f} MB ({reserved_gib:.1f} GiB CUDA pool)"
+    )
+
+
 def load_era5_batch(
     asset_root: Path,
     *,
@@ -485,7 +506,7 @@ def run_ablate_cute(
         old_env = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         try:
-            pred, ms_per, peak_alloc, _reserved = run_tier(
+            pred, ms_per, peak_alloc, peak_reserved = run_tier(
                 precision=precision,
                 checkpoint=checkpoint,
                 batch=batch,
@@ -502,7 +523,10 @@ def run_ablate_cute(
                 else:
                     os.environ[k] = v
         all_preds[tier_key] = pred
-        print(f"[run] {tier_key} forward={ms_per:.1f} ms peak={peak_alloc:.0f} MB", flush=True)
+        print(
+            f"[run] {tier_key} forward={ms_per:.1f} ms {format_peak_memory(peak_alloc, peak_reserved)}",
+            flush=True,
+        )
         if tier_key == "fp32":
             baseline = pred
             baseline_ms = ms_per
@@ -600,12 +624,15 @@ def probe_max_batch(
     return lo
 
 
-def peak_mb_forward(model: Any, batch: Any, device: torch.device) -> float:
+def peak_mb_forward(model: Any, batch: Any, device: torch.device) -> tuple[float, float]:
+    """Return (peak_allocated_mb, peak_reserved_mb) for one forward."""
     if device.type != "cuda":
-        return float("nan")
-    purge_gpu()
+        return float("nan"), float("nan")
     torch.cuda.reset_peak_memory_stats(device)
     with torch.inference_mode():
         _ = model.forward(batch)
     torch.cuda.synchronize(device)
-    return torch.cuda.max_memory_allocated(device) / 1e6
+    return (
+        torch.cuda.max_memory_allocated(device) / 1e6,
+        torch.cuda.max_memory_reserved(device) / 1e6,
+    )
