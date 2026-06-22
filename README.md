@@ -29,6 +29,16 @@ The [`flash_aurora/aurora/`](flash_aurora/aurora/) package is the [Microsoft Aur
 - **Profiling write-ups** (local): [`profiling/`](profiling/). Backbone **D2 vs D2+D3** (from repo root, CUDA): default `--compare-d2d3` is **light** (batch=1, repeat=4). **`--preset stress`** uses `L=2048`, batch=4 (8192 tokens/step, `warmup`/`repeat` raised). **`--preset stress-heavy`** is batch=8, `L=8192` (very large VRAM). Example:  
   `uv run python profiling/profiling_swin3d.py --compare-d2d3 --preset stress --compare-report-out profiling/swin3d_d2d3_stress.md`
 
+## Testing
+
+```bash
+./scripts/run_tests.sh
+# or: 
+uv run pytest tests/aurora tests/kernels tests/engine -m "not integration"
+```
+
+**Official reference drift:** [`test_aurora_small`](tests/aurora/test_model.py) runs the small pretrained model in FP64 (`model.double()`, `use_lora=True`) and compares outputs to Microsoft Hugging Face reference pickles. On recent PyTorch stacks (e.g. 2.12.x) and RTX PRO6000 Blackwell Server Edition, a small mean relative error can appear on a few surface variables (`2t` ~1.5×10⁻⁴ vs upstream tolerance 1×10⁻⁴; `10u`/`10v` similarly) even with the official [`microsoft-aurora`](https://pypi.org/project/microsoft-aurora/) wheel — same checkpoint and inputs, different accumulated FP64 rounding. The test **passes** and emits a **UserWarning** when drift exceeds upstream tolerances so you know this is an environment mismatch, not a flash-aurora regression.
+
 ## CuTe Window Attention — current state
 
 We've been replacing Aurora's per-window SDPA with hand-written CuTeDSL kernels on Blackwell (SM120). The work lives entirely in our `ops/cute` layer — upstream Aurora torch code is untouched.
