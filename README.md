@@ -1,4 +1,4 @@
-# Flash-Aurora: One More Step Toward Efficient Geospatial FOundation Models Inference Service
+# Flash-Aurora: One More Step Toward Efficient Geospatial Foundation Models Inference Service
 
 High-performance inference stack for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model. The repository packages the upstream model under `flash_aurora.aurora`, custom CUDA kernels (Triton and CuTeDSL), precision routing, and `flash_aurora.engine` for data ingress, checkpoints, rollout, and export.
 
@@ -92,8 +92,8 @@ Measured with `benchmark/bench_aurora_pretrained.py` on **AuroraPretrained** at 
 | `tf32@tf32` | 931.0 | 2.31x | 0.060 |
 | `tf32@fp32` | 1093.3 | 1.97x | 0.018 |
 | `fp32@fp32` | 1988.9 | 1.08x | 5.4e-05 |
-| PyTorch FP32 ref (no Triton/CuTe) | 2151.0 | 1.00x | 0 |
-| PyTorch autocast BF16 backbone | 1013.7 | 2.12x | 0.140 |
+| PyTorch autocast (backbone) | 1013.7 | 2.12x | 0.140 |
+| PyTorch FP32 ref | 2151.0 | base | 0 |
 
 The PyTorch FP32 reference uses no custom kernels. Every other custom tier uses Triton layout and AdaLN fusion; `tf32` and BF16 tiers additionally use CuTe window attention and the corresponding backbone matmul mode. All custom tiers pass per-variable mean relative-error tolerances from the upstream golden tests on this ERA5 sample when compared to the PyTorch FP32 reference. Recommended production preset on this hardware: `bf16_mixed@fp32` or `bf16_mixed@tf32` (about 3x speedup with bounded drift).
 
