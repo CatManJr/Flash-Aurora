@@ -21,6 +21,7 @@ cuda-keyring_1.1-1_all.deb
 
 # Local notebook experiments (not for commit)
 *.ipynb
+!/docs/*.ipynb
 .ipynb_checkpoints/
 
 # Default rollout export dir from example notebooks
