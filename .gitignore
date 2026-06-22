@@ -33,14 +33,10 @@ output/
 *.qdstrm
 *.qdrep
 
-# benchmark/ and profiling/: track scripts only, not run artifacts
-benchmark/**
-!benchmark/**/
-!benchmark/**/*.py
-
-profiling/**
-!profiling/**/
-!profiling/**/*.py
-!profiling/**/*.sh
+# benchmark/profiling run artifacts
+benchmark/results/
+profiling/graphs/
+profiling/nsight/
+profiling/*.json
 
 .vscode/settings.json
