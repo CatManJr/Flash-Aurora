@@ -44,5 +44,6 @@ profiling/nsight/
 profiling/*.json
 profiling/*.png
 profiling/*.md
+*/*.log
 
 .vscode/settings.json

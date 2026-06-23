@@ -1,0 +1,102 @@
+GPU NVIDIA RTX PRO 6000 Blackwell Server Edition SM120 | CuTe=True kernel=cute | measured=200
+
+Checkpoint shape coverage: 9 unique geometries from 7 variants × enc/dec stages
+shape                              tile_m/n  bf16  +mask  tf32  +mask    max_abs  checkpoints
+--------------------------------------------------------------------------------------------------------------
+Bwin=1800 H=8 N=144 Dh=64            64/144    OK     OK    OK     OK   2.44e-04  aurora-0.1-finetuned, aurora-0.25...
+Bwin=1250 H=8 N=144 Dh=64            64/144    OK     OK    OK     OK   2.44e-04  aurora-0.4-air-pollution
+Bwin=578 H=4 N=144 Dh=64             64/144    OK     OK    OK     OK   2.44e-04  aurora-0.25-small-pretrained
+Bwin=450 H=16 N=144 Dh=64            64/144    OK     OK    OK     OK   2.44e-04  aurora-0.1-finetuned, aurora-0.25...
+Bwin=338 H=16 N=144 Dh=64            64/144    OK     OK    OK     OK   2.44e-04  aurora-0.4-air-pollution
+Bwin=162 H=8 N=144 Dh=64             64/144    OK     OK    OK     OK   2.44e-04  aurora-0.25-small-pretrained
+Bwin=128 H=32 N=144 Dh=64            64/144    OK     OK    OK     OK   2.44e-04  aurora-0.1-finetuned, aurora-0.25...
+Bwin=98 H=32 N=144 Dh=64             64/144    OK     OK    OK     OK   2.44e-04  aurora-0.4-air-pollution
+Bwin=50 H=16 N=144 Dh=64             64/144    OK     OK    OK     OK   2.44e-04  aurora-0.25-small-pretrained
+
+Coverage summary: PASS (9 shapes × BF16/TF32 × mask/unmask)
+
+Accuracy vs FP32 SDPA (micro + all checkpoints): nomask PASS (max_abs BF16=2.44e-04 TF32=1.08e-04) | masked -100 PASS (max_abs BF16=2.44e-04 TF32=1.46e-04)
+
+No mask — micro shapes (BF16 CuTe vs BF16 SDPA)
+shape                  cute_ms sdpa_ms    vs
+--------------------------------------------
+N144 H8                  0.022   0.024  1.12x
+N288 H8                  0.026   0.029  1.08x
+N576 H32 stream          0.045   0.039  0.86x
+
+No mask — micro shapes (TF32 CuTe vs FP32 SDPA)
+shape                  cute_ms sdpa_ms    vs
+--------------------------------------------
+N144 H8                  0.031   0.051  1.61x
+N288 H8                  0.043   0.057  1.33x
+N576 H32 stream          0.096   0.160  1.67x
+
+No mask — all checkpoint shapes (BF16)
+shape                  cute_ms sdpa_ms    vs
+--------------------------------------------
+Bwin=1800 H=8 N=144 Dh=64   0.727   0.780  1.07x
+Bwin=1250 H=8 N=144 Dh=64   0.510   0.549  1.07x
+Bwin=578 H=4 N=144 Dh=64   0.132   0.145  1.10x
+Bwin=450 H=16 N=144 Dh=64   0.374   0.407  1.09x
+Bwin=338 H=16 N=144 Dh=64   0.285   0.309  1.08x
+Bwin=162 H=8 N=144 Dh=64   0.053   0.083  1.57x
+Bwin=128 H=32 N=144 Dh=64   0.220   0.239  1.09x
+Bwin=98 H=32 N=144 Dh=64   0.174   0.189  1.09x
+Bwin=50 H=16 N=144 Dh=64   0.039   0.057  1.47x
+
+No mask — all checkpoint shapes (TF32; SDPA is true FP32 matmul)
+shape                  cute_ms sdpa_ms    vs
+--------------------------------------------
+Bwin=1800 H=8 N=144 Dh=64   1.613   2.582  1.60x
+Bwin=1250 H=8 N=144 Dh=64   1.125   1.802  1.60x
+Bwin=578 H=4 N=144 Dh=64   0.279   0.444  1.59x
+Bwin=450 H=16 N=144 Dh=64   0.819   1.308  1.60x
+Bwin=338 H=16 N=144 Dh=64   0.620   0.991  1.60x
+Bwin=162 H=8 N=144 Dh=64   0.166   0.263  1.59x
+Bwin=128 H=32 N=144 Dh=64   0.477   0.760  1.59x
+Bwin=98 H=32 N=144 Dh=64   0.371   0.590  1.59x
+Bwin=50 H=16 N=144 Dh=64   0.087   0.163  1.86x
+
+Masked Swin bias -100 (all checkpoint shapes, nW=1)
+
+Masked — BF16 CuTe vs BF16 SDPA + attn_mask
+shape                  cute_ms sdpa_ms    vs
+--------------------------------------------
+Bwin=1800 H=8 N=144 Dh=64   0.829   1.014  1.22x
+Bwin=1250 H=8 N=144 Dh=64   0.566   0.704  1.24x
+Bwin=578 H=4 N=144 Dh=64   0.158   0.193  1.23x
+Bwin=450 H=16 N=144 Dh=64   0.431   0.523  1.21x
+Bwin=338 H=16 N=144 Dh=64   0.338   0.402  1.19x
+Bwin=162 H=8 N=144 Dh=64   0.108   0.106  0.98x
+Bwin=128 H=32 N=144 Dh=64   0.269   0.314  1.17x
+Bwin=98 H=32 N=144 Dh=64   0.219   0.247  1.13x
+Bwin=50 H=16 N=144 Dh=64   0.082   0.073  0.88x
+
+Masked — TF32 CuTe vs FP32 SDPA + attn_mask
+shape                  cute_ms sdpa_ms    vs
+--------------------------------------------
+Bwin=1800 H=8 N=144 Dh=64   1.906   3.221  1.69x
+Bwin=1250 H=8 N=144 Dh=64   1.341   2.120  1.58x
+Bwin=578 H=4 N=144 Dh=64   0.349   0.537  1.54x
+Bwin=450 H=16 N=144 Dh=64   0.989   1.515  1.53x
+Bwin=338 H=16 N=144 Dh=64   0.755   1.151  1.52x
+Bwin=162 H=8 N=144 Dh=64   0.214   0.317  1.48x
+Bwin=128 H=32 N=144 Dh=64   0.582   0.883  1.52x
+Bwin=98 H=32 N=144 Dh=64   0.457   0.691  1.51x
+Bwin=50 H=16 N=144 Dh=64   0.137   0.208  1.52x
+
+Forced SDPA backend probe — BF16 0.25° ERA5 enc (no mask)
+shape                     cute   flash mem_eff    math
+------------------------------------------------------
+era5 enc1 1800×8         0.727   0.792   0.862  25.863
+era5 enc2 450×16         0.378   0.402   0.428  13.349
+era5 enc3 128×32         0.220   0.252   0.270   3.636
+
+Forced SDPA backend probe — BF16 0.25° ERA5 enc (masked -100)
+shape                     cute   flash mem_eff    math
+------------------------------------------------------
+era5 enc1 1800×8         0.825     n/a   1.028  14.473
+era5 enc2 450×16         0.440     n/a   0.535   7.196
+era5 enc3 128×32         0.268     n/a   0.322   4.101
+
+Latency: trimmed mean of 200 runs (drop 5% tails). vs = baseline/cute (>1 faster).
