@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from flash_aurora.engine.core.redaction import sanitize_exception
 from flash_aurora.engine.core.netcdf_codec import NETCDF_ENGINE
+from flash_aurora.engine.ingress.download.parallel import run_labeled_tasks
 from flash_aurora.engine.ingress.download.paths import ensure_directory, normalize_path
 
 WB2_HRES_T0_URL = "gs://weatherbench2/datasets/hres_t0/2016-2022-6h-1440x721.zarr"
@@ -52,7 +54,7 @@ def open_hres_t0_store():
     )
 
 
-def download_hres_t0_day(cache_dir: Path | str, day: str) -> dict[str, Path]:
+def download_hres_t0_day(cache_dir: Path | str, day: str, *, workers: int = 1) -> dict[str, Path]:
     cache_dir = normalize_path(cache_dir)
     ensure_directory(cache_dir)
 
@@ -66,14 +68,28 @@ def download_hres_t0_day(cache_dir: Path | str, day: str) -> dict[str, Path]:
     ds = open_hres_t0_store()
     day_slice = ds.sel(time=day)
 
-    try:
-        if not surface_path.is_file():
-            ds_surf = day_slice[list(WB2_HRES_SURFACE_VARS)].compute()
-            ds_surf.to_netcdf(surface_path, engine=NETCDF_ENGINE)
+    def _write_surface() -> Path:
+        if surface_path.is_file():
+            return surface_path
+        ds_surf = day_slice[list(WB2_HRES_SURFACE_VARS)].compute()
+        ds_surf.to_netcdf(surface_path, engine=NETCDF_ENGINE)
+        return surface_path
 
+    def _write_atmospheric() -> Path:
+        if atmospheric_path.is_file():
+            return atmospheric_path
+        ds_atmos = day_slice[list(WB2_HRES_ATMOS_VARS)].compute()
+        ds_atmos.to_netcdf(atmospheric_path, engine=NETCDF_ENGINE)
+        return atmospheric_path
+
+    try:
+        tasks: list[tuple[str, Callable[[], Path]]] = []
+        if not surface_path.is_file():
+            tasks.append(("surface", _write_surface))
         if not atmospheric_path.is_file():
-            ds_atmos = day_slice[list(WB2_HRES_ATMOS_VARS)].compute()
-            ds_atmos.to_netcdf(atmospheric_path, engine=NETCDF_ENGINE)
+            tasks.append(("atmospheric", _write_atmospheric))
+        if tasks:
+            run_labeled_tasks(tasks, workers=workers, description="WeatherBench2 HRES")
     except Exception as exc:
         raise RuntimeError(
             f"WeatherBench2 download failed for {day}: {sanitize_exception(exc)}"

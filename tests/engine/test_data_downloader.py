@@ -67,7 +67,7 @@ def test_ensure_era5_calls_cds_backends(tmp_path: Path) -> None:
     valid_time = datetime(2023, 1, 1, 6)
     cache = tmp_path / "era5"
 
-    def fake_download(cache_dir: Path, day: str, *, include_static: bool = True):
+    def fake_download(cache_dir: Path, day: str, *, include_static: bool = True, workers: int = 1):
         cache_dir.mkdir(parents=True, exist_ok=True)
         paths = {
             "static": cache_dir / "static.nc",
@@ -124,7 +124,7 @@ def test_cams_backend_downloads_when_missing(tmp_path: Path) -> None:
     valid_time = datetime(2022, 6, 11, 12)
     cache = tmp_path / "cams"
 
-    def fake_download(cache_dir: Path, day: str):
+    def fake_download(cache_dir: Path, day: str, workers: int = 1):
         cache_dir.mkdir(parents=True, exist_ok=True)
         paths = {
             "surface": cache_dir / f"{day}-cams-surface-level.nc",
@@ -264,7 +264,7 @@ def test_ensure_accepts_cds_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     valid_time = datetime(2023, 1, 1, 6)
     cache = tmp_path / "era5"
 
-    def fake_download(cache_dir: Path, day: str, *, include_static: bool = True):
+    def fake_download(cache_dir: Path, day: str, *, include_static: bool = True, workers: int = 1):
         cache_dir.mkdir(parents=True, exist_ok=True)
         paths = {
             "static": cache_dir / "static.nc",
@@ -320,7 +320,7 @@ def test_grib_ifs_backend_downloads_when_missing(tmp_path: Path) -> None:
     valid_time = datetime(2022, 5, 11, 6)
     cache = tmp_path / "hres_0.1"
 
-    def fake_download(cache_dir: Path, day: str):
+    def fake_download(cache_dir: Path, day: str, workers: int = 1):
         cache_dir.mkdir(parents=True, exist_ok=True)
         paths = expected_paths(config.source, valid_time, cache_dir)
         for path in paths.values():
@@ -488,7 +488,7 @@ def test_ensure_wave_prompts_for_ecmwf_credentials(tmp_path: Path, monkeypatch: 
     valid_time = datetime(2022, 9, 16, 6)
     cache = tmp_path / "wave"
 
-    def fake_download(cache_dir: Path, day: str):
+    def fake_download(cache_dir: Path, day: str, workers: int = 1):
         cache_dir.mkdir(parents=True, exist_ok=True)
         paths = expected_paths(config.source, valid_time, cache_dir)
         for path in paths.values():

@@ -17,6 +17,7 @@ from flash_aurora.engine.ingress.download.credentials import (
     use_download_credentials,
 )
 from flash_aurora.engine.ingress.download.layout import cache_subdir, expected_paths, missing_keys
+from flash_aurora.engine.ingress.download.options import DownloadOptions, resolve_download_workers
 from flash_aurora.engine.ingress.download.paths import ensure_directory, normalize_path
 
 
@@ -59,9 +60,11 @@ class DataDownloader:
         config: EngineConfig,
         *,
         credentials: DownloadCredentials | None = None,
+        workers: int | None = None,
     ) -> None:
         self.config = config
         self._credentials = credentials
+        self._download_options = DownloadOptions.resolve(workers)
         if self.config.user_cwd is None:
             self.config.user_cwd = Path.cwd()
 
@@ -81,6 +84,7 @@ class DataDownloader:
         ecmwf_api_key: str | None = None,
         ecmwf_api_url: str | None = None,
         ecmwf_email: str | None = None,
+        workers: int | None = None,
     ) -> DataDownloader:
         registry = presets or DEFAULT_PRESETS
         config = registry.get(name)
@@ -99,7 +103,19 @@ class DataDownloader:
                 ecmwf_email=ecmwf_email,
             ),
         )
-        return cls(config, credentials=preset_credentials)
+        return cls(config, credentials=preset_credentials, workers=workers)
+
+    @property
+    def download_workers(self) -> int:
+        return self._download_options.workers
+
+    def with_workers(self, workers: int) -> DataDownloader:
+        """Return a downloader that uses a different worker count."""
+        return DataDownloader(
+            self.config,
+            credentials=self._credentials,
+            workers=workers,
+        )
 
     def _effective_credentials(
         self,
@@ -178,6 +194,7 @@ class DataDownloader:
         ecmwf_api_url: str | None = None,
         ecmwf_email: str | None = None,
         prompt: bool = False,
+        workers: int | None = None,
     ) -> DownloadResult:
         directory = ensure_directory(
             normalize_path(cache_dir)
@@ -185,8 +202,7 @@ class DataDownloader:
             else self.resolve_cache_dir(DownloadRequest(valid_time=valid_time))
         )
         paths = expected_paths(self.config.source, valid_time, directory)
-        missing = missing_keys(self.config.source, valid_time, directory)
-        if not missing:
+        if not missing_keys(self.config.source, valid_time, directory):
             return DownloadResult(
                 cache_dir=directory,
                 paths=paths,
@@ -194,6 +210,9 @@ class DataDownloader:
                 skipped=tuple(paths),
             )
 
+        effective_workers = resolve_download_workers(
+            workers if workers is not None else self._download_options.workers
+        )
         creds = self._effective_credentials(
             credentials,
             cds_api_key=cds_api_key,
@@ -208,7 +227,12 @@ class DataDownloader:
         backend = get_backend(self.config.source)
         try:
             with use_download_credentials(creds):
-                outcome: DownloadOutcome = backend.ensure(self.config.source, valid_time, directory)
+                outcome: DownloadOutcome = backend.ensure(
+                    self.config.source,
+                    valid_time,
+                    directory,
+                    workers=effective_workers,
+                )
         except DownloadBackendError:
             raise
         except Exception as exc:
@@ -251,6 +275,7 @@ class DataDownloader:
         ecmwf_api_url: str | None = None,
         ecmwf_email: str | None = None,
         prompt: bool = False,
+        workers: int | None = None,
     ) -> IngestRequest:
         directory = normalize_path(cache_dir) if cache_dir is not None else self.resolve_cache_dir(
             DownloadRequest(valid_time=valid_time)
@@ -268,6 +293,7 @@ class DataDownloader:
                 ecmwf_api_url=ecmwf_api_url,
                 ecmwf_email=ecmwf_email,
                 prompt=prompt,
+                workers=workers,
             )
         return IngestRequest(
             valid_time=valid_time,

@@ -7,6 +7,7 @@ from typing import Protocol
 
 from flash_aurora.engine.core.config import SourceProfile
 from flash_aurora.engine.ingress.download import cds, cams, grib_ifs, layout, mars, weatherbench2
+from flash_aurora.engine.ingress.download.parallel import run_labeled_tasks
 
 
 class DownloadBackendError(NotImplementedError):
@@ -21,7 +22,14 @@ class DownloadOutcome:
 
 
 class DownloadBackend(Protocol):
-    def ensure(self, source: SourceProfile, valid_time: datetime, cache_dir: Path) -> DownloadOutcome: ...
+    def ensure(
+        self,
+        source: SourceProfile,
+        valid_time: datetime,
+        cache_dir: Path,
+        *,
+        workers: int = 1,
+    ) -> DownloadOutcome: ...
 
 
 def _partition(keys: tuple[str, ...], before: set[str], after: dict[str, Path]) -> DownloadOutcome:
@@ -30,66 +38,112 @@ def _partition(keys: tuple[str, ...], before: set[str], after: dict[str, Path]) 
     return DownloadOutcome(paths=after, downloaded=downloaded, skipped=skipped)
 
 
+def _keys_and_before(
+    source: SourceProfile,
+    valid_time: datetime,
+    cache_dir: Path,
+) -> tuple[tuple[str, ...], set[str]]:
+    keys = tuple(layout.expected_paths(source, valid_time, cache_dir))
+    before = {key for key in keys if layout.expected_paths(source, valid_time, cache_dir)[key].is_file()}
+    return keys, before
+
+
 class CdsEra5Backend:
-    def ensure(self, source: SourceProfile, valid_time: datetime, cache_dir: Path) -> DownloadOutcome:
+    def ensure(
+        self,
+        source: SourceProfile,
+        valid_time: datetime,
+        cache_dir: Path,
+        *,
+        workers: int = 1,
+    ) -> DownloadOutcome:
         day = layout.day_token(valid_time)
-        keys = tuple(layout.expected_paths(source, valid_time, cache_dir))
-        before = {key for key in keys if layout.expected_paths(source, valid_time, cache_dir)[key].is_file()}
-        paths = cds.download_era5_day(cache_dir, day, include_static=True)
+        keys, before = _keys_and_before(source, valid_time, cache_dir)
+        cds.download_era5_day(cache_dir, day, include_static=True, workers=workers)
         expected = layout.expected_paths(source, valid_time, cache_dir)
         return _partition(keys, before, expected)
 
 
 class Wb2HresBackend:
-    def ensure(self, source: SourceProfile, valid_time: datetime, cache_dir: Path) -> DownloadOutcome:
+    def ensure(
+        self,
+        source: SourceProfile,
+        valid_time: datetime,
+        cache_dir: Path,
+        *,
+        workers: int = 1,
+    ) -> DownloadOutcome:
         day = layout.day_token(valid_time)
-        keys = tuple(layout.expected_paths(source, valid_time, cache_dir))
-        before = {key for key in keys if layout.expected_paths(source, valid_time, cache_dir)[key].is_file()}
+        keys, before = _keys_and_before(source, valid_time, cache_dir)
 
-        weatherbench2.download_hres_t0_day(cache_dir, day)
-        cds.download_era5_static(cache_dir)
+        run_labeled_tasks(
+            (
+                ("hres", lambda: weatherbench2.download_hres_t0_day(cache_dir, day, workers=workers)),
+                ("static", lambda: cds.download_era5_static(cache_dir)),
+            ),
+            workers=min(workers, 2),
+            description="WB2 HRES + static",
+        )
 
         expected = layout.expected_paths(source, valid_time, cache_dir)
         return _partition(keys, before, expected)
 
 
 class Wb2WamBackend:
-    def ensure(self, source: SourceProfile, valid_time: datetime, cache_dir: Path) -> DownloadOutcome:
+    def ensure(
+        self,
+        source: SourceProfile,
+        valid_time: datetime,
+        cache_dir: Path,
+        *,
+        workers: int = 1,
+    ) -> DownloadOutcome:
         day = layout.day_token(valid_time)
-        keys = tuple(layout.expected_paths(source, valid_time, cache_dir))
-        before = {key for key in keys if layout.expected_paths(source, valid_time, cache_dir)[key].is_file()}
+        keys, before = _keys_and_before(source, valid_time, cache_dir)
 
-        weatherbench2.download_hres_t0_day(cache_dir, day)
-        mars.download_wave_grib(cache_dir, day)
+        run_labeled_tasks(
+            (
+                ("hres", lambda: weatherbench2.download_hres_t0_day(cache_dir, day, workers=workers)),
+                ("wave", lambda: mars.download_wave_grib(cache_dir, day)),
+            ),
+            workers=min(workers, 2),
+            description="WB2 HRES + MARS wave",
+        )
 
         expected = layout.expected_paths(source, valid_time, cache_dir)
         return _partition(keys, before, expected)
 
 
 class CamsBackend:
-    def ensure(self, source: SourceProfile, valid_time: datetime, cache_dir: Path) -> DownloadOutcome:
+    def ensure(
+        self,
+        source: SourceProfile,
+        valid_time: datetime,
+        cache_dir: Path,
+        *,
+        workers: int = 1,
+    ) -> DownloadOutcome:
         day = layout.day_token(valid_time)
-        keys = tuple(layout.expected_paths(source, valid_time, cache_dir))
-        before = {key for key in keys if layout.expected_paths(source, valid_time, cache_dir)[key].is_file()}
-
+        keys, before = _keys_and_before(source, valid_time, cache_dir)
         cams.download_cams_day(cache_dir, day)
-
         expected = layout.expected_paths(source, valid_time, cache_dir)
         return _partition(keys, before, expected)
 
 
 class GribIfsBackend:
-    def ensure(self, source: SourceProfile, valid_time: datetime, cache_dir: Path) -> DownloadOutcome:
+    def ensure(
+        self,
+        source: SourceProfile,
+        valid_time: datetime,
+        cache_dir: Path,
+        *,
+        workers: int = 1,
+    ) -> DownloadOutcome:
         day = layout.day_token(valid_time)
-        keys = tuple(layout.expected_paths(source, valid_time, cache_dir))
-        before = {
-            key
-            for key in keys
-            if layout.expected_paths(source, valid_time, cache_dir)[key].is_file()
-        }
+        keys, before = _keys_and_before(source, valid_time, cache_dir)
 
         if not layout.hres_01_netcdf_complete(cache_dir, day):
-            grib_ifs.download_ifs_analysis_day(cache_dir, day)
+            grib_ifs.download_ifs_analysis_day(cache_dir, day, workers=workers)
 
         expected = layout.expected_paths(source, valid_time, cache_dir)
         return _partition(keys, before, expected)
@@ -102,7 +156,14 @@ class UnsupportedBackend:
         self.label = label
         self._doc = doc
 
-    def ensure(self, source: SourceProfile, valid_time: datetime, cache_dir: Path) -> DownloadOutcome:
+    def ensure(
+        self,
+        source: SourceProfile,
+        valid_time: datetime,
+        cache_dir: Path,
+        *,
+        workers: int = 1,
+    ) -> DownloadOutcome:
         raise DownloadBackendError(
             f"Automatic download for {self.label} is not implemented yet. {self._doc}"
         )

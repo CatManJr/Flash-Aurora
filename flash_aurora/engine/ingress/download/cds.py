@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from flash_aurora.engine.core.config import STANDARD_LEVELS
 from flash_aurora.engine.core.redaction import safe_config_label, sanitize_exception
@@ -10,6 +11,7 @@ from flash_aurora.engine.ingress.download.credentials import (
     active_download_credentials,
     merge_credentials,
 )
+from flash_aurora.engine.ingress.download.parallel import run_labeled_tasks
 from flash_aurora.engine.ingress.download.paths import cdsapirc_path, ensure_directory, normalize_path
 
 
@@ -152,11 +154,19 @@ def download_era5_atmospheric(cache_dir: Path | str, day: str) -> Path:
     return target
 
 
-def download_era5_day(cache_dir: Path | str, day: str, *, include_static: bool = True) -> dict[str, Path]:
+def download_era5_day(
+    cache_dir: Path | str,
+    day: str,
+    *,
+    include_static: bool = True,
+    workers: int = 1,
+) -> dict[str, Path]:
     cache_dir = normalize_path(cache_dir)
-    paths: dict[str, Path] = {}
+    tasks: list[tuple[str, Callable[[], Path]]] = []
     if include_static:
-        paths["static"] = download_era5_static(cache_dir)
-    paths["surface"] = download_era5_surface(cache_dir, day)
-    paths["atmospheric"] = download_era5_atmospheric(cache_dir, day)
-    return paths
+        tasks.append(("static", lambda: download_era5_static(cache_dir)))
+    tasks.append(("surface", lambda: download_era5_surface(cache_dir, day)))
+    tasks.append(("atmospheric", lambda: download_era5_atmospheric(cache_dir, day)))
+
+    results = run_labeled_tasks(tasks, workers=workers, description="CDS ERA5")
+    return {key: results[key] for key, _ in tasks}

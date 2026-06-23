@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from flash_aurora.engine.ingress.download.http import fetch_bytes
+from flash_aurora.engine.ingress.download.parallel import run_labeled_tasks
 from flash_aurora.engine.ingress.download.progress import download_progress_enabled
 from flash_aurora.engine.ingress.download.layout import (
     GRIB_IFS_ATMOS_HOURS,
@@ -66,7 +67,21 @@ def iter_grib_downloads(date: datetime, cache_dir: Path) -> tuple[tuple[Path, st
     return tuple(items)
 
 
-def download_ifs_analysis_day(cache_dir: Path | str, day: str) -> dict[str, Path]:
+def _download_grib_file(path: Path, url: str, *, progress: bool) -> Path:
+    if path.is_file():
+        return path
+    content = fetch_bytes(url, label=path.name, progress=progress)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def download_ifs_analysis_day(
+    cache_dir: Path | str,
+    day: str,
+    *,
+    workers: int = 1,
+) -> dict[str, Path]:
     """Download IFS HRES 0.1° analysis GRIB files from UCAR RDA (example_hres_0.1.ipynb)."""
     cache_dir = normalize_path(cache_dir)
     ensure_directory(cache_dir)
@@ -75,34 +90,53 @@ def download_ifs_analysis_day(cache_dir: Path | str, day: str) -> dict[str, Path
     all_items = iter_grib_downloads(date, cache_dir)
     pending = tuple((path, url) for path, url in all_items if not path.is_file())
     skipped = len(all_items) - len(pending)
-
     show_progress = download_progress_enabled()
-    iterator: Iterable[tuple[Path, str]] = pending
-    if show_progress and pending:
-        from tqdm.auto import tqdm
 
-        iterator = tqdm(
-            pending,
-            desc="UCAR GRIB files",
-            unit="file",
-            initial=0,
-            total=len(all_items),
-        )
-        if skipped:
-            iterator.set_postfix_str(f"skipped {skipped} cached")
-            iterator.update(skipped)
-    elif skipped and show_progress:
+    if pending:
+        if workers <= 1:
+            iterator: Iterable[tuple[Path, str]] = pending
+            if show_progress:
+                from tqdm.auto import tqdm
+
+                iterator = tqdm(
+                    pending,
+                    desc="UCAR GRIB files",
+                    unit="file",
+                    initial=0,
+                    total=len(all_items),
+                )
+                if skipped:
+                    iterator.set_postfix_str(f"skipped {skipped} cached")
+                    iterator.update(skipped)
+            elif skipped:
+                print(f"UCAR GRIB: skipped {skipped} cached, downloading {len(pending)}")
+
+            for path, url in iterator:
+                try:
+                    _download_grib_file(path, url, progress=show_progress)
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"UCAR RDA download failed for {path.name}: {exc}"
+                    ) from None
+        else:
+            if show_progress and skipped:
+                print(f"UCAR GRIB: skipped {skipped} cached, downloading {len(pending)} with {workers} workers")
+
+            def _task(path: Path, url: str):
+                return lambda: _download_grib_file(path, url, progress=False)
+
+            tasks = tuple((path.name, _task(path, url)) for path, url in pending)
+            try:
+                run_labeled_tasks(
+                    tasks,
+                    workers=workers,
+                    description="UCAR GRIB files",
+                    show_progress=show_progress,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(f"UCAR RDA parallel download failed: {exc}") from None
+    elif show_progress and skipped:
         print(f"UCAR GRIB: all {skipped} files already cached")
-
-    for path, url in iterator:
-        try:
-            content = fetch_bytes(url, label=path.name, progress=show_progress)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"UCAR RDA download failed for {path.name}: {exc}"
-            ) from None
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
 
     result_paths = grib_ifs_paths(cache_dir, day)
     if all(path.is_file() for path in result_paths.values()) and not hres_01_netcdf_complete(
