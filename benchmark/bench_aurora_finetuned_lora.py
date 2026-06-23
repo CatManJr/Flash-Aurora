@@ -9,7 +9,7 @@ This script runs finetuned presets only (default includes ``tc_tracking``).
 Examples::
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_finetuned_lora.py \\
-        --asset-root /root/autodl-tmp/aurora
+        --asset-root "$AURORA_ASSET_ROOT"
 """
 
 from __future__ import annotations

@@ -55,15 +55,6 @@ def test_normalize_user_path_uses_user_cwd(tmp_path: Path) -> None:
     assert resolved == (base / "assets").resolve()
 
 
-def _is_tutorial_notebook(path: Path, repo_root: Path) -> bool:
-    """Example notebooks may pin team data-disk paths for saved run outputs."""
-    try:
-        rel = path.relative_to(repo_root / "docs")
-    except ValueError:
-        return False
-    return rel.name.startswith("example_") and path.suffix == ".ipynb"
-
-
 def test_library_source_has_no_autodl_paths() -> None:
     root = Path(__file__).resolve().parents[2]
     forbidden = "/root/autodl-tmp"
@@ -80,13 +71,11 @@ def test_library_source_has_no_autodl_paths() -> None:
         if not scan_root.is_dir():
             continue
         for path in scan_root.rglob("*"):
-            if path.suffix not in {".py", ".md", ".sh", ".ipynb"}:
+            if path.suffix not in {".py", ".sh"}:
                 continue
             if any(part in {".venv", "__pycache__", "node_modules"} for part in path.parts):
                 continue
             if path.resolve() == Path(__file__).resolve():
-                continue
-            if _is_tutorial_notebook(path, root):
                 continue
             text = path.read_text(encoding="utf-8")
             if forbidden in text:

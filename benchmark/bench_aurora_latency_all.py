@@ -10,14 +10,14 @@ Default tiers exclude ``bf16@*`` (no speed win; worse precision drift).
 Examples::
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_latency_all.py \\
-        --asset-root /root/autodl-tmp/aurora
+        --asset-root "$AURORA_ASSET_ROOT"
 
     uv run python benchmark/bench_aurora_latency_all.py \\
         --presets hres_t0_finetuned tc_tracking --warmup 2 --repeat 5
 
     # Fair cross-tier numbers (one fresh process per tier; default for README reports):
     uv run python benchmark/bench_aurora_latency_all.py \\
-        --asset-root /root/autodl-tmp/aurora --isolate-tiers \\
+        --asset-root "$AURORA_ASSET_ROOT" --isolate-tiers \\
         --report-out benchmark/latency_all_latest.md
 """
 

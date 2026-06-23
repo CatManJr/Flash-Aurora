@@ -6,7 +6,7 @@ Measures CPU ingress/build, checkpoint load, H2D, rollout, and NetCDF export.
 Examples::
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_engine_cycle.py \\
-        --asset-root /root/autodl-tmp/aurora
+        --asset-root "$AURORA_ASSET_ROOT"
 
     uv run python benchmark/bench_engine_cycle.py \\
         --presets era5_pretrained hres_t0_finetuned --steps 4

@@ -13,7 +13,7 @@ production configuration for finetuned weights.
 Examples::
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_hres_lora.py \\
-        --asset-root /root/autodl-tmp/aurora
+        --asset-root "$AURORA_ASSET_ROOT"
 
 For synthetic HRES-only timing see ``bench_aurora_hres_oom_probe.py``. For all finetuned
 presets on **real ingress** see ``bench_aurora_finetuned_lora.py``.

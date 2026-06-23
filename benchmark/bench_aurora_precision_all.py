@@ -11,7 +11,7 @@ before each model load and forward for reproducibility.
 Examples::
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_precision_all.py \\
-        --asset-root /root/autodl-tmp/aurora
+        --asset-root "$AURORA_ASSET_ROOT"
 
     uv run python benchmark/bench_aurora_precision_all.py \\
         --presets era5_pretrained hres_t0_finetuned --tiers bf16_mixed@fp32 tf32@fp32
