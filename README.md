@@ -517,7 +517,7 @@ Personal ECMWF accounts typically lack MARS archive access. For `wave`, set dire
 - **Multi-step rollout.** `rollout_stream(batch, K)` and `run_from_netcdf(..., steps=K)`; optional `RolloutObserver` hooks per step.
 - **NetCDF export.** `rollout_and_export()` writes forecast steps to `export_dir`. Optional async pipeline (Earth-2 style) overlaps GPU to CPU offload and disk writes with the next forward step.
 - **Prepare overlap.** `prepare()` can build initial conditions on a CPU worker thread while the model loads on the main thread.
-- **CUDA Graph warmup.** `warmup()` captures fixed-shape backbone graphs when `cuda_graph=True`.
+- **CUDA graph (experimental, off by default).** Optional backbone-only capture via `engine.config.cuda_graph=True`. Not recommended for production: CuTe/Triton paths are already fast, capture covers only the Swin backbone (encoder/decoder stay eager), and static buffers add VRAM. See **CUDA graph status** below.
 - **GPU scheduling.** `GpuGuard` (default on) estimates VRAM from variant, precision tier, and rollout depth; large jobs queue when memory is saturated. Disable with `gpu_guard=False` or `FLASH_AURORA_GPU_GUARD=0`.
 
 ### Core API
@@ -525,17 +525,102 @@ Personal ECMWF accounts typically lack MARS archive access. For `wave`, set dire
 **Engine lifecycle.**
 
 ```python
-from flash_aurora import AuroraEngine
+from datetime import datetime
+from pathlib import Path
 
+from flash_aurora import AuroraEngine, DataDownloader
+
+# 1. Create engine (checkpoint loads on first prepare)
 engine = AuroraEngine.from_preset(
-    "era5_pretrained",
-    asset_root="/path/to/assets",
-    inference_precision="bf16_mixed@fp32",
+    "era5_pretrained",  # preset: era5_pretrained, hres_0.1, cams, ...
+    asset_root=Path("/path/to/assets"),  # local root for checkpoints and downloads
+    checkpoint_path=None,  # explicit checkpoint file; preset default when None
+    allow_hub_download=True,  # fetch checkpoint from Hugging Face when missing locally
+    hf_endpoint=None,  # Hugging Face API base URL
+    hf_mirror=False,  # True uses built-in HF mirror endpoint
+    hf_revision=None,  # Hugging Face revision or tag
+    hf_token=None,  # token for private or gated models
+    export_dir=None,  # default NetCDF export directory for rollout_and_export
+    inference_precision="bf16_mixed@fp32",  # tier label backbone@encoder_decoder
+    overlap_ic_load=True,  # default: IC build overlaps model load on first prepare
+    async_export=False,  # async NetCDF writes in rollout_and_export
+    export_pool_size=2,  # thread pool size when async_export is True
+    export_max_inflight=None,  # max queued async exports; default pool_size - 1
+    export_use_egress_stream=True,  # dedicated CUDA stream for async export D2H
+    ic_cache=False,  # disk cache for repeated same-day IC builds
+    forward_warmup_iters=2,  # untimed forwards after prepare; 0 disables
+    presets=None,  # optional custom PresetRegistry
 )
-engine.load()
-engine.warmup()
-pred = engine.run_from_netcdf("/path/to/era5.nc", steps=1)[0]
-engine.release_gpu()
+# EngineConfig-only (set after from_preset):
+engine.config.cuda_graph = False  # experimental; default off (low ROI, see CUDA graph status)
+engine.config.device = "cuda:0"  # inference device
+engine.config.gpu_guard = True  # queue large jobs when VRAM is saturated
+engine.config.gpu_guard_timeout = 3600.0  # seconds to wait for GPU slot
+engine.config.gpu_rollout_steps = 1  # rollout depth used for VRAM estimate
+
+# 2. Downloader (ensure runs only when cache files are missing)
+downloader = DataDownloader.from_preset(
+    "era5_pretrained",  # must match engine preset
+    asset_root=engine.config.asset_root,
+    user_cwd=None,  # base for relative paths; current working directory when None
+    presets=None,  # optional custom PresetRegistry
+    credentials=None,  # optional DownloadCredentials bundle
+    cds_api_key=None,  # CDS API key for ERA5
+    cds_api_url=None,  # CDS API URL
+    ads_api_key=None,  # ADS API key for CAMS
+    ads_api_url=None,  # ADS API URL
+    ecmwf_api_key=None,  # ECMWF Open Data key for HRES
+    ecmwf_api_url=None,  # ECMWF Open Data URL
+    ecmwf_email=None,  # ECMWF account email for HRES
+    workers=None,  # parallel download workers; preset default when None
+)
+
+# 3. Build ingest request (download=True calls ensure when cache is missing)
+request = downloader.ingest_request(
+    datetime(2023, 1, 1, 6),  # any valid UTC time for the initial condition
+    cache_dir=None,  # override cache directory; preset layout when None
+    time_index=1,  # 0..3 for 00/06/12/18 UTC cycle
+    download=True,  # False skips auto-download even if cache is missing
+    credentials=None,  # optional per-call credential override
+    cds_api_key=None,
+    cds_api_url=None,
+    ads_api_key=None,
+    ads_api_url=None,
+    ecmwf_api_key=None,
+    ecmwf_api_url=None,
+    ecmwf_email=None,
+    prompt=False,  # prompt for credentials when missing
+    workers=None,  # parallel download workers for this ensure call
+)
+
+# 4. Prepare IC batch on CPU, load model, run forward warmup
+batch = engine.prepare(
+    request,
+    rollout_steps=4,  # rollout depth for GPU guard VRAM estimate
+    overlap=None,  # None uses engine.config.overlap_ic_load; True or False to override
+)
+
+# 5. Autoregressive rollout
+forecasts = list(
+    engine.rollout_stream(
+        batch,
+        steps=4,  # number of 6-hour lead steps
+        observers=None,  # optional RolloutObserver hooks per step
+    )
+)
+
+# 6. Optional NetCDF export
+# paths = list(
+#     engine.rollout_and_export(
+#         batch,
+#         steps=4,
+#         export_dir=None,  # None uses engine.config.export_dir
+#         async_export=None,  # None uses engine.config.async_export
+#     )
+# )
+
+# 7. Release GPU reservation and optionally move model to CPU
+engine.release_gpu(move_model_to_cpu=True)
 ```
 
 **Download and ingest.**
@@ -567,8 +652,24 @@ Cold-start time is usually dominated by **CPU ingress** (`build_ic`), **model in
 | `export_max_inflight` | `None` | Max queued writes before back-pressure (`pool_size - 1` when unset). |
 | `export_use_egress_stream` | `True` | Use a dedicated CUDA stream for D2H during async export. |
 | `ic_cache` | `False` | Cache the post-processed `Batch` on disk so repeated prepares with the same inputs replay bit-for-bit (see below). |
+| `forward_warmup_iters` | `2` | Untimed forward passes after `prepare()` / before first rollout step to compile CuTe kernels (set `0` to disable). |
 
 **Per-call overrides:** `engine.prepare(request, overlap=False)` and `engine.rollout_and_export(batch, steps=K, async_export=True)` take precedence over the config for that invocation only.
+
+### CUDA graph status
+
+`EngineConfig.cuda_graph` defaults to `False`. When enabled, `forward_warmup` may call `capture_inference_cuda_graph()` after dummy forwards.
+
+**Not necessary for Aurora**
+
+1. **Compute is already fast.** Custom tiers (CuTe window attention + Triton layout/AdaLN) dominate the old PyTorch path. CUDA graph mainly removes CPU kernel-launch overhead; on a warmed `bf16_mixed` run that is a small fraction of forward time (~680 ms/step on 0.25° and 0.1° presets).
+2. **Capture scope is partial.** Default `cuda_graph_scope='backbone'`: encoder and Perceiver decoder still run eagerly every step. Only Swin3D is replayed via `graph.replay()`, after a `copy_` into static buffers.
+3. **Memory cost.** Static graph buffers increase allocated VRAM (roughly +400–500 MiB on a small-grid smoke test; more on full grids).
+4. **`full_gpu` is experimental.** Capturing encoder + backbone + decoder in one graph is fragile (Python metadata, hooks) and not wired in the engine path.
+
+**When it might help later:** micro-batched or launch-bound deployments where forward is already sub-100 ms and every microsecond counts. That requires a fuller graph (or wider scope), finetuned rollout-step handling, and engine-level benchmarks on production presets—not the current backbone-only prototype.
+
+Use `forward_warmup_iters` for CuTe JIT warmup; treat `cuda_graph` as research-only unless you profile a clear win on your grid and preset.
 
 ### IC cache (`ic_cache`)
 
@@ -625,7 +726,7 @@ dl = DataDownloader.from_preset("hres_0.1", asset_root=engine.config.asset_root)
 request = dl.ingest_request(
     datetime(2022, 5, 11, 6),
     time_index=1,
-    download=False,
+    download=True,
 )
 
 batch = engine.prepare(request, rollout_steps=4)
@@ -647,7 +748,7 @@ batch = InitialConditionBuilder(engine.config).from_source(request)
 paths = list(engine.rollout_and_export(batch, steps=4))
 ```
 
-**Configuration surface.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`, `overlap_ic_load`, `async_export`, `export_pool_size`, `export_max_inflight`, `export_use_egress_stream`, `ic_cache`. Inspect registered names with `DEFAULT_PRESETS.names()`.
+**Configuration surface.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`, `overlap_ic_load`, `async_export`, `export_pool_size`, `export_max_inflight`, `export_use_egress_stream`, `ic_cache`, `forward_warmup_iters`. Inspect registered names with `DEFAULT_PRESETS.names()`.
 
 **Utilities.** `ecmwf_credential_status()` reports ECMWF API readiness before MARS requests; `normalize_user_path()` and `AssetStore` constrain file access to allowed roots under `asset_root`.
 

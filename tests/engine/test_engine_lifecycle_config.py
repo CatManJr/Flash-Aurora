@@ -26,6 +26,7 @@ def test_lifecycle_defaults(tmp_path: Path) -> None:
     assert engine.config.async_export is False
     assert engine.config.export_pool_size == 2
     assert engine.config.export_use_egress_stream is True
+    assert engine.config.forward_warmup_iters == 2
 
 
 def test_prepare_overlap_follows_config(tmp_path: Path) -> None:

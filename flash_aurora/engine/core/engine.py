@@ -46,6 +46,7 @@ class AuroraEngine:
         self._graph_pool = GraphPool()
         self._exporter = RolloutExporter(self._resolved_export_dir())
         self._gpu_ticket: GpuGuardTicket | None = None
+        self._forward_warmed = False
 
     def _resolved_export_dir(self) -> Path:
         return normalize_user_path(
@@ -80,6 +81,7 @@ class AuroraEngine:
         export_max_inflight: int | None = None,
         export_use_egress_stream: bool | None = None,
         ic_cache: bool | None = None,
+        forward_warmup_iters: int | None = None,
         presets: PresetRegistry | None = None,
     ) -> AuroraEngine:
         registry = presets or DEFAULT_PRESETS
@@ -115,6 +117,8 @@ class AuroraEngine:
             config.export_use_egress_stream = export_use_egress_stream
         if ic_cache is not None:
             config.ic_cache = ic_cache
+        if forward_warmup_iters is not None:
+            config.forward_warmup_iters = forward_warmup_iters
         engine = cls(config, presets=registry)
         engine.config.preset_name = name
         return engine
@@ -188,6 +192,7 @@ class AuroraEngine:
         model = self._loader.build_model()
         build_model_ms = (time.perf_counter() - t0) * 1000.0
 
+        # Checkpoint stays on CPU until weights are loaded; H2D happens once below.
         t0 = time.perf_counter()
         self._loader.load(model)
         load_ckpt_ms = (time.perf_counter() - t0) * 1000.0
@@ -197,9 +202,11 @@ class AuroraEngine:
             device = torch.device("cpu")
 
         t0 = time.perf_counter()
-        model.to(device)
         if device.type == "cuda":
+            model.to(device, non_blocking=True)
             torch.cuda.synchronize(device)
+        else:
+            model.to(device)
         model_h2d_ms = (time.perf_counter() - t0) * 1000.0
 
         timing = LoadTiming(
@@ -249,6 +256,7 @@ class AuroraEngine:
         else:
             batch, model, _timing = serial_ic_then_load(build_ic, load)
         self._model = model
+        self._maybe_warmup(batch)
         return batch
 
     def prepare_from_netcdf(
@@ -270,13 +278,34 @@ class AuroraEngine:
         else:
             batch, model, _timing = serial_ic_then_load(build_ic, load)
         self._model = model
+        self._maybe_warmup(batch)
         return batch
 
-    def warmup(self) -> None:
-        self._graph_pool.warmup(self.model)
+    def _maybe_warmup(self, batch: Batch) -> None:
+        if self._forward_warmed or self.config.forward_warmup_iters <= 0:
+            return
+        self._graph_pool.warmup(self.model, batch, self.config)
+        self._forward_warmed = True
+
+    def warmup(self, batch: Batch, *, forward_iters: int | None = None) -> None:
+        """Run forward warmup (CuTe JIT) and optional CUDA graph capture.
+
+        Idempotent unless ``forward_iters`` is passed explicitly.
+        """
+        if forward_iters is not None and forward_iters <= 0:
+            return
+        if forward_iters is not None or not self._forward_warmed:
+            self._graph_pool.warmup(
+                self.model,
+                batch,
+                self.config,
+                forward_iters=forward_iters,
+            )
+            self._forward_warmed = True
 
     def predict(self, batch: Batch) -> Batch:
         self.validate(batch)
+        self._maybe_warmup(batch)
         with torch.inference_mode():
             return self.model.forward(batch)
 
@@ -305,6 +334,7 @@ class AuroraEngine:
         if self._gpu_ticket is not None:
             self._gpu_ticket.heartbeat()
         self.validate(batch)
+        self._maybe_warmup(batch)
         session = RolloutSession(self.model, observers)
         yield from session.run(batch, steps)
 
