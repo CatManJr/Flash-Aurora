@@ -566,8 +566,29 @@ Cold-start time is usually dominated by **CPU ingress** (`build_ic`), **model in
 | `export_pool_size` | `2` | Thread-pool size for async NetCDF writes. |
 | `export_max_inflight` | `None` | Max queued writes before back-pressure (`pool_size - 1` when unset). |
 | `export_use_egress_stream` | `True` | Use a dedicated CUDA stream for D2H during async export. |
+| `ic_cache` | `False` | Cache the post-processed `Batch` on disk so repeated prepares with the same inputs replay bit-for-bit (see below). |
 
 **Per-call overrides:** `engine.prepare(request, overlap=False)` and `engine.rollout_and_export(batch, steps=K, async_export=True)` take precedence over the config for that invocation only.
+
+### IC cache (`ic_cache`)
+
+Optional disk cache for **repeat runs on the same initial field**. Applies to all presets via `InitialConditionBuilder`:
+
+- `from_source(request)` — keyed by preset, calendar day, `time_index`, and input file hashes (CDS/GRIB/NetCDF cache layout or `raw_paths`).
+- `from_netcdf_path(path)` / `prepare_from_netcdf(path)` — keyed by preset and user NetCDF content hash.
+
+Cache files live under `{cache_dir}/.ic-cache/` (download workflow) or beside the user NetCDF. Enable when benchmarking or serving the same analysis day repeatedly:
+
+```python
+engine = AuroraEngine.from_preset(
+    "hres_0.1",
+    asset_root="/path/to/assets",
+    ic_cache=True,
+)
+batch = engine.prepare(request)  # cold once, then fast on cache hit
+```
+
+Default is `False` so arbitrary one-off user NetCDF paths do not write multi-GB cache files unless opted in.
 
 **Which presets benefit**
 
@@ -626,7 +647,7 @@ batch = InitialConditionBuilder(engine.config).from_source(request)
 paths = list(engine.rollout_and_export(batch, steps=4))
 ```
 
-**Configuration surface.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`, `overlap_ic_load`, `async_export`, `export_pool_size`, `export_max_inflight`, `export_use_egress_stream`. Inspect registered names with `DEFAULT_PRESETS.names()`.
+**Configuration surface.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`, `overlap_ic_load`, `async_export`, `export_pool_size`, `export_max_inflight`, `export_use_egress_stream`, `ic_cache`. Inspect registered names with `DEFAULT_PRESETS.names()`.
 
 **Utilities.** `ecmwf_credential_status()` reports ECMWF API readiness before MARS requests; `normalize_user_path()` and `AssetStore` constrain file access to allowed roots under `asset_root`.
 
