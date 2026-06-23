@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from flash_aurora.engine.core.config import (
     EngineConfig,
     ModelVariantSpec,
@@ -158,22 +160,7 @@ class PresetRegistry:
     def get(self, name: str) -> EngineConfig:
         if name not in self._configs:
             raise KeyError(f"Unknown preset: {name}")
-        src = self._configs[name]
-        return EngineConfig(
-            variant=src.variant,
-            source=src.source,
-            asset_root=src.asset_root,
-            checkpoint_path=src.checkpoint_path,
-            user_cwd=src.user_cwd,
-            allow_hub_download=src.allow_hub_download,
-            hf_endpoint=src.hf_endpoint,
-            hf_revision=src.hf_revision,
-            hf_token=src.hf_token,
-            export_dir=src.export_dir,
-            inference_precision=src.inference_precision,
-            cuda_graph=src.cuda_graph,
-            device=src.device,
-        )
+        return replace(self._configs[name])
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._configs))

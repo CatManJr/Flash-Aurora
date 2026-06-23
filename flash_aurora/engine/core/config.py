@@ -117,6 +117,11 @@ class EngineConfig:
     gpu_guard: bool = True
     gpu_guard_timeout: float = 3600.0
     gpu_rollout_steps: int = 1
+    overlap_ic_load: bool = True
+    async_export: bool = False
+    export_pool_size: int = 2
+    export_max_inflight: int | None = None
+    export_use_egress_stream: bool = True
 
     def hub_download_options(self) -> "HubDownloadOptions":
         from flash_aurora.engine.core.hub import HubDownloadOptions

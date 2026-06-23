@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Generator, Iterable
 
@@ -12,9 +13,10 @@ from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.core.hooks import RolloutObserver
 from flash_aurora.engine.core.hub import HF_MIRROR_ENDPOINT
 from flash_aurora.engine.core.paths import AssetStore, normalize_asset_path, normalize_user_path
+from flash_aurora.engine.core.prepare import LoadTiming, overlap_ic_and_load, serial_ic_then_load
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from flash_aurora.engine.core.rollout_session import RolloutSession
-from flash_aurora.engine.egress.export import RolloutExporter
+from flash_aurora.engine.egress.export import PipelineRolloutExporter, RolloutExporter
 from flash_aurora.engine.ingress.build_ic import InitialConditionBuilder
 from flash_aurora.engine.ingress.adapters import IngestRequest
 from flash_aurora.engine.ingress.validator import BatchValidator
@@ -72,6 +74,11 @@ class AuroraEngine:
         hf_token: str | None = None,
         export_dir: Path | str | None = None,
         inference_precision: str | None = None,
+        overlap_ic_load: bool | None = None,
+        async_export: bool | None = None,
+        export_pool_size: int | None = None,
+        export_max_inflight: int | None = None,
+        export_use_egress_stream: bool | None = None,
         presets: PresetRegistry | None = None,
     ) -> AuroraEngine:
         registry = presets or DEFAULT_PRESETS
@@ -95,6 +102,16 @@ class AuroraEngine:
             config.hf_token = hf_token
         if inference_precision is not None:
             config.inference_precision = inference_precision
+        if overlap_ic_load is not None:
+            config.overlap_ic_load = overlap_ic_load
+        if async_export is not None:
+            config.async_export = async_export
+        if export_pool_size is not None:
+            config.export_pool_size = export_pool_size
+        if export_max_inflight is not None:
+            config.export_max_inflight = export_max_inflight
+        if export_use_egress_stream is not None:
+            config.export_use_egress_stream = export_use_egress_stream
         engine = cls(config, presets=registry)
         engine.config.preset_name = name
         return engine
@@ -160,14 +177,97 @@ class AuroraEngine:
 
     def load(self, *, rollout_steps: int | None = None) -> Aurora:
         self.acquire_gpu(rollout_steps=rollout_steps)
+        self._model = self._load_model_to_device()[0]
+        return self._model
+
+    def _load_model_to_device(self) -> tuple[Aurora, LoadTiming]:
+        t0 = time.perf_counter()
         model = self._loader.build_model()
+        build_model_ms = (time.perf_counter() - t0) * 1000.0
+
+        t0 = time.perf_counter()
         self._loader.load(model)
+        load_ckpt_ms = (time.perf_counter() - t0) * 1000.0
+
         device = torch.device(self.config.device)
         if device.type == "cuda" and not torch.cuda.is_available():
             device = torch.device("cpu")
+
+        t0 = time.perf_counter()
         model.to(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        model_h2d_ms = (time.perf_counter() - t0) * 1000.0
+
+        timing = LoadTiming(
+            build_model_ms=build_model_ms,
+            load_ckpt_ms=load_ckpt_ms,
+            model_h2d_ms=model_h2d_ms,
+        )
+        return model, timing
+
+    def _resolve_overlap(self, overlap: bool | None) -> bool:
+        if overlap is not None:
+            return overlap
+        return self.config.overlap_ic_load
+
+    def _resolve_async_export(self, async_export: bool | None) -> bool:
+        if async_export is not None:
+            return async_export
+        return self.config.async_export
+
+    def _pipeline_exporter(self, export_dir: Path) -> PipelineRolloutExporter:
+        return PipelineRolloutExporter.async_netcdf(
+            export_dir,
+            pool_size=self.config.export_pool_size,
+            max_inflight=self.config.export_max_inflight,
+            use_egress_stream=self.config.export_use_egress_stream,
+        )
+
+    def prepare(
+        self,
+        request: IngestRequest,
+        *,
+        rollout_steps: int | None = None,
+        overlap: bool | None = None,
+    ) -> Batch:
+        """Build initial conditions and load the model.
+
+        When overlap is enabled (``EngineConfig.overlap_ic_load``, default True),
+        IC construction runs on a background thread while the model loads.
+        """
+        self.acquire_gpu(rollout_steps=rollout_steps)
+        build_ic = lambda: self._builder().from_source(request)
+        load = self._load_model_to_device
+        use_overlap = self._resolve_overlap(overlap)
+
+        if use_overlap:
+            batch, model, _timing = overlap_ic_and_load(build_ic, load)
+        else:
+            batch, model, _timing = serial_ic_then_load(build_ic, load)
         self._model = model
-        return model
+        return batch
+
+    def prepare_from_netcdf(
+        self,
+        path: Path | str,
+        *,
+        rollout_steps: int | None = None,
+        overlap: bool | None = None,
+    ) -> Batch:
+        """Load IC from a NetCDF path and initialize the model."""
+        resolved = Path(path)
+        self.acquire_gpu(rollout_steps=rollout_steps)
+        build_ic = lambda: self._builder().from_netcdf_path(resolved)
+        load = self._load_model_to_device
+        use_overlap = self._resolve_overlap(overlap)
+
+        if use_overlap:
+            batch, model, _timing = overlap_ic_and_load(build_ic, load)
+        else:
+            batch, model, _timing = serial_ic_then_load(build_ic, load)
+        self._model = model
+        return batch
 
     def warmup(self) -> None:
         self._graph_pool.warmup(self.model)
@@ -211,10 +311,19 @@ class AuroraEngine:
         steps: int,
         *,
         export_dir: Path | str | None = None,
+        async_export: bool | None = None,
     ) -> Generator[Path, None, None]:
         if export_dir is not None:
             self.set_export_dir(export_dir)
         else:
             self.set_export_dir(self.config.export_dir)
+
+        resolved_dir = self._resolved_export_dir()
+        if self._resolve_async_export(async_export):
+            with self._pipeline_exporter(resolved_dir) as exporter:
+                for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):
+                    yield exporter.write_step(step_index, prediction)
+            return
+
         for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):
             yield self._exporter.write_step(step_index, prediction)

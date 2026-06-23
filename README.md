@@ -515,7 +515,8 @@ Personal ECMWF accounts typically lack MARS archive access. For `wave`, set dire
 - **Precision wiring.** `EngineConfig.inference_precision` selects the Triton fusion base and, when set, TF32/BF16 GEMM and CuTe DSL window attention (see above).
 - **Automated ingress.** CDS (ERA5), ADS (CAMS), WeatherBench2 (HRES met), ECMWF Open Data (0.1-degree GRIB), and MARS (wave GRIB when permitted). Credentials merge from environment variables, `~/.cdsapirc`, `~/.ecmwfapirc`, and optional constructor kwargs.
 - **Multi-step rollout.** `rollout_stream(batch, K)` and `run_from_netcdf(..., steps=K)`; optional `RolloutObserver` hooks per step.
-- **NetCDF export.** `rollout_and_export()` writes forecast steps to `export_dir`.
+- **NetCDF export.** `rollout_and_export()` writes forecast steps to `export_dir`. Optional async pipeline (Earth-2 style) overlaps GPU to CPU offload and disk writes with the next forward step.
+- **Prepare overlap.** `prepare()` can build initial conditions on a CPU worker thread while the model loads on the main thread.
 - **CUDA Graph warmup.** `warmup()` captures fixed-shape backbone graphs when `cuda_graph=True`.
 - **GPU scheduling.** `GpuGuard` (default on) estimates VRAM from variant, precision tier, and rollout depth; large jobs queue when memory is saturated. Disable with `gpu_guard=False` or `FLASH_AURORA_GPU_GUARD=0`.
 
@@ -554,7 +555,78 @@ forecasts = list(engine.rollout_stream(batch, steps=4))
 paths = list(engine.rollout_and_export(batch, steps=4))
 ```
 
-**Configuration surface.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`. Inspect registered names with `DEFAULT_PRESETS.names()`.
+### Lifecycle optimizations
+
+Cold-start time is usually dominated by **CPU ingress** (`build_ic`), **model init** (`build_model` / CuTe JIT), and **NetCDF export**—not GPU forward. Two optional optimizations address that; both are configured on `EngineConfig` / `from_preset()` and can be overridden per call.
+
+| Field | Default | What it does |
+|-------|---------|--------------|
+| `overlap_ic_load` | `True` | `prepare()` / `prepare_from_netcdf()` runs IC build on a background thread while the model is built and checkpoint-loaded. |
+| `async_export` | `False` | `rollout_and_export()` pipelines egress-stream GPU to CPU copy and background NetCDF writes (Earth-2 `AsyncZarrBackend` pattern, one file per step). |
+| `export_pool_size` | `2` | Thread-pool size for async NetCDF writes. |
+| `export_max_inflight` | `None` | Max queued writes before back-pressure (`pool_size - 1` when unset). |
+| `export_use_egress_stream` | `True` | Use a dedicated CUDA stream for D2H during async export. |
+
+**Per-call overrides:** `engine.prepare(request, overlap=False)` and `engine.rollout_and_export(batch, steps=K, async_export=True)` take precedence over the config for that invocation only.
+
+**Which presets benefit**
+
+Measured on RTX PRO 6000 (`bf16_mixed@fp32`, forward warmup 2). Forward/step is ~680 ms on 0.25° and 0.1° presets regardless of these flags.
+
+| Preset | `overlap_ic_load` | `async_export` | Rationale |
+|--------|-------------------|----------------|-----------|
+| `hres_0.1` | **On** (default) | **On** for `K \gtrsim 4` | IC build (GRIB/regrid) dominates prepare (~2 min); each export step is ~5 s vs ~0.7 s forward. Largest win from both flags. |
+| `era5_pretrained`, `hres_t0_finetuned`, `tc_tracking` | On (default) | Optional | Modest prepare overlap (~4–8 s saved). Export is smaller per step; async helps mainly on longer rollouts. |
+| `cams` | On (default) | Optional for long rollouts | Medium grid; export cost grows with step count. |
+| `wave` | On (default) | Optional if exporting many steps | Ingress can be heavy when GRIB cache is cold. |
+| `small_pretrained` | Off | Off | Fast IC and tiny NetCDF; overhead of threading not worth it. |
+
+**When to turn overlap off:** debugging ingress, profiling serial prepare stages, or when IC is already a pre-built NetCDF and `load()` alone is enough.
+
+**When to turn async export off:** single-step smoke tests, very short rollouts (`K=1–2`), or debugging export correctness.
+
+**Recommended service path (0.1° example)**
+
+```python
+from datetime import datetime
+
+from flash_aurora import AuroraEngine, DataDownloader
+
+engine = AuroraEngine.from_preset(
+    "hres_0.1",
+    asset_root="/path/to/assets",
+    inference_precision="bf16_mixed@fp32",
+    overlap_ic_load=True,
+    async_export=True,
+    export_pool_size=2,
+)
+dl = DataDownloader.from_preset("hres_0.1", asset_root=engine.config.asset_root)
+request = dl.ingest_request(
+    datetime(2022, 5, 11, 6),
+    time_index=1,
+    download=False,
+)
+
+batch = engine.prepare(request, rollout_steps=4)
+paths = list(engine.rollout_and_export(batch, steps=4))
+engine.release_gpu()
+```
+
+**Serial fallback (debug / baseline)**
+
+```python
+engine = AuroraEngine.from_preset(
+    "era5_pretrained",
+    asset_root="/path/to/assets",
+    overlap_ic_load=False,
+    async_export=False,
+)
+engine.load()
+batch = InitialConditionBuilder(engine.config).from_source(request)
+paths = list(engine.rollout_and_export(batch, steps=4))
+```
+
+**Configuration surface.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`, `overlap_ic_load`, `async_export`, `export_pool_size`, `export_max_inflight`, `export_use_egress_stream`. Inspect registered names with `DEFAULT_PRESETS.names()`.
 
 **Utilities.** `ecmwf_credential_status()` reports ECMWF API readiness before MARS requests; `normalize_user_path()` and `AssetStore` constrain file access to allowed roots under `asset_root`.
 

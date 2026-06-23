@@ -2,6 +2,8 @@
 """Engine lifecycle bottleneck profile (cached ingress only, no download).
 
 Measures CPU ingress/build, checkpoint load, H2D, rollout, and NetCDF export.
+Rollout timing uses ``--forward-warmup`` (default 2) so CUDA/kernel JIT is excluded,
+matching ``bench_aurora_latency_all.py``.
 
 Examples::
 
@@ -61,17 +63,29 @@ def _format_report(
         f"- Rollout steps: {steps}",
         f"- Inference precision: `bf16_mixed@fp32` (unless preset default)",
         "- Excludes: CDS/ADS/MARS download and API queue",
+        f"- Overlap IC+load: `{any(r.overlap_ic_load for r in results)}`",
+        f"- Async export: `{any(r.async_export for r in results)}`",
+        f"- Forward warmup: `{results[0].forward_warmup}` (excluded from rollout timing)",
         "",
         "## Summary",
         "",
-        "| preset | total (s) | bottleneck | build_ic | build_model | load_ckpt | rollout | export |",
-        "|--------|----------:|------------|---------:|------------:|----------:|--------:|-------:|",
+        "| preset | total (s) | bottleneck | prepare (s) | build_model | load_ckpt | rollout | export |",
+        "|--------|----------:|------------|------------:|------------:|----------:|--------:|-------:|",
     ]
     for row in results:
-        export_total = (row.export_per_step_ms or 0.0) * row.rollout_steps / 1000.0
+        if row.overlap_ic_load:
+            prepare_s = row.prepare_ms / 1000.0
+            prepare_col = f"{prepare_s:.2f}"
+        else:
+            prepare_col = f"{(row.build_ic_ms + row.load_total_ms) / 1000.0:.2f}"
+        export_total = (
+            (row.export_pipeline_ms or 0.0) / 1000.0
+            if row.async_export
+            else (row.export_per_step_ms or 0.0) * row.rollout_steps / 1000.0
+        )
         lines.append(
             f"| {row.preset} | {row.engine_total_ms / 1000.0:.2f} | {row.bottleneck} "
-            f"| {row.build_ic_ms / 1000.0:.2f} | {row.build_model_ms / 1000.0:.2f} "
+            f"| {prepare_col} | {row.build_model_ms / 1000.0:.2f} "
             f"| {row.load_ckpt_ms / 1000.0:.2f} "
             f"| {row.rollout_total_ms / 1000.0:.2f} | {export_total:.2f} |"
         )
@@ -132,6 +146,28 @@ def main() -> int:
         action="store_true",
         help="Build/load one throwaway model before timing (stabilizes CuTe/Triton JIT)",
     )
+    parser.add_argument(
+        "--forward-warmup",
+        type=int,
+        default=2,
+        help="Untimed rollout forwards before timed steps (default: 2, same as latency bench)",
+    )
+    parser.add_argument(
+        "--overlap-ic-load",
+        action="store_true",
+        help="Overlap IC build with model init (matches AuroraEngine.prepare)",
+    )
+    parser.add_argument(
+        "--async-export",
+        action="store_true",
+        help="Pipeline NetCDF export during rollout (matches rollout_and_export async_export)",
+    )
+    parser.add_argument(
+        "--export-dir",
+        type=Path,
+        default=None,
+        help="Rollout export directory (default: <asset-root>/.flash-aurora/bench_export)",
+    )
     parser.add_argument("--report-out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -188,6 +224,10 @@ def main() -> int:
                     device=device,
                     include_export=not args.no_export,
                     ic_loader=lambda: load_preset_batch(preset_name, asset_root)[0],
+                    overlap_ic_load=args.overlap_ic_load,
+                    async_export=args.async_export,
+                    forward_warmup=args.forward_warmup,
+                    export_dir=args.export_dir,
                 )
             else:
                 timing = measure_engine_cycle(
@@ -198,6 +238,10 @@ def main() -> int:
                     rollout_steps=args.steps,
                     device=device,
                     include_export=not args.no_export,
+                    overlap_ic_load=args.overlap_ic_load,
+                    async_export=args.async_export,
+                    forward_warmup=args.forward_warmup,
+                    export_dir=args.export_dir,
                 )
             results.append(timing)
             print(
