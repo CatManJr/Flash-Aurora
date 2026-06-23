@@ -122,6 +122,7 @@ class EngineConfig:
     export_pool_size: int = 2
     export_max_inflight: int | None = None
     export_use_egress_stream: bool = True
+    ic_cache: bool = False
 
     def hub_download_options(self) -> "HubDownloadOptions":
         from flash_aurora.engine.core.hub import HubDownloadOptions

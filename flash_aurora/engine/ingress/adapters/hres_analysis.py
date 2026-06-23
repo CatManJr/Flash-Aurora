@@ -57,6 +57,8 @@ class GribHresAnalysisAdapter:
 
     def build_initial_batch(self, request: IngestRequest, config: EngineConfig) -> Batch:
         paths = self._resolve_paths(request, config)
+        regrid_res = config.source.regrid_res if config.source.regrid_res is not None else 0.1
+
         if not self._has_netcdf_cache(paths) and self._has_grib_cache(paths):
             materialize_hres_01_netcdf(
                 paths.cache_dir,
@@ -73,7 +75,6 @@ class GribHresAnalysisAdapter:
                 "Provide NetCDF cache files or GRIB downloads from example_hres_0.1."
             )
 
-        regrid_res = config.source.regrid_res if config.source.regrid_res is not None else 0.1
         batch = batch.regrid(res=regrid_res)
 
         assets = AssetStore(root=config.asset_root)

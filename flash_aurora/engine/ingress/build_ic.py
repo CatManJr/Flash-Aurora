@@ -8,6 +8,12 @@ from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.core.paths import AssetStore
 from flash_aurora.engine.ingress.adapters import IngestRequest, get_adapter
 from flash_aurora.engine.ingress.deserialize import BatchDeserializer
+from flash_aurora.engine.ingress.ic_cache import (
+    load_cached_netcdf_batch,
+    load_cached_source_batch,
+    store_cached_netcdf_batch,
+    store_cached_source_batch,
+)
 from flash_aurora.engine.ingress.static import StaticFieldLoader
 from flash_aurora.engine.ingress.validator import BatchValidator
 
@@ -50,11 +56,23 @@ class InitialConditionBuilder:
         resolved = path.expanduser().resolve()
         if not resolved.is_file():
             raise FileNotFoundError(f"NetCDF not found: {resolved}")
+
+        if self._config.ic_cache:
+            cached = load_cached_netcdf_batch(resolved, self._config)
+            if cached is not None:
+                self._validator.validate(cached)
+                return cached
+
         roots = self._allowed_roots()
         if resolved.parent not in roots:
             roots = roots + (resolved.parent,)
         batch = BatchDeserializer.from_netcdf(resolved, allowed_roots=roots)
-        return self._with_static(batch)
+        batch = self._with_static(batch)
+        self._validator.validate(batch)
+
+        if self._config.ic_cache:
+            store_cached_netcdf_batch(resolved, self._config, batch)
+        return batch
 
     def from_netcdf(self, filename: str) -> Batch:
         path = self._assets.join(
@@ -65,7 +83,16 @@ class InitialConditionBuilder:
         return self.from_netcdf_path(path)
 
     def from_source(self, request: IngestRequest) -> Batch:
+        if self._config.ic_cache:
+            cached = load_cached_source_batch(request, self._config)
+            if cached is not None:
+                self._validator.validate(cached)
+                return cached
+
         adapter = get_adapter(self._config.source)
         batch = adapter.build_initial_batch(request, self._config)
         self._validator.validate(batch)
+
+        if self._config.ic_cache:
+            store_cached_source_batch(request, self._config, batch)
         return batch

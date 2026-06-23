@@ -1,6 +1,7 @@
 """Copyright (c) Microsoft Corporation. Licensed under the MIT license."""
 
 import dataclasses
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -208,10 +209,19 @@ class Batch:
             lon_new=lon_new,
         )
 
+        def _regrid_vars(vars: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            if not vars:
+                return {}
+            keys = list(vars.keys())
+            max_workers = min(len(keys), 8)
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                values = list(pool.map(interpolate_res, (vars[k] for k in keys)))
+            return dict(zip(keys, values, strict=True))
+
         return Batch(
-            surf_vars={k: interpolate_res(v) for k, v in self.surf_vars.items()},
-            static_vars={k: interpolate_res(v) for k, v in self.static_vars.items()},
-            atmos_vars={k: interpolate_res(v) for k, v in self.atmos_vars.items()},
+            surf_vars=_regrid_vars(self.surf_vars),
+            static_vars=_regrid_vars(self.static_vars),
+            atmos_vars=_regrid_vars(self.atmos_vars),
             metadata=Metadata(
                 lat=lat_new,
                 lon=lon_new,

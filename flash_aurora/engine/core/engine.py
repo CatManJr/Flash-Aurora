@@ -79,6 +79,7 @@ class AuroraEngine:
         export_pool_size: int | None = None,
         export_max_inflight: int | None = None,
         export_use_egress_stream: bool | None = None,
+        ic_cache: bool | None = None,
         presets: PresetRegistry | None = None,
     ) -> AuroraEngine:
         registry = presets or DEFAULT_PRESETS
@@ -112,6 +113,8 @@ class AuroraEngine:
             config.export_max_inflight = export_max_inflight
         if export_use_egress_stream is not None:
             config.export_use_egress_stream = export_use_egress_stream
+        if ic_cache is not None:
+            config.ic_cache = ic_cache
         engine = cls(config, presets=registry)
         engine.config.preset_name = name
         return engine

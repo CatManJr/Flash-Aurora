@@ -35,6 +35,7 @@ def test_adapter_materializes_netcdf_before_ingest(tmp_path: Path) -> None:
         source=DEFAULT_PRESETS.get("hres_0.1").source,
         asset_root=tmp_path,
         allow_hub_download=False,
+        ic_cache=False,
     )
     cache = tmp_path / "hres_0.1"
     cache.mkdir()
