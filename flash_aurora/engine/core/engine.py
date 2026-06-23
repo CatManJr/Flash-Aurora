@@ -12,6 +12,7 @@ from flash_aurora.engine.core.checkpoint import CheckpointLoader
 from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.core.hooks import RolloutObserver
 from flash_aurora.engine.core.hub import HF_MIRROR_ENDPOINT
+from flash_aurora.engine.core.asset_root import normalize_asset_root
 from flash_aurora.engine.core.paths import AssetStore, normalize_asset_path, normalize_user_path
 from flash_aurora.engine.core.prepare import LoadTiming, overlap_ic_and_load, serial_ic_then_load
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS, PresetRegistry
@@ -49,10 +50,12 @@ class AuroraEngine:
         self._forward_warmed = False
 
     def _resolved_export_dir(self) -> Path:
-        return normalize_user_path(
-            self.config.export_dir,
-            user_cwd=self.config.user_cwd,
-        )
+        if self.config.export_dir is not None:
+            return normalize_user_path(
+                self.config.export_dir,
+                user_cwd=self.config.user_cwd,
+            )
+        return self.asset_dir / "output"
 
     def set_export_dir(self, export_dir: Path | str) -> Path:
         """Update the rollout export directory and refresh the exporter."""
@@ -66,7 +69,7 @@ class AuroraEngine:
         cls,
         name: str,
         *,
-        asset_root: Path | str,
+        asset_root: Path | str | None = None,
         checkpoint_path: Path | str | None = None,
         allow_hub_download: bool | None = None,
         hf_endpoint: str | None = None,
@@ -88,7 +91,7 @@ class AuroraEngine:
         config = registry.get(name)
         user_cwd = Path.cwd()
         config.user_cwd = user_cwd
-        config.asset_root = normalize_user_path(asset_root, user_cwd=user_cwd)
+        config.asset_root = normalize_asset_root(asset_root, user_cwd=user_cwd)
         if checkpoint_path is not None:
             config.checkpoint_path = normalize_user_path(checkpoint_path, user_cwd=user_cwd)
         if export_dir is not None:
@@ -124,9 +127,14 @@ class AuroraEngine:
         return engine
 
     @property
-    def fetched_dir(self) -> Path:
+    def asset_dir(self) -> Path:
         store = AssetStore(root=self.config.asset_root)
         return store.resolve_root(self.config.asset_root, self.config.user_cwd)
+
+    @property
+    def fetched_dir(self) -> Path:
+        """Deprecated alias for :attr:`asset_dir`."""
+        return self.asset_dir
 
     def _allowed_roots(self) -> tuple[Path, ...]:
         return AssetStore(root=self.config.asset_root).allowed_roots(
@@ -348,10 +356,9 @@ class AuroraEngine:
     ) -> Generator[Path, None, None]:
         if export_dir is not None:
             self.set_export_dir(export_dir)
-        else:
-            self.set_export_dir(self.config.export_dir)
 
         resolved_dir = self._resolved_export_dir()
+        self._exporter = RolloutExporter(resolved_dir)
         if self._resolve_async_export(async_export):
             with self._pipeline_exporter(resolved_dir) as exporter:
                 for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):

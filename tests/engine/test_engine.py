@@ -37,6 +37,12 @@ def test_set_export_dir_updates_rollout_target(tmp_path: Path, monkeypatch: pyte
     assert engine.config.export_dir == target.resolve()
 
 
+def test_default_export_dir_is_under_asset_root(tmp_path: Path) -> None:
+    assets = tmp_path / "data"
+    engine = AuroraEngine.from_preset("era5_pretrained", asset_root=assets)
+    assert engine._resolved_export_dir() == (assets / "output").resolve()
+
+
 def test_build_model_applies_inference_precision(tmp_path: Path) -> None:
     engine = AuroraEngine.from_preset(
         "era5_pretrained",

@@ -828,9 +828,9 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
-        default=_default_ckpt_dir or str(Path.cwd() / "assets"),
+        default=_default_ckpt_dir,
         metavar="DIR",
-        help="Directory for Aurora .ckpt files (default: AURORA_ASSET_ROOT or ./assets).",
+        help="Directory for Aurora .ckpt files (default: AURORA_ASSET_ROOT / AURORA_HF_LOCAL_DIR).",
     )
     parser.add_argument(
         "--checkpoint",

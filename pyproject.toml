@@ -31,6 +31,7 @@ dependencies = [
     "zarr>=3.2.1",
     "gcsfs>=2026.6.0",
     "ecmwf-api-client>=1.7.0",
+    "pyzmq>=26.0.0",
 ]
 
 [project.optional-dependencies]

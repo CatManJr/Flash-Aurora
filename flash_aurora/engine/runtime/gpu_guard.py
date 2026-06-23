@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+from flash_aurora.engine.core.asset_root import resolve_asset_root
 from flash_aurora.engine.core.config import ModelVariantSpec
 from flash_aurora.engine.runtime.gpu_budget import estimate_vram_gib, is_exclusive_variant
 from flash_aurora.engine.runtime.gpu_memory import cuda_memory_snapshot, format_cuda_memory_snapshot
@@ -33,6 +34,9 @@ def resolve_guard_dir(asset_root: Path | str | None) -> Path:
         return Path(override).expanduser().resolve()
     if asset_root is not None:
         return Path(asset_root).expanduser().resolve() / ".flash-aurora" / "gpu_guard"
+    env_root = resolve_asset_root()
+    if env_root is not None:
+        return env_root / ".flash-aurora" / "gpu_guard"
     return (Path.cwd() / ".flash-aurora" / "gpu_guard").resolve()
 
 

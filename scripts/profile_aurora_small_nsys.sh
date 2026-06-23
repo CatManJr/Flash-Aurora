@@ -45,8 +45,13 @@ else
   OUT_BASE="$OUT_DIR/aurora_${INFERENCE_PRECISION}_${STAMP}"
 fi
 export AURORA_NVTX="${AURORA_NVTX:-1}"
-AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-./assets}"
-export AURORA_HF_LOCAL_DIR
+if [[ -z "${AURORA_ASSET_ROOT:-}" && -z "${AURORA_HF_LOCAL_DIR:-}" ]]; then
+  echo "Set AURORA_ASSET_ROOT to your data-disk asset directory (not ./assets under the repo)." >&2
+  exit 1
+fi
+AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-${AURORA_HF_LOCAL_DIR}}"
+export AURORA_ASSET_ROOT
+export AURORA_HF_LOCAL_DIR="${AURORA_HF_LOCAL_DIR:-$AURORA_ASSET_ROOT}"
 
 echo "[nsys] using: ${NSYS_BIN}"
 echo "[nsys] output base: ${OUT_BASE}"

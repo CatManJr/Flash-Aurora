@@ -17,6 +17,7 @@ tutorials_python/
 .pytest_cache
 fetched/
 */fetched/
+assets/
 cuda-keyring_1.1-1_all.deb
 
 # Local notebook experiments (not for commit)

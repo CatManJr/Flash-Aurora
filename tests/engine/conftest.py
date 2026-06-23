@@ -4,15 +4,19 @@ from pathlib import Path
 
 import pytest
 
+from flash_aurora.engine.core.asset_root import resolve_asset_root
 from flash_aurora.engine.core.config import EngineConfig
 
 
 @pytest.fixture(scope="session")
 def asset_root() -> Path:
-    default = Path.cwd() / "fetched"
-    if default.is_dir() and any(default.iterdir()):
-        return default.resolve()
-    pytest.skip("Populate ./fetched for integration tests or run unit tests only")
+    root = resolve_asset_root()
+    if root is None or not root.is_dir() or not any(root.iterdir()):
+        pytest.skip(
+            "Set AURORA_ASSET_ROOT to a data-disk directory with checkpoints and "
+            "cached ingress (not ./fetched under the repo on the system drive)"
+        )
+    return root
 
 
 @pytest.fixture(scope="session")

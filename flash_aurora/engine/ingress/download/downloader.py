@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from flash_aurora.engine.core.config import EngineConfig
+from flash_aurora.engine.core.asset_root import normalize_asset_root
 from flash_aurora.engine.core.paths import AssetStore, normalize_user_path
 from flash_aurora.engine.core.redaction import redact_text, safe_path, sanitize_exception
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS, PresetRegistry
@@ -73,7 +74,7 @@ class DataDownloader:
         cls,
         name: str,
         *,
-        asset_root: Path | str,
+        asset_root: Path | str | None = None,
         user_cwd: Path | str | None = None,
         presets: PresetRegistry | None = None,
         credentials: DownloadCredentials | None = None,
@@ -90,7 +91,7 @@ class DataDownloader:
         config = registry.get(name)
         user_cwd = normalize_path(user_cwd) if user_cwd is not None else Path.cwd()
         config.user_cwd = user_cwd
-        config.asset_root = normalize_user_path(asset_root, user_cwd=user_cwd)
+        config.asset_root = normalize_asset_root(asset_root, user_cwd=user_cwd)
         preset_credentials = merge_credentials(
             credentials,
             DownloadCredentials(

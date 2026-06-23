@@ -11,7 +11,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-export AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-./assets}"
+if [[ -z "${AURORA_ASSET_ROOT:-}" && -z "${AURORA_HF_LOCAL_DIR:-}" ]]; then
+  echo "Set AURORA_ASSET_ROOT to your data-disk asset directory (not ./assets under the repo)." >&2
+  exit 1
+fi
+export AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-${AURORA_HF_LOCAL_DIR}}"
 
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-4}"
 WARMUP="${WARMUP:-6}"

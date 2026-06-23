@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 STANDARD_LEVELS: tuple[int, ...] = (
@@ -109,7 +109,7 @@ class EngineConfig:
     hf_endpoint: str | None = None
     hf_revision: str | None = None
     hf_token: str | None = None
-    export_dir: Path = field(default_factory=lambda: Path("output"))
+    export_dir: Path | None = None
     inference_precision: str | None = None
     cuda_graph: bool = False
     device: str = "cuda:0"

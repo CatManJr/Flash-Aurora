@@ -18,7 +18,11 @@ cd "$REPO_ROOT"
 
 # CuTe DSL JIT targets the current GPU unless CUTE_DSL_ARCH is set explicitly.
 export AURORA_NVTX=1
-export AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-./assets}"
+if [[ -z "${AURORA_ASSET_ROOT:-}" && -z "${AURORA_HF_LOCAL_DIR:-}" ]]; then
+  echo "Set AURORA_ASSET_ROOT to your data-disk asset directory (not ./assets under the repo)." >&2
+  exit 1
+fi
+export AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-${AURORA_HF_LOCAL_DIR}}"
 
 PAIR_STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="${NSIGHT_OUT_DIR:-$REPO_ROOT/profiling/nsight}"
