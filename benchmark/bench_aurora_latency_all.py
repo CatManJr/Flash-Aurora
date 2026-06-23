@@ -99,11 +99,18 @@ def print_preset_latency_table(
     rows: list[tuple[str, str, str, str, str]],
 ) -> None:
     print(f"\n=== {preset} ({grid}) ===")
-    hdr = f"{'tier':<44} {'eager':>10} {'merged':>10} {'eager/merged':>12} {'vs ref':>8}"
-    print(hdr)
-    print("-" * len(hdr))
-    for tier, eager_s, merged_s, ratio_s, vs_ref in rows:
-        print(f"{tier:<44} {eager_s:>10} {merged_s:>10} {ratio_s:>12} {vs_ref:>8}")
+    if use_lora:
+        hdr = f"{'tier':<44} {'eager':>10} {'merged':>10} {'eager/merged':>12} {'vs ref':>8}"
+        print(hdr)
+        print("-" * len(hdr))
+        for tier, eager_s, merged_s, ratio_s, vs_ref in rows:
+            print(f"{tier:<44} {eager_s:>10} {merged_s:>10} {ratio_s:>12} {vs_ref:>8}")
+    else:
+        hdr = f"{'tier':<44} {'forward':>10} {'vs ref':>8}"
+        print(hdr)
+        print("-" * len(hdr))
+        for tier, _eager_s, merged_s, _ratio_s, vs_ref in rows:
+            print(f"{tier:<44} {merged_s:>10} {vs_ref:>8}")
 
 
 _BENCH_WORKER = Path(__file__).resolve().parent / "_latency_tier_worker.py"
@@ -196,7 +203,7 @@ def write_markdown_report(
                 )
             ),
             "- Finetuned presets: `lora_eager` vs `lora_merged` (engine default)",
-            "- Pretrained presets: single forward in **merged** column (`eager` = —)",
+            "- Pretrained presets: single `forward` column (no LoRA)",
             f"- Reference tier for speedup: `{PYTORCH_FP32_REF_TIER}`",
             "- Excluded: `wave` (MARS ingress)",
             "- Tiers exclude `bf16@*` (see README)",
@@ -207,14 +214,22 @@ def write_markdown_report(
     for preset in sorted(preset_tables):
         use_lora, grid = preset_meta[preset]
         lines.extend([f"## {preset} ({grid})", ""])
-        lines.append(
-            "| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |"
-        )
-        lines.append("|------|----------------:|-----------------:|-------------:|--------------------:|")
-        for tier, eager_s, merged_s, ratio_s, vs_ref in preset_tables[preset]:
+        if use_lora:
             lines.append(
-                f"| {tier} | {eager_s} | {merged_s} | {ratio_s} | {vs_ref} |"
+                "| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |"
             )
+            lines.append(
+                "|------|----------------:|-----------------:|-------------:|--------------------:|"
+            )
+            for tier, eager_s, merged_s, ratio_s, vs_ref in preset_tables[preset]:
+                lines.append(
+                    f"| {tier} | {eager_s} | {merged_s} | {ratio_s} | {vs_ref} |"
+                )
+        else:
+            lines.append("| Tier | forward (ms) | vs PyTorch FP32 ref |")
+            lines.append("|------|-------------:|--------------------:|")
+            for tier, _eager_s, merged_s, _ratio_s, vs_ref in preset_tables[preset]:
+                lines.append(f"| {tier} | {merged_s} | {vs_ref} |")
         lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
