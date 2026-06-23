@@ -14,13 +14,20 @@ Examples::
 
     uv run python benchmark/bench_aurora_latency_all.py \\
         --presets hres_t0_finetuned tc_tracking --warmup 2 --repeat 5
+
+    # Fair cross-tier numbers (one fresh process per tier; default for README reports):
+    uv run python benchmark/bench_aurora_latency_all.py \\
+        --asset-root /root/autodl-tmp/aurora --isolate-tiers \\
+        --report-out benchmark/latency_all_latest.md
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +41,7 @@ from _asset_root import default_asset_root  # noqa: E402
 from _latency_bench import (  # noqa: E402
     DEFAULT_LATENCY_TIERS,
     PYTORCH_FP32_REF_TIER,
+    order_tier_specs_for_timing,
     resolve_tier_specs,
     run_tier_lora_modes,
 )
@@ -98,6 +106,56 @@ def print_preset_latency_table(
         print(f"{tier:<44} {eager_s:>10} {merged_s:>10} {ratio_s:>12} {vs_ref:>8}")
 
 
+_BENCH_WORKER = Path(__file__).resolve().parent / "_latency_tier_worker.py"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _run_tier_isolated(
+    *,
+    preset: str,
+    tier_label: str,
+    precision: str,
+    asset_root: Path,
+    warmup: int,
+    repeat: int,
+) -> dict[str, tuple[float, float, float]]:
+    """Spawn a clean process so cuDNN autotune from other tiers cannot skew timing."""
+    cmd = [
+        sys.executable,
+        str(_BENCH_WORKER),
+        "--preset",
+        preset,
+        "--tier-label",
+        tier_label,
+        "--precision",
+        precision,
+        "--asset-root",
+        str(asset_root),
+        "--warmup",
+        str(warmup),
+        "--repeat",
+        str(repeat),
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(_REPO_ROOT),
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"isolated tier failed preset={preset!r} tier={tier_label!r}\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    payload = json.loads(proc.stdout.strip())
+    return {
+        key: (vals["ms"], vals["peak_alloc_mb"], vals["peak_reserved_mb"])
+        for key, vals in payload["timings"].items()
+    }
+
+
 def write_markdown_report(
     path: Path,
     *,
@@ -108,6 +166,8 @@ def write_markdown_report(
     cute_arch: str | None,
     warmup: int,
     repeat: int,
+    isolate_tiers: bool,
+    defer_ref: bool = False,
     preset_tables: dict[str, list[tuple[str, str, str, str, str]]],
     preset_meta: dict[str, tuple[bool, str]],
 ) -> None:
@@ -125,6 +185,16 @@ def write_markdown_report(
         [
             f"- Asset root: `{asset_root}`",
             f"- Warmup: {warmup}, repeat: {repeat}",
+            f"- Tier isolation: **{'subprocess per tier' if isolate_tiers else 'single process'}**",
+            (
+                f"- PyTorch FP32 ref: **timed after custom tiers (--defer-ref)**"
+                if defer_ref
+                else (
+                    "- PyTorch FP32 ref: **timed before custom tiers**"
+                    if not isolate_tiers
+                    else "- PyTorch FP32 ref: **fresh subprocess per tier**"
+                )
+            ),
             "- Finetuned presets: `lora_eager` vs `lora_merged` (engine default)",
             "- Pretrained presets: single forward in **merged** column (`eager` = —)",
             f"- Reference tier for speedup: `{PYTORCH_FP32_REF_TIER}`",
@@ -168,6 +238,18 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument(
+        "--isolate-tiers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run each preset×tier in a fresh subprocess (fair cuDNN state; default: on)",
+    )
+    parser.add_argument(
+        "--defer-ref",
+        action="store_true",
+        help="With --no-isolate-tiers: time PyTorch FP32 ref after custom tiers "
+        "(reproduces cuDNN cross-tier warmup artifact)",
+    )
     parser.add_argument("--report-out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -190,8 +272,12 @@ def main() -> None:
     print(f"[presets] {', '.join(args.presets)}")
     print(f"[tiers] {', '.join(args.tiers)}")
     print(f"[warmup] {args.warmup}  [repeat] {args.repeat}")
+    print(f"[isolate] {args.isolate_tiers}")
+    if not args.isolate_tiers:
+        print(f"[defer-ref] {args.defer_ref}")
 
-    _jit_warmup(asset_root, device)
+    ref_tier_specs, other_tier_specs = order_tier_specs_for_timing(tier_specs)
+    jit_warmup_done = False
 
     preset_tables: dict[str, list[tuple[str, str, str, str, str]]] = {}
     preset_meta: dict[str, tuple[bool, str]] = {}
@@ -214,20 +300,52 @@ def main() -> None:
         )
 
         tier_timings: dict[str, dict[str, tuple[float, float, float]]] = {}
-        for tier_label, precision in tier_specs:
+
+        def _run_tier(tier_label: str, precision: str) -> None:
             print(f"  [run] {tier_label}...", flush=True)
-            tier_timings[tier_label] = run_tier_lora_modes(
-                config=config,
-                ckpt=ckpt,
-                precision=precision,
-                batch=batch,
-                device=device,
-                warmup=args.warmup,
-                repeat=args.repeat,
-            )
-            gc.collect()
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            if args.isolate_tiers:
+                tier_timings[tier_label] = _run_tier_isolated(
+                    preset=preset,
+                    tier_label=tier_label,
+                    precision=precision,
+                    asset_root=asset_root,
+                    warmup=args.warmup,
+                    repeat=args.repeat,
+                )
+            else:
+                tier_timings[tier_label] = run_tier_lora_modes(
+                    config=config,
+                    ckpt=ckpt,
+                    precision=precision,
+                    batch=batch,
+                    device=device,
+                    warmup=args.warmup,
+                    repeat=args.repeat,
+                )
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+        if args.isolate_tiers:
+            for tier_label, precision in tier_specs:
+                _run_tier(tier_label, precision)
+        else:
+            if args.defer_ref:
+                if not jit_warmup_done and other_tier_specs:
+                    _jit_warmup(asset_root, device)
+                    jit_warmup_done = True
+                for tier_label, precision in other_tier_specs:
+                    _run_tier(tier_label, precision)
+                for tier_label, precision in ref_tier_specs:
+                    _run_tier(tier_label, precision)
+            else:
+                for tier_label, precision in ref_tier_specs:
+                    _run_tier(tier_label, precision)
+                if not jit_warmup_done and other_tier_specs:
+                    _jit_warmup(asset_root, device)
+                    jit_warmup_done = True
+                for tier_label, precision in other_tier_specs:
+                    _run_tier(tier_label, precision)
 
         if PYTORCH_FP32_REF_TIER in tier_timings:
             if use_lora:
@@ -263,7 +381,8 @@ def main() -> None:
 
     report_path = args.report_out
     if report_path is None:
-        report_path = Path("benchmark") / f"latency_all_{datetime.now():%Y%m%d_%H%M%S}.md"
+        stem = "latency_all_isolated" if args.isolate_tiers else "latency_all_single_process"
+        report_path = Path("benchmark") / f"{stem}.md"
     write_markdown_report(
         report_path,
         asset_root=asset_root,
@@ -273,6 +392,8 @@ def main() -> None:
         cute_arch=cute_arch,
         warmup=args.warmup,
         repeat=args.repeat,
+        isolate_tiers=args.isolate_tiers,
+        defer_ref=args.defer_ref,
         preset_tables=preset_tables,
         preset_meta=preset_meta,
     )

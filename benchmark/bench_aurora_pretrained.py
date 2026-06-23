@@ -166,10 +166,17 @@ def main() -> None:
         print(f"  [{key}] inference_precision={spec!r}")
         print(f"           {label}")
 
-    baseline_key = _PYTORCH_BASELINE_KEY
-    if baseline_key not in {t[0] for t in tier_list}:
+    tier_keys = {t[0] for t in tier_list}
+    if _PYTORCH_BASELINE_KEY in tier_keys:
+        baseline_key = _PYTORCH_BASELINE_KEY
+    elif "fp32" in tier_keys:
+        baseline_key = "fp32"
+    else:
         baseline_key = tier_list[0][0]
-        print(f"[warn] PyTorch FP32 baseline not in run; using {baseline_key!r} for diffs")
+        print(
+            f"[warn] PyTorch FP32 baseline ({_PYTORCH_BASELINE_KEY!r} or legacy 'fp32') "
+            f"not in run; using {baseline_key!r} for diffs"
+        )
 
     baseline = None
     baseline_ms: float | None = None

@@ -18,12 +18,12 @@ from _pretrained_era5 import (
 PYTORCH_FP32_REF_TIER = _PYTORCH_BASELINE_KEY
 
 DEFAULT_LATENCY_TIERS: tuple[str, ...] = (
+    PYTORCH_FP32_REF_TIER,
     "bf16_mixed@fp32",
     "bf16_mixed@tf32",
     "tf32@fp32",
     "tf32@tf32",
     "fp32@fp32",
-    PYTORCH_FP32_REF_TIER,
     "pytorch_backbone_autocast_bf16_encoder_decoder_fp32",
 )
 
@@ -41,6 +41,21 @@ def resolve_tier_specs(names: list[str]) -> list[tuple[str, str]]:
         except ValueError:
             resolved.append((name, name))
     return resolved
+
+
+def order_tier_specs_for_timing(
+    specs: list[tuple[str, str]],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Split tiers so the PyTorch FP32 ref is timed before Triton/CuTe pollute cuDNN.
+
+    Custom kernels (and even a finetuned ``bf16_mixed`` warmup) can leave cuDNN
+    autotune state that makes a later ``fp32`` baseline appear ~1.9x faster than a
+    cold true PyTorch run.  Returns ``(ref_specs, other_specs)``; table order should
+    still follow the original ``specs`` list.
+    """
+    ref = [s for s in specs if s[0] == PYTORCH_FP32_REF_TIER]
+    other = [s for s in specs if s[0] != PYTORCH_FP32_REF_TIER]
+    return ref, other
 
 
 def build_model(
