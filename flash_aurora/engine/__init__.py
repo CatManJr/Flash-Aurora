@@ -7,6 +7,14 @@ from flash_aurora.engine.ingress.adapters import IngestRequest
 from flash_aurora.engine.ingress.build_ic import InitialConditionBuilder
 from flash_aurora.engine.ingress.download import DataDownloader, DownloadBackendError, DownloadRequest, DownloadResult
 from flash_aurora.engine.ingress.download.credentials import DownloadCredentials, ecmwf_credential_status
+from flash_aurora.engine.runtime import (
+    GpuResourceSample,
+    ResourceMonitor,
+    ResourceSample,
+    device_index_from_name,
+    plot_resource_usage,
+    query_gpu_status,
+)
 
 __all__ = [
     "AuroraEngine",
@@ -18,11 +26,17 @@ __all__ = [
     "DownloadResult",
     "ecmwf_credential_status",
     "EngineConfig",
+    "GpuResourceSample",
     "HF_MIRROR_ENDPOINT",
     "HubDownloadOptions",
     "InitialConditionBuilder",
     "IngestRequest",
     "PresetRegistry",
+    "ResourceMonitor",
+    "ResourceSample",
+    "device_index_from_name",
     "normalize_asset_path",
     "normalize_user_path",
+    "plot_resource_usage",
+    "query_gpu_status",
 ]

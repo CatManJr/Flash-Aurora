@@ -43,6 +43,48 @@ def test_default_export_dir_is_under_asset_root(tmp_path: Path) -> None:
     assert engine._resolved_export_dir() == (assets / "output").resolve()
 
 
+def test_engine_close_releases_gpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = AuroraEngine.from_preset("era5_pretrained", asset_root=tmp_path)
+    engine._model = object()
+    engine._forward_warmed = True
+    engine._graph_pool._captured["shape"] = object()
+    released_with: bool | None = None
+
+    def release_gpu(*, move_model_to_cpu: bool = True) -> None:
+        nonlocal released_with
+        released_with = move_model_to_cpu
+
+    monkeypatch.setattr(engine, "release_gpu", release_gpu)
+
+    engine.close()
+    engine.close()
+
+    assert released_with is False
+    assert engine._model is None
+    assert engine._forward_warmed is False
+    assert engine._graph_pool._captured == {}
+
+
+def test_engine_load_failure_releases_gpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = AuroraEngine.from_preset("era5_pretrained", asset_root=tmp_path)
+    released = False
+
+    def fail_load():
+        raise RuntimeError("load failed")
+
+    def release_gpu(*, move_model_to_cpu: bool = True) -> None:
+        nonlocal released
+        released = move_model_to_cpu
+
+    monkeypatch.setattr(engine, "_load_model_to_device", fail_load)
+    monkeypatch.setattr(engine, "release_gpu", release_gpu)
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        engine.load()
+
+    assert released is True
+
+
 def test_build_model_applies_inference_precision(tmp_path: Path) -> None:
     engine = AuroraEngine.from_preset(
         "era5_pretrained",

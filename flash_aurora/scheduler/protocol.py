@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+import numpy as np
+
 
 PROTOCOL_VERSION = 1
 
-ForecastOutputMode = Literal["export_paths", "metadata_only"]
+ForecastOutputMode = Literal["export_paths", "metadata_only", "last_step_array"]
 ForecastCommandKind = Literal["forecast", "health", "shutdown"]
 ForecastEventKind = Literal[
     "accepted",
@@ -43,6 +47,8 @@ class ForecastRequest:
     async_export: bool | None = None
     overlap: bool | None = None
     output_mode: ForecastOutputMode = "export_paths"
+    preview_var: str | None = None
+    sticky_key: str | None = None
 
     def parsed_valid_time(self) -> datetime:
         if self.valid_time is None:
@@ -65,7 +71,28 @@ class ForecastEvent:
     valid_time: str | None = None
     error: str | None = None
     worker_preset: str | None = None
+    worker_id: str | None = None
+    worker_device: str | None = None
+    worker_capacity: int | None = None
+    array_name: str | None = None
+    array_data_b64: str | None = None
     message: str | None = None
+
+    def array(self) -> np.ndarray:
+        if self.array_data_b64 is None:
+            raise ValueError("event does not contain array data")
+        return decode_array(self.array_data_b64)
+
+
+def encode_array(array: np.ndarray) -> str:
+    buffer = io.BytesIO()
+    np.save(buffer, np.asarray(array), allow_pickle=False)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def decode_array(payload: str) -> np.ndarray:
+    buffer = io.BytesIO(base64.b64decode(payload.encode("ascii")))
+    return np.load(buffer, allow_pickle=False)
 
 
 def _require_str(payload: dict[str, Any], key: str) -> str:
@@ -96,6 +123,8 @@ def forecast_request_to_dict(request: ForecastRequest) -> dict[str, Any]:
         "async_export": request.async_export,
         "overlap": request.overlap,
         "output_mode": request.output_mode,
+        "preview_var": request.preview_var,
+        "sticky_key": request.sticky_key,
     }
 
 
@@ -105,7 +134,7 @@ def forecast_request_from_dict(payload: dict[str, Any]) -> ForecastRequest:
         raise ValueError(f"unsupported protocol version {version}")
 
     output_mode = payload.get("output_mode", "export_paths")
-    if output_mode not in ("export_paths", "metadata_only"):
+    if output_mode not in ("export_paths", "metadata_only", "last_step_array"):
         raise ValueError(f"unsupported output_mode {output_mode!r}")
 
     async_export = payload.get("async_export")
@@ -123,6 +152,8 @@ def forecast_request_from_dict(payload: dict[str, Any]) -> ForecastRequest:
         async_export=None if async_export is None else bool(async_export),
         overlap=None if overlap is None else bool(overlap),
         output_mode=output_mode,
+        preview_var=_optional_str(payload, "preview_var"),
+        sticky_key=_optional_str(payload, "sticky_key"),
     )
 
 
@@ -160,6 +191,11 @@ def forecast_event_to_dict(event: ForecastEvent) -> dict[str, Any]:
         "valid_time": event.valid_time,
         "error": event.error,
         "worker_preset": event.worker_preset,
+        "worker_id": event.worker_id,
+        "worker_device": event.worker_device,
+        "worker_capacity": event.worker_capacity,
+        "array_name": event.array_name,
+        "array_data_b64": event.array_data_b64,
         "message": event.message,
     }
 
@@ -182,6 +218,7 @@ def forecast_event_from_dict(payload: dict[str, Any]) -> ForecastEvent:
         raise ValueError(f"unsupported event kind {kind!r}")
 
     step = payload.get("step")
+    worker_capacity = payload.get("worker_capacity")
     return ForecastEvent(
         kind=kind,
         request_id=_optional_str(payload, "request_id"),
@@ -190,6 +227,11 @@ def forecast_event_from_dict(payload: dict[str, Any]) -> ForecastEvent:
         valid_time=_optional_str(payload, "valid_time"),
         error=_optional_str(payload, "error"),
         worker_preset=_optional_str(payload, "worker_preset"),
+        worker_id=_optional_str(payload, "worker_id"),
+        worker_device=_optional_str(payload, "worker_device"),
+        worker_capacity=None if worker_capacity is None else int(worker_capacity),
+        array_name=_optional_str(payload, "array_name"),
+        array_data_b64=_optional_str(payload, "array_data_b64"),
         message=_optional_str(payload, "message"),
     )
 

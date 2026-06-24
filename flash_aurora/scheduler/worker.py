@@ -17,6 +17,7 @@ from flash_aurora.scheduler.protocol import (
     ForecastEvent,
     ForecastRequest,
     decode_command,
+    encode_array,
     encode_event,
 )
 
@@ -27,6 +28,9 @@ class ForecastWorkerConfig:
     asset_root: Path
     command_addr: str
     event_addr: str
+    worker_id: str | None = None
+    device: str | None = None
+    capacity: int = 1
     inference_precision: str | None = None
     export_dir: Path | None = None
     ic_cache: bool | None = None
@@ -48,6 +52,8 @@ class ForecastWorker:
         context: zmq.Context | None = None,
     ) -> None:
         self._config = config
+        if config.capacity < 1:
+            raise ValueError("worker capacity must be >= 1")
         self._owns_context = context is None
         self._context = context or zmq.Context.instance()
         self._engine = engine or self._build_engine()
@@ -60,6 +66,7 @@ class ForecastWorker:
         self._event_socket = self._context.socket(zmq.PUSH)
         self._command_socket.bind(config.command_addr)
         self._event_socket.bind(config.event_addr)
+        self._closed = False
 
     @property
     def preset(self) -> str:
@@ -77,6 +84,30 @@ class ForecastWorker:
     def event_addr(self) -> str:
         return self._config.event_addr
 
+    @property
+    def worker_id(self) -> str:
+        if self._config.worker_id is not None:
+            return self._config.worker_id
+        return f"{self._config.preset}@{self._config.device or 'cuda:0'}"
+
+    @property
+    def device(self) -> str:
+        if self._config.device is not None:
+            return self._config.device
+        engine_config = getattr(self._engine, "config", None)
+        engine_device = getattr(engine_config, "device", None)
+        return engine_device if isinstance(engine_device, str) else "cuda:0"
+
+    @property
+    def capacity(self) -> int:
+        return self._config.capacity
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _build_engine(self) -> AuroraEngine:
         kwargs: dict[str, Any] = {
             "asset_root": self._config.asset_root,
@@ -93,12 +124,18 @@ class ForecastWorker:
             kwargs["overlap_ic_load"] = self._config.overlap_ic_load
         if self._config.async_export is not None:
             kwargs["async_export"] = self._config.async_export
-        return AuroraEngine.from_preset(self._config.preset, **kwargs)
+        engine = AuroraEngine.from_preset(self._config.preset, **kwargs)
+        if self._config.device is not None:
+            engine.config.device = self._config.device
+        return engine
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._running = False
         try:
-            self._engine.release_gpu(move_model_to_cpu=True)
+            self._engine.close()
         except Exception:
             pass
         self._command_socket.close(linger=0)
@@ -124,6 +161,27 @@ class ForecastWorker:
         if request.cache_dir is None:
             return None
         return Path(request.cache_dir).expanduser().resolve()
+
+    def _last_step_array_event(
+        self,
+        request: ForecastRequest,
+        step_index: int,
+        prediction,
+    ) -> ForecastEvent:
+        variable = request.preview_var or next(iter(prediction.surf_vars))
+        if variable not in prediction.surf_vars:
+            available = ", ".join(sorted(prediction.surf_vars))
+            raise ValueError(f"surface variable {variable!r} not found; available: {available}")
+        array = prediction.surf_vars[variable][0, -1].detach().float().cpu().numpy()
+        valid_time = prediction.metadata.time[-1].isoformat()
+        return ForecastEvent(
+            kind="step",
+            request_id=request.request_id,
+            step=step_index,
+            valid_time=valid_time,
+            array_name=variable,
+            array_data_b64=encode_array(array),
+        )
 
     def run_forecast(self, request: ForecastRequest) -> None:
         self._validate_request(request)
@@ -168,10 +226,26 @@ class ForecastWorker:
                         export_path=str(path),
                     )
                 )
+        elif request.output_mode == "metadata_only":
+            for step_index, prediction in enumerate(
+                self._engine.rollout_stream(batch, request.steps)
+            ):
+                valid_time = prediction.metadata.time[-1].isoformat()
+                self._emit(
+                    ForecastEvent(
+                        kind="step",
+                        request_id=request.request_id,
+                        step=step_index,
+                        valid_time=valid_time,
+                    )
+                )
         else:
             for step_index, prediction in enumerate(
                 self._engine.rollout_stream(batch, request.steps)
             ):
+                if step_index == request.steps - 1:
+                    self._emit(self._last_step_array_event(request, step_index, prediction))
+                    continue
                 valid_time = prediction.metadata.time[-1].isoformat()
                 self._emit(
                     ForecastEvent(
@@ -193,6 +267,9 @@ class ForecastWorker:
                 ForecastEvent(
                     kind="health",
                     worker_preset=self._config.preset,
+                    worker_id=self.worker_id,
+                    worker_device=self.device,
+                    worker_capacity=self.capacity,
                     message="ok",
                 )
             )
@@ -210,6 +287,10 @@ class ForecastWorker:
                 self.run_forecast(command.request)
             except Exception as exc:
                 request_id = command.request.request_id
+                try:
+                    self._engine.release_gpu(move_model_to_cpu=True)
+                except Exception:
+                    pass
                 self._emit(
                     ForecastEvent(
                         kind="failed",
@@ -225,16 +306,17 @@ class ForecastWorker:
         poller = zmq.Poller()
         poller.register(self._command_socket, zmq.POLLIN)
 
-        while self._running:
-            events = poller.poll(timeout=self._config.poll_timeout_ms)
-            if not events:
-                continue
-            data = self._command_socket.recv()
-            command = decode_command(data)
-            if not self.handle_command(command):
-                break
-
-        self.close()
+        try:
+            while self._running:
+                events = poller.poll(timeout=self._config.poll_timeout_ms)
+                if not events:
+                    continue
+                data = self._command_socket.recv()
+                command = decode_command(data)
+                if not self.handle_command(command):
+                    break
+        finally:
+            self.close()
 
     def serve_once(self) -> bool:
         """Process a single command (for tests). Returns False on shutdown."""
@@ -247,6 +329,7 @@ class ForecastWorker:
 def install_signal_handlers(worker: ForecastWorker) -> None:
     def _handler(_signum: int, _frame: object) -> None:
         worker._running = False
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _handler)
     signal.signal(signal.SIGTERM, _handler)

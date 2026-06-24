@@ -42,8 +42,24 @@ class ForecastClient:
         self._command_socket.connect(config.command_addr)
         self._event_socket.connect(config.event_addr)
         self._event_socket.setsockopt(zmq.RCVTIMEO, config.recv_timeout_ms)
+        self._closed = False
+
+    def __enter__(self) -> ForecastClient:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._command_socket.close(linger=0)
         self._event_socket.close(linger=0)
         if self._owns_context:
@@ -52,9 +68,13 @@ class ForecastClient:
     def _send_command(self, command: ForecastCommand) -> None:
         self._command_socket.send(encode_command(command))
 
-    def _recv_event(self) -> ForecastEvent:
+    def recv_event(self) -> ForecastEvent:
+        """Receive the next scheduler event from the event socket."""
         data = self._event_socket.recv()
         return decode_event(data)
+
+    def _recv_event(self) -> ForecastEvent:
+        return self.recv_event()
 
     def submit(self, request: ForecastRequest) -> None:
         self._send_command(ForecastCommand(kind="forecast", request=request))

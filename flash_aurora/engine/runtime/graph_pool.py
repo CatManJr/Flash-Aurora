@@ -14,6 +14,9 @@ class GraphPool:
     def __init__(self) -> None:
         self._captured: dict[str, object] = {}
 
+    def clear(self) -> None:
+        self._captured.clear()
+
     def warmup(
         self,
         model: Aurora,

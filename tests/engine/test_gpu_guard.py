@@ -167,5 +167,5 @@ def test_engine_acquire_and_release_gpu(tmp_path: Path, monkeypatch: pytest.Monk
     ):
         ticket = engine.acquire_gpu(rollout_steps=1)
         assert ticket is not None
-        engine.release_gpu(move_model_to_cpu=False)
+        engine.release_gpu()
         assert engine._gpu_ticket is None

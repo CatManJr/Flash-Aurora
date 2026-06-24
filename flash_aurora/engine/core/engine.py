@@ -48,6 +48,34 @@ class AuroraEngine:
         self._exporter = RolloutExporter(self._resolved_export_dir())
         self._gpu_ticket: GpuGuardTicket | None = None
         self._forward_warmed = False
+        self._closed = False
+
+    def __enter__(self) -> AuroraEngine:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """Release GPU resources and close exporter state."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._exporter.close()
+        finally:
+            try:
+                self.release_gpu(move_model_to_cpu=False)
+            finally:
+                self._model = None
+                self._graph_pool.clear()
+                self._forward_warmed = False
 
     def _resolved_export_dir(self) -> Path:
         if self.config.export_dir is not None:
@@ -191,9 +219,13 @@ class AuroraEngine:
         return registry.status(device_index=self._device_index())
 
     def load(self, *, rollout_steps: int | None = None) -> Aurora:
-        self.acquire_gpu(rollout_steps=rollout_steps)
-        self._model = self._load_model_to_device()[0]
-        return self._model
+        try:
+            self.acquire_gpu(rollout_steps=rollout_steps)
+            self._model = self._load_model_to_device()[0]
+            return self._model
+        except Exception:
+            self.release_gpu()
+            raise
 
     def _load_model_to_device(self) -> tuple[Aurora, LoadTiming]:
         t0 = time.perf_counter()
@@ -259,13 +291,17 @@ class AuroraEngine:
         load = self._load_model_to_device
         use_overlap = self._resolve_overlap(overlap)
 
-        if use_overlap:
-            batch, model, _timing = overlap_ic_and_load(build_ic, load)
-        else:
-            batch, model, _timing = serial_ic_then_load(build_ic, load)
-        self._model = model
-        self._maybe_warmup(batch)
-        return batch
+        try:
+            if use_overlap:
+                batch, model, _timing = overlap_ic_and_load(build_ic, load)
+            else:
+                batch, model, _timing = serial_ic_then_load(build_ic, load)
+            self._model = model
+            self._maybe_warmup(batch)
+            return batch
+        except Exception:
+            self.release_gpu()
+            raise
 
     def prepare_from_netcdf(
         self,
@@ -281,13 +317,17 @@ class AuroraEngine:
         load = self._load_model_to_device
         use_overlap = self._resolve_overlap(overlap)
 
-        if use_overlap:
-            batch, model, _timing = overlap_ic_and_load(build_ic, load)
-        else:
-            batch, model, _timing = serial_ic_then_load(build_ic, load)
-        self._model = model
-        self._maybe_warmup(batch)
-        return batch
+        try:
+            if use_overlap:
+                batch, model, _timing = overlap_ic_and_load(build_ic, load)
+            else:
+                batch, model, _timing = serial_ic_then_load(build_ic, load)
+            self._model = model
+            self._maybe_warmup(batch)
+            return batch
+        except Exception:
+            self.release_gpu()
+            raise
 
     def _maybe_warmup(self, batch: Batch) -> None:
         if self._forward_warmed or self.config.forward_warmup_iters <= 0:
@@ -344,7 +384,11 @@ class AuroraEngine:
         self.validate(batch)
         self._maybe_warmup(batch)
         session = RolloutSession(self.model, observers)
-        yield from session.run(batch, steps)
+        try:
+            yield from session.run(batch, steps)
+        except Exception:
+            self.release_gpu()
+            raise
 
     def rollout_and_export(
         self,

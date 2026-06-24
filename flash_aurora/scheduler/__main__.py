@@ -28,6 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="tcp://127.0.0.1:9756",
         help="ZMQ bind address for outgoing events (worker PUSH)",
     )
+    parser.add_argument("--worker-id", default=None, help="Stable worker id for coordinators")
+    parser.add_argument("--device", default=None, help="Inference device, for example cuda:1")
+    parser.add_argument("--capacity", type=int, default=1, help="Concurrent job slots advertised")
     parser.add_argument("--inference-precision", default=None)
     parser.add_argument("--export-dir", type=Path, default=None)
     parser.add_argument("--ic-cache", action=argparse.BooleanOptionalAction, default=None)
@@ -46,6 +49,9 @@ def main() -> None:
         asset_root=asset_root,
         command_addr=args.command_addr,
         event_addr=args.event_addr,
+        worker_id=args.worker_id,
+        device=args.device,
+        capacity=args.capacity,
         inference_precision=args.inference_precision,
         export_dir=args.export_dir,
         ic_cache=args.ic_cache,
@@ -57,10 +63,16 @@ def main() -> None:
     worker = ForecastWorker(config)
     install_signal_handlers(worker)
     print(
-        f"[worker] preset={config.preset} command={config.command_addr} event={config.event_addr}",
+        f"[worker] id={worker.worker_id} preset={config.preset} device={worker.device} "
+        f"capacity={config.capacity} command={config.command_addr} event={config.event_addr}",
         flush=True,
     )
-    worker.serve_forever()
+    try:
+        worker.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        worker.close()
 
 
 if __name__ == "__main__":

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import numpy as np
 import pytest
 
 from flash_aurora.scheduler.protocol import (
     ForecastCommand,
     ForecastEvent,
     ForecastRequest,
+    decode_array,
     decode_command,
     decode_event,
+    encode_array,
     encode_command,
     encode_event,
     forecast_command_from_dict,
@@ -33,7 +36,8 @@ def test_forecast_request_json_round_trip() -> None:
         export_dir="/tmp/out",
         async_export=True,
         overlap=False,
-        output_mode="metadata_only",
+        output_mode="last_step_array",
+        preview_var="2t",
     )
     restored = forecast_request_from_dict(forecast_request_to_dict(request))
     assert restored == request
@@ -64,6 +68,23 @@ def test_forecast_event_json_round_trip() -> None:
     )
     restored = forecast_event_from_dict(forecast_event_to_dict(event))
     assert restored == event
+
+
+def test_forecast_event_array_round_trip() -> None:
+    array = np.arange(6, dtype=np.float32).reshape(2, 3)
+    event = ForecastEvent(
+        kind="step",
+        request_id="job-array",
+        step=0,
+        array_name="2t",
+        array_data_b64=encode_array(array),
+    )
+
+    restored = forecast_event_from_dict(forecast_event_to_dict(event))
+
+    assert restored.array_name == "2t"
+    np.testing.assert_array_equal(restored.array(), array)
+    np.testing.assert_array_equal(decode_array(restored.array_data_b64 or ""), array)
 
 
 def test_encode_decode_bytes() -> None:
