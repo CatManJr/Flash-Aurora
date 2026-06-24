@@ -19,6 +19,7 @@ Dependencies include PyTorch, `nvidia-cutlass-dsl[cu13]`, and `quack-kernels` (s
 | --------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `flash_aurora/aurora/`            | Aurora model fork (upstream README preserved in place). See `NOTICE.md` and `LICENSE.txt`.            |
 | `flash_aurora/engine/`            | `AuroraEngine`, presets, ingress/download, rollout, export, GPU guard.                                |
+| `flash_aurora/scheduler/`         | ZMQ forecast worker and client (out-of-process inference service).                                    |
 | `flash_aurora/aurora/ops/triton/` | Fused Swin layout and AdaLN kernels.                                                                  |
 | `flash_aurora/aurora/ops/cute/`   | CuTe DSL window self-attention kernels.                                                               |
 | `benchmark/`                      | Kernel- and model-level timing scripts (`bench_aurora_latency_all.py`, `bench_window_attn.py`, etc.). |
@@ -476,7 +477,7 @@ Legacy single-preset timing: `benchmark/bench_aurora_pretrained.py` (subset of `
 
 ## Engine (`flash_aurora.engine`)
 
-`flash_aurora.engine` is the inference service layer. It binds Aurora variants, upstream data profiles, checkpoint resolution, batch validation, multi-step rollout, and NetCDF export behind a preset-driven API. Tutorial notebooks under `docs/example_*.ipynb` exercise each preset end to end.
+`flash_aurora.engine` is the inference service layer. It binds Aurora variants, upstream data profiles, checkpoint resolution, batch validation, multi-step rollout, and NetCDF export behind a preset-driven API. Tutorial notebooks under `docs/example_*.ipynb` exercise each preset in process. For out-of-process deployment, see `docs/example_scheduler.py` and **Forecast scheduler (ZMQ)** below.
 
 ### Architecture
 
@@ -519,6 +520,77 @@ Personal ECMWF accounts typically lack MARS archive access. For `wave`, set dire
 - **Prepare overlap.** `prepare()` can build initial conditions on a CPU worker thread while the model loads on the main thread.
 - **CUDA graph (experimental, off by default).** Optional backbone-only capture via `engine.config.cuda_graph=True`. Not recommended for production: CuTe/Triton paths are already fast, capture covers only the Swin backbone (encoder/decoder stay eager), and static buffers add VRAM. See **CUDA graph status** below.
 - **GPU scheduling.** `GpuGuard` (default on) estimates VRAM from variant, precision tier, and rollout depth; large jobs queue when memory is saturated. Disable with `gpu_guard=False` or `FLASH_AURORA_GPU_GUARD=0`.
+
+### Forecast scheduler (ZMQ)
+
+`flash_aurora.scheduler` wraps the same `AuroraEngine` and `DataDownloader` in a long-lived **forecast worker** that owns one GPU and one preset. Clients send JSON commands over ZeroMQ and receive a stream of job events. Use this path when inference should run outside a notebook kernel, when several callers share one GPU slot, or when a script must release VRAM on exit.
+
+**Processing model.** The worker binds a command socket (PULL) and an event socket (PUSH). Default TCP addresses are `tcp://127.0.0.1:9755` (commands) and `tcp://127.0.0.1:9756` (events). Jobs are handled **sequentially**: only one rollout executes at a time, and further submissions wait in the socket buffer until the current job finishes. Each `ForecastRequest.preset` must match the worker preset exactly.
+
+**Event protocol.** A successful forecast emits `accepted`, `preparing`, `running`, one `step` event per rollout step, then `completed`. With `output_mode="export_paths"` (default), each `step` carries an `export_path`. With `output_mode="metadata_only"`, each `step` carries a `valid_time` and no NetCDF is written. Failures emit `failed` with an error string.
+
+**Tutorial script.** `docs/example_scheduler.py` starts a worker subprocess, runs a health check, submits an export job and a metadata-only job, then shuts the worker down. Prerequisite: checkpoint and ERA5 cache under an absolute `AURORA_ASSET_ROOT` (populate via `docs/example_era5.ipynb` or an explicit path). The demo sets `download=False` and reads cached ingress only.
+
+```bash
+export AURORA_ASSET_ROOT=/path/to/data/aurora
+uv run python docs/example_scheduler.py
+```
+
+To attach to a worker you started separately, pass `--client-only` and the same `--command-addr` / `--event-addr`.
+
+**Persistent worker.** For a service that stays up across many clients, start the worker in its own terminal:
+
+```bash
+export AURORA_ASSET_ROOT=/path/to/data/aurora
+
+uv run python -m flash_aurora.scheduler \
+  --preset era5_pretrained \
+  --asset-root "$AURORA_ASSET_ROOT" \
+  --inference-precision bf16_mixed@fp32 \
+  --command-addr tcp://127.0.0.1:9755 \
+  --event-addr tcp://127.0.0.1:9756
+```
+
+Point `ForecastClientConfig` at the same addresses. Send `shutdown` through the client (or SIGINT to the worker process) when tearing down the service.
+
+**Client sketch.**
+
+```python
+from flash_aurora.scheduler import ForecastClient, ForecastClientConfig, ForecastRequest
+
+client = ForecastClient(
+    ForecastClientConfig(
+        command_addr="tcp://127.0.0.1:9755",
+        event_addr="tcp://127.0.0.1:9756",
+    )
+)
+for event in client.forecast(
+    ForecastRequest(
+        request_id="job-1",
+        preset="era5_pretrained",
+        steps=4,
+        valid_time="2023-01-01T06:00:00",
+        time_index=1,
+        download=False,
+        export_dir="/path/to/output",
+    )
+):
+    print(event.kind, event.export_path or event.valid_time or "")
+
+client.shutdown_worker()  # stop a worker this client owns
+client.close()
+```
+
+For incremental progress UI, call `client.submit(request)` and iterate `client.events(request.request_id)` instead of the blocking `forecast()` helper.
+
+
+| Module | Role |
+| ------ | ---- |
+| `scheduler/worker.py` | `ForecastWorker`, CLI entry (`python -m flash_aurora.scheduler`). |
+| `scheduler/client.py` | `ForecastClient` command submission and event streaming. |
+| `scheduler/protocol.py` | JSON wire types (`ForecastRequest`, `ForecastEvent`, `ForecastCommand`). |
+
+Unit tests live under `tests/scheduler/`. Integration tests require a GPU and cached assets (`pytest tests/scheduler/ -m "not integration and not gpu"` for protocol and mock worker tests).
 
 ### Core API
 
