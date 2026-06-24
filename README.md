@@ -1,6 +1,6 @@
 # Flash-Aurora: Toward Efficient Inference for Geospatial Foundation Models
 
-Flash-Aurora is a high-performance inference stack for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model. The repository packages the upstream model in `flash_aurora.aurora`, custom GPU kernels (Triton and CuTe DSL), precision routing, and `flash_aurora.engine` for data ingress, checkpoint loading, rollout, and NetCDF export.
+Flash-Aurora is an inference stack for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model. It includes the Aurora model fork, Triton and CuTe DSL kernels, precision routing, data ingress, checkpoint loading, autoregressive rollout, NetCDF export, and a ZeroMQ scheduler for out-of-process serving.
 
 ## Install
 
@@ -10,70 +10,485 @@ cd flash-aurora
 uv sync
 ```
 
-Dependencies include PyTorch, `nvidia-cutlass-dsl[cu13]`, and `quack-kernels` (see `pyproject.toml`). CuTe DSL kernels JIT-compile for the local GPU architecture (set `CUTE_DSL_ARCH`, for example `sm_120a` on NVIDIA Blackwell). Remaining Python dependencies follow [Microsoft Aurora](https://github.com/microsoft/aurora).
+Dependencies are declared in `pyproject.toml` and pinned by `uv.lock`. CuTe DSL kernels JIT-compile for the local GPU architecture. Set `CUTE_DSL_ARCH` when needed, for example `sm_120a` on NVIDIA Blackwell GeForce.
 
 ## Repository layout
 
 
-| Path                              | Role                                                                                                  |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `flash_aurora/aurora/`            | Aurora model fork (upstream README preserved in place). See `NOTICE.md` and `LICENSE.txt`.            |
-| `flash_aurora/engine/`            | `AuroraEngine`, presets, ingress/download, rollout, export, GPU guard.                                |
-| `flash_aurora/scheduler/`         | ZMQ forecast worker and client (out-of-process inference service).                                    |
-| `flash_aurora/aurora/ops/triton/` | Fused Swin layout and AdaLN kernels.                                                                  |
-| `flash_aurora/aurora/ops/cute/`   | CuTe DSL window self-attention kernels.                                                               |
-| `benchmark/`                      | Kernel- and model-level timing scripts (`bench_aurora_latency_all.py`, `bench_window_attn.py`, etc.). |
-| `tests/`                          | `tests/aurora`, `tests/kernels`, `tests/engine`.                                                      |
+| Path                                         | Role                                                                                                                                |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `flash_aurora/aurora/`                       | Aurora model (upstream README preserved in place). See `NOTICE.md` and `LICENSE.txt`.                                               |
+| `flash_aurora/aurora/ops/triton/`            | Fused Swin3D layout, AdaLN, and GELU kernels.                                                                                       |
+| `flash_aurora/aurora/ops/cute/`              | CuTe DSL window self-attention and dense GEMM kernels.                                                                              |
+| `flash_aurora/engine/core/`                  | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle.                        |
+| `flash_aurora/engine/ingress/`               | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, optional IC disk cache.                             |
+| `flash_aurora/engine/egress/`                | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                     |
+| `flash_aurora/engine/runtime/`               | `GraphPool`, `GpuGuard`, VRAM budget estimates, IC/load overlap, `ResourceMonitor`.                                                 |
+| `flash_aurora/scheduler/worker.py`           | `ForecastWorker`, single-GPU job queue, CLI (`python -m flash_aurora.scheduler`).                                                   |
+| `flash_aurora/scheduler/coordinator.py`      | `ForecastCoordinator`, multi-worker dispatch, queueing, sticky sessions.                                                            |
+| `flash_aurora/scheduler/coordinator_main.py` | Coordinator CLI entry.                                                                                                              |
+| `flash_aurora/scheduler/client.py`           | `ForecastClient`, command submission, event streaming.                                                                              |
+| `flash_aurora/scheduler/protocol.py`         | JSON wire types (`ForecastRequest`, `ForecastEvent`, `ForecastCommand`).                                                            |
+| `flash_aurora/scheduler/processes.py`        | Scoped stale-process cleanup, process-tree termination, graceful shutdown helpers.                                                  |
+| `flash_aurora/scheduler/supervisor.py`       | `SchedulerSupervisor`, system-wide orphan reclaim.                                                                                  |
+| `docs/`                                      | Tutorial notebooks: in-process presets (`example_*.ipynb`) and ZMQ scheduler (`example_scheduler_*.ipynb`, `example_scheduler.py`). |
+| `benchmark/`                                 | Kernel- and model-level timing scripts (`bench_aurora_latency_all.py`, `bench_window_attn.py`, etc.).                               |
+| `tests/aurora/`                              | Model fork and rollout unit tests.                                                                                                  |
+| `tests/kernels/`                             | Triton and CuTe kernel tests.                                                                                                       |
+| `tests/engine/`                              | Engine, ingress, egress, runtime, and GPU guard tests.                                                                              |
+| `tests/scheduler/`                           | Protocol, worker, coordinator, process cleanup, and supervisor tests.                                                               |
 
 
 Run tests: `./scripts/run_tests.sh`
 
-## Inference precision tiers
+## Reading guide
 
-Tiers use the label `backbone@encoder_decoder`, for example `bf16_mixed@fp32`.
+Use the Engine section first if you want to run forecasts or integrate Flash-Aurora in another application. Use the Forecast scheduler section when inference must run outside the notebook process or when one host has multiple GPUs. Tutorial notebooks under `docs/` cover each preset in process and both scheduler deployment modes. Use the benchmark sections when comparing precision tiers or reproducing reported latency and drift numbers.
+
+## Engine (`flash_aurora.engine`)
+
+`flash_aurora.engine` is the preset-driven inference layer. It combines model variants, data profiles, checkpoint resolution, batch validation, rollout, and NetCDF export. In-process tutorials live under `docs/example_*.ipynb`. Out-of-process serving is documented in the Forecast scheduler (ZMQ) section below.
+
+### Architecture
+
+The engine has four layers. Data flows from download and adapters into a validated `Batch`, through `prepare()` (initial-condition construction and model load), autoregressive rollout, and optionally to forecast NetCDF.
+
+
+| Layer   | Path              | Role                                                                                                                                  |
+| ------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Core    | `engine/core/`    | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle (`close`, `release_gpu`). |
+| Ingress | `engine/ingress/` | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, static fields, optional IC disk cache (`ic_cache`).   |
+| Egress  | `engine/egress/`  | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                       |
+| Runtime | `engine/runtime/` | `GraphPool`, cross-process `GpuGuard`, VRAM budget estimates, IC/load overlap (`rollout_prep`), `ResourceMonitor`.                    |
+
+
+A preset pairs a `ModelVariantSpec` with a `SourceProfile`. The model spec defines checkpoint files, variables, grid shape $H \times W$, and timestep $\Delta t$. The source profile defines schema, latitude convention, and cache layout. `DataDownloader.ensure()` fills the cache. `InitialConditionBuilder` reads cached files or adapter requests and attaches static fields. `BatchValidator` checks tensor shapes and variable names. `AuroraEngine.prepare()` builds the initial condition, loads the checkpoint, and can overlap IC construction with model initialization. `AuroraEngine.load()` resolves checkpoints, applies `inference_precision`, and can acquire a `GpuGuard` lease. `rollout_stream()` advances $K$ autoregressive steps by $\Delta t$ per step. `rollout_and_export()` writes NetCDF files under `export_dir`. `release_gpu()` releases the lease between jobs; `close()` performs terminal teardown without moving weights to CPU.
+
+### Presets and data sources
+
+
+| Preset              | Model                 | Grid $H \times W$  | Source                   | Download backend       |
+| ------------------- | --------------------- | ------------------ | ------------------------ | ---------------------- |
+| `era5_pretrained`   | AuroraPretrained      | $721 \times 1440$  | CDS ERA5                 | CDS                    |
+| `hres_t0_finetuned` | Aurora (LoRA)         | $721 \times 1440$  | WeatherBench2 HRES       | WB2 + ERA5 static      |
+| `small_pretrained`  | AuroraSmallPretrained | $400 \times 800$   | CDS ERA5                 | CDS                    |
+| `hres_0.1`          | AuroraHighRes         | $1801 \times 3600$ | IFS GRIB analysis        | ECMWF Open Data / GRIB |
+| `cams`              | AuroraAirPollution    | $451 \times 900$   | CAMS reanalysis          | ADS                    |
+| `wave`              | AuroraWave            | $721 \times 1440$  | WB2 met + MARS wave GRIB | WB2 + MARS             |
+| `tc_tracking`       | Aurora (LoRA)         | $721 \times 1440$  | WeatherBench2 HRES       | WB2 + ERA5 static      |
+
+
+Personal ECMWF accounts typically lack MARS archive access. For `wave`, place `{day}-wave.grib` in the cache manually or use an institutional MARS credential. See `docs/example_wave.ipynb`.
+
+### Capabilities
+
+The engine supports local checkpoint and static asset management with optional Hugging Face Hub download (`allow_hub_download`, mirror via `HF_MIRROR_ENDPOINT`). `EngineConfig.inference_precision` selects the Triton fusion base and, when set, TF32/BF16 GEMM and CuTe DSL window attention. Ingress covers CDS (ERA5), ADS (CAMS), WeatherBench2 (HRES meteorology), ECMWF Open Data ($0.1^{\circ}$ GRIB), and MARS (wave GRIB when permitted); credentials merge from environment variables, `~/.cdsapirc`, `~/.ecmwfapirc`, and optional constructor kwargs. Multi-step rollout is available through `rollout_stream(batch, K)` and `run_from_netcdf(..., steps=K)`, with optional `RolloutObserver` hooks per step. `rollout_and_export()` writes forecast steps to `export_dir`; an optional async pipeline (Earth-2 style) overlaps GPU-to-CPU offload and disk writes with the next forward step. `prepare()` can build initial conditions on a background thread while the model loads (`overlap_ic_load`, default on). Optional `ic_cache` stores post-processed batches on disk for repeated runs on the same analysis time. Experimental CUDA graph capture (`engine.config.cuda_graph=True`) is off by default; see CUDA graph status below. `GpuGuard` (default on) estimates VRAM from variant, precision tier, and rollout depth and queues large jobs when memory is saturated; disable with `gpu_guard=False` or `FLASH_AURORA_GPU_GUARD=0`. Idempotent `close()`, context managers, and `release_gpu(move_model_to_cpu=...)` release the `GpuGuard` lease and CUDA cache; terminal `close()` skips CPU weight migration, and exception paths in `load()`, `prepare()`, and `rollout_stream()` call `release_gpu()` before propagating errors. `ResourceMonitor` samples host CPU, DRAM, per-device GPU utilization, and VRAM over time; `plot_resource_usage()` renders utilization curves for scheduler tutorials and operational diagnostics.
+
+### Forecast scheduler (ZMQ)
+
+`flash_aurora.scheduler` runs `AuroraEngine` and `DataDownloader` inside long-lived worker processes. A worker owns one GPU, one preset, and a sequential job queue. Clients send JSON commands over ZeroMQ and receive progress events. Use this path when inference should run outside a notebook kernel, when several callers share GPU capacity, or when a script must release VRAM on exit.
+
+#### Architecture
+
+
+| Component       | Module                                  | Role                                                                                                  |
+| --------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Worker          | `worker.py`, `__main__.py`              | Long-lived single-GPU process; sequential forecast queue; lazy engine load; signal-aware `close()`.   |
+| Coordinator     | `coordinator.py`, `coordinator_main.py` | Front-end dispatcher over multiple workers; preset-aware routing; optional sticky sessions.           |
+| Client          | `client.py`                             | ZMQ command submission, blocking `forecast()` or streaming `events()`.                                |
+| Protocol        | `protocol.py`                           | JSON commands and events; `output_mode` for NetCDF export, metadata-only, or last-step array preview. |
+| Process cleanup | `processes.py`                          | Scoped stale-process discovery, IPC file removal, `shutdown_scheduler_subprocess(es)`.                |
+| Supervisor      | `supervisor.py`                         | OS-level orphan detection and forced reclaim independent of ZMQ state.                                |
+
+
+#### Capabilities
+
+A single worker binds one GPU, one preset, and one sequential queue over a command socket (PULL) and an event socket (PUSH). Default TCP addresses are `tcp://127.0.0.1:9755` (commands) and `tcp://127.0.0.1:9756` (events). Each `ForecastRequest.preset` must match the worker preset. Distributed multi workers place one worker per GPU behind a `ForecastCoordinator` that tracks preset, device, and capacity, dispatches whole-forecast jobs to idle workers, and forwards events. This is job-level data-parallel service scheduling, not tensor parallelism inside one rollout; heterogeneous presets across devices are supported. A successful forecast emits `accepted`, `preparing`, `running`, one `step` event per rollout step, and `completed`. With `output_mode="export_paths"` (default), each `step` carries an `export_path`; with `output_mode="metadata_only"`, each `step` carries `valid_time` and no NetCDF is written; with `output_mode="last_step_array"`, only the final `step` carries the selected `preview_var` surface array for plotting. Failures emit `failed` with an error string. Workers, coordinators, and clients expose idempotent `close()`, context managers, and best-effort finalizers. Tutorial shutdown uses `shutdown_scheduler_subprocess(client, proc)` or `shutdown_scheduler_subprocesses(client, procs)` to send a ZMQ `shutdown` command, wait for graceful exit, and force-terminate only stuck subprocess trees; preflight cleanup uses `cleanup_stale_scheduler_processes(socket_dir)` scoped to one IPC directory. The supervisor provides last-resort orphan reclaim when graceful cleanup fails by scanning the process table for `flash_aurora.scheduler` processes whose parent has exited, terminating with SIGTERM then SIGKILL, and removing stale IPC files under `/tmp`.
+
+#### Deployment
+
+#### Persistent worker
+
+Start one worker in its own terminal:
+
+```bash
+export AURORA_ASSET_ROOT=/path/to/data/aurora
+
+uv run python -m flash_aurora.scheduler \
+  --preset era5_pretrained \
+  --asset-root "$AURORA_ASSET_ROOT" \
+  --worker-id gpu0-era5 \
+  --device cuda:0 \
+  --inference-precision bf16_mixed@fp32 \
+  --command-addr tcp://127.0.0.1:9755 \
+  --event-addr tcp://127.0.0.1:9756
+```
+
+Point `ForecastClientConfig` at the same addresses. Send `shutdown` through the client (or SIGINT to the worker process) when tearing down the service.
+
+#### Coordinator over more than one GPU
+
+Start multiple workers with different sockets and devices, then start the coordinator:
+
+```bash
+export AURORA_ASSET_ROOT=/path/to/data/aurora
+
+uv run python -m flash_aurora.scheduler \
+  --preset era5_pretrained \
+  --asset-root "$AURORA_ASSET_ROOT" \
+  --worker-id gpu0-era5 \
+  --device cuda:0 \
+  --inference-precision bf16_mixed@fp32 \
+  --command-addr tcp://127.0.0.1:9755 \
+  --event-addr tcp://127.0.0.1:9756
+
+uv run python -m flash_aurora.scheduler \
+  --preset era5_pretrained \
+  --asset-root "$AURORA_ASSET_ROOT" \
+  --worker-id gpu1-era5 \
+  --device cuda:1 \
+  --inference-precision bf16_mixed@fp32 \
+  --command-addr tcp://127.0.0.1:9765 \
+  --event-addr tcp://127.0.0.1:9766
+
+uv run python -m flash_aurora.scheduler.coordinator_main \
+  --command-addr tcp://127.0.0.1:9855 \
+  --event-addr tcp://127.0.0.1:9856 \
+  --worker gpu0-era5,era5_pretrained,tcp://127.0.0.1:9755,tcp://127.0.0.1:9756,cuda:0,1 \
+  --worker gpu1-era5,era5_pretrained,tcp://127.0.0.1:9765,tcp://127.0.0.1:9766,cuda:1,1
+```
+
+Clients connect to `tcp://127.0.0.1:9855` and `tcp://127.0.0.1:9856`. Two concurrent `era5_pretrained` jobs can then occupy the two workers at the same time. `ForecastRequest.sticky_key` is optional; when set, the coordinator keeps requests with the same key on the same worker when capacity permits.
+
+#### Client sketch
+
+```python
+from flash_aurora.scheduler import ForecastClient, ForecastClientConfig, ForecastRequest
+
+client = ForecastClient(
+    ForecastClientConfig(
+        command_addr="tcp://127.0.0.1:9755",
+        event_addr="tcp://127.0.0.1:9756",
+    )
+)
+for event in client.forecast(
+    ForecastRequest(
+        request_id="job-1",
+        preset="era5_pretrained",
+        steps=4,
+        valid_time="2023-01-01T06:00:00",
+        time_index=1,
+        download=False,
+        export_dir="/path/to/output",
+    )
+):
+    print(event.kind, event.export_path or event.valid_time or "")
+
+client.shutdown_worker()  # stop a worker this client owns
+client.close()
+```
+
+For incremental progress UI, call `client.submit(request)` and iterate `client.events(request.request_id)` instead of the blocking `forecast()` helper.
+
+#### Tutorial notebooks
+
+
+| Notebook                                                                                                                        | Topic                                                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `docs/example_era5.ipynb`                                                                                                       | Baseline in-process `era5_pretrained`; populate cache and checkpoints.                                                             |
+| `docs/example_hres_t0.ipynb`, `example_hres_0.1.ipynb`, `example_cams.ipynb`, `example_wave.ipynb`, `example_tc_tracking.ipynb` | Other presets in process.                                                                                                          |
+| `docs/example_scheduler_single_worker.ipynb`                                                                                    | Single-GPU ZMQ queue; scoped preflight cleanup; graceful shutdown.                                                                 |
+| `docs/example_scheduler_distributed_workers.ipynb`                                                                              | Heterogeneous four-GPU dispatch; cold-start timing; device status; `last_step_array` previews; refill while a slow job is pending. |
+| `docs/example_scheduler.py`                                                                                                     | Command-line version of the single-worker tutorial.                                                                                |
+
+
+All scheduler tutorials require an absolute `AURORA_ASSET_ROOT` with checkpoints and cached ingress. They start real subprocesses, set `download=False`, and call `shutdown_scheduler_subprocess(es)` at the end.
+
+#### Supervisor CLI
+
+```bash
+# one-shot cleanup (typical notebook usage)
+python -m flash_aurora.scheduler.supervisor
+
+# report without killing (dry run)
+python -m flash_aurora.scheduler.supervisor --dry-run
+
+# persistent daemon, scan every 30 s
+python -m flash_aurora.scheduler.supervisor --daemon --interval 30
+```
+
+Unit tests live under `tests/scheduler/`. Integration tests require a GPU and cached assets (`pytest tests/scheduler/ -m "not integration and not gpu"` for protocol and mock worker tests).
+
+### Core API
+
+Engine lifecycle.
+
+```python
+from datetime import datetime
+from pathlib import Path
+
+from flash_aurora import AuroraEngine, DataDownloader
+
+# 1. Create engine (checkpoint loads on first prepare)
+engine = AuroraEngine.from_preset(
+    "era5_pretrained",  # preset: era5_pretrained, hres_0.1, cams, ...
+    asset_root=Path("/path/to/assets"),  # local root for checkpoints and downloads
+    checkpoint_path=None,  # explicit checkpoint file; preset default when None
+    allow_hub_download=True,  # fetch checkpoint from Hugging Face when missing locally
+    hf_endpoint=None,  # Hugging Face API base URL
+    hf_mirror=False,  # True uses built-in HF mirror endpoint
+    hf_revision=None,  # Hugging Face revision or tag
+    hf_token=None,  # token for private or gated models
+    export_dir=None,  # default NetCDF export directory for rollout_and_export
+    inference_precision="bf16_mixed@fp32",  # tier label backbone@encoder_decoder
+    overlap_ic_load=True,  # default: IC build overlaps model load on first prepare
+    async_export=False,  # async NetCDF writes in rollout_and_export
+    export_pool_size=2,  # thread pool size when async_export is True
+    export_max_inflight=None,  # max queued async exports; default pool_size - 1
+    export_use_egress_stream=True,  # dedicated CUDA stream for async export D2H
+    ic_cache=False,  # disk cache for repeated same-day IC builds
+    forward_warmup_iters=2,  # untimed forwards after prepare; 0 disables
+    presets=None,  # optional custom PresetRegistry
+)
+# EngineConfig-only (set after from_preset):
+engine.config.cuda_graph = False  # experimental; default off (low ROI, see CUDA graph status)
+engine.config.device = "cuda:0"  # inference device
+engine.config.gpu_guard = True  # queue large jobs when VRAM is saturated
+engine.config.gpu_guard_timeout = 3600.0  # seconds to wait for GPU slot
+engine.config.gpu_rollout_steps = 1  # rollout depth used for VRAM estimate
+
+# 2. Downloader (ensure runs only when cache files are missing)
+downloader = DataDownloader.from_preset(
+    "era5_pretrained",  # must match engine preset
+    asset_root=engine.config.asset_root,
+    user_cwd=None,  # base for relative paths; current working directory when None
+    presets=None,  # optional custom PresetRegistry
+    credentials=None,  # optional DownloadCredentials bundle
+    cds_api_key=None,  # CDS API key for ERA5
+    cds_api_url=None,  # CDS API URL
+    ads_api_key=None,  # ADS API key for CAMS
+    ads_api_url=None,  # ADS API URL
+    ecmwf_api_key=None,  # ECMWF Open Data key for HRES
+    ecmwf_api_url=None,  # ECMWF Open Data URL
+    ecmwf_email=None,  # ECMWF account email for HRES
+    workers=None,  # parallel download workers; preset default when None
+)
+
+# 3. Build ingest request (download=True calls ensure when cache is missing)
+request = downloader.ingest_request(
+    datetime(2023, 1, 1, 6),  # any valid UTC time for the initial condition
+    cache_dir=None,  # override cache directory; preset layout when None
+    time_index=1,  # 0..3 for 00/06/12/18 UTC cycle
+    download=True,  # False skips auto-download even if cache is missing
+    credentials=None,  # optional per-call credential override
+    cds_api_key=None,
+    cds_api_url=None,
+    ads_api_key=None,
+    ads_api_url=None,
+    ecmwf_api_key=None,
+    ecmwf_api_url=None,
+    ecmwf_email=None,
+    prompt=False,  # prompt for credentials when missing
+    workers=None,  # parallel download workers for this ensure call
+)
+
+# 4. Prepare IC batch on CPU, load model, run forward warmup
+batch = engine.prepare(
+    request,
+    rollout_steps=4,  # rollout depth for GPU guard VRAM estimate
+    overlap=None,  # None uses engine.config.overlap_ic_load; True or False to override
+)
+
+# 5. Autoregressive rollout
+forecasts = list(
+    engine.rollout_stream(
+        batch,
+        steps=4,  # number of 6-hour lead steps
+        observers=None,  # optional RolloutObserver hooks per step
+    )
+)
+
+# 6. Optional NetCDF export (export while autoregressing)
+# paths = list(
+#     engine.rollout_and_export(
+#         batch,
+#         steps=4,
+#         export_dir=None,  # None uses engine.config.export_dir
+#         async_export=None,  # None uses engine.config.async_export
+#     )
+# )
+
+# 7. Release GPU reservation between jobs; optionally move weights to CPU
+engine.release_gpu(move_model_to_cpu=True)
+
+# 8. Terminal teardown (for example at process exit)
+engine.close()  # releases GpuGuard lease without CPU migration; clears model state
+```
+
+Download and ingest.
+
+```python
+from datetime import datetime
+from flash_aurora import AuroraEngine, DataDownloader
+from flash_aurora.engine import InitialConditionBuilder
+
+engine = AuroraEngine.from_preset("era5_pretrained", asset_root="/path/to/assets")
+dl = DataDownloader.from_preset("era5_pretrained", asset_root="/path/to/assets")
+dl.ensure(valid_time=datetime(2023, 1, 1, 6))
+
+request = dl.ingest_request(datetime(2023, 1, 1, 6), time_index=1, download=False)
+batch = InitialConditionBuilder(engine.config).from_source(request)
+forecasts = list(engine.rollout_stream(batch, steps=4))
+paths = list(engine.rollout_and_export(batch, steps=4))
+```
+
+### Lifecycle optimizations
+
+Cold-start time is usually dominated by CPU ingress (`build_ic`), model initialization (`build_model` / CuTe JIT), and NetCDF export, not GPU forward. Two optional optimizations address that; both are configured on `EngineConfig` / `from_preset()` and can be overridden per call.
+
+
+| Field                      | Default | What it does                                                                                                                                         |
+| -------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `overlap_ic_load`          | `True`  | `prepare()` / `prepare_from_netcdf()` runs IC build on a background thread while the model is built and checkpoint-loaded.                           |
+| `async_export`             | `False` | `rollout_and_export()` pipelines egress-stream GPU to CPU copy and background NetCDF writes (Earth-2 `AsyncZarrBackend` pattern, one file per step). |
+| `export_pool_size`         | `2`     | Thread-pool size for async NetCDF writes.                                                                                                            |
+| `export_max_inflight`      | `None`  | Max queued writes before back-pressure (`pool_size - 1` when unset).                                                                                 |
+| `export_use_egress_stream` | `True`  | Use a dedicated CUDA stream for D2H during async export.                                                                                             |
+| `ic_cache`                 | `False` | Cache the post-processed `Batch` on disk so repeated prepares with the same inputs replay bit-for-bit (see below).                                   |
+| `forward_warmup_iters`     | `2`     | Untimed forward passes after `prepare()` / before first rollout step to compile CuTe kernels (set `0` to disable).                                   |
+
+
+**Per-call overrides.** `engine.prepare(request, overlap=False)` and `engine.rollout_and_export(batch, steps=K, async_export=True)` take precedence over the config for that invocation only.
+
+### CUDA graph status
+
+`EngineConfig.cuda_graph` defaults to `False`. When enabled, `forward_warmup` may call `capture_inference_cuda_graph()` after dummy forwards.
+
+CUDA graph capture is not necessary for Aurora in production. Custom tiers (CuTe window attention and Triton layout/AdaLN) already dominate the old PyTorch path; CUDA graph mainly removes CPU kernel-launch overhead, which is a small fraction of forward time on a warmed `bf16_mixed` run (${\sim}680$ ms/step on $0.25^{\circ}$ and $0.1^{\circ}$ presets). Capture scope is partial under the default `cuda_graph_scope='backbone'`: the encoder and Perceiver decoder still run eagerly every step, and only Swin3D is replayed via `graph.replay()` after a `copy_` into static buffers. Static graph buffers increase allocated VRAM (roughly $400$ to $500$ MiB on a small-grid smoke test; more on full grids). A `full_gpu` capture of encoder, backbone, and decoder in one graph remains experimental, fragile (Python metadata, hooks), and not wired in the engine path.
+
+Use `forward_warmup_iters` for CuTe JIT warmup; treat `cuda_graph` as research-only unless you profile a clear win on your grid and preset.
+
+### IC cache (`ic_cache`)
+
+Optional disk cache for repeat runs on the same initial field. Applies to all presets via `InitialConditionBuilder`. Keys for `from_source(request)` include preset, calendar day, `time_index`, and input file hashes (CDS/GRIB/NetCDF cache layout or `raw_paths`). Keys for `from_netcdf_path(path)` and `prepare_from_netcdf(path)` include preset and user NetCDF content hash.
+
+Cache files live under `{cache_dir}/.ic-cache/` (download workflow) or beside the user NetCDF. Enable when benchmarking or serving the same analysis day repeatedly:
+
+```python
+engine = AuroraEngine.from_preset(
+    "hres_0.1",
+    asset_root="/path/to/assets",
+    ic_cache=True,
+)
+batch = engine.prepare(request)  # cold once, then fast on cache hit
+```
+
+Default is `False` so arbitrary one-off user NetCDF paths do not write multi-GB cache files unless opted in.
+
+### Which presets benefit
+
+Measured on RTX PRO 6000 (`bf16_mixed@fp32`, forward warmup $2$). Forward latency is ${\sim}680$ ms per step on $0.25^{\circ}$ and $0.1^{\circ}$ presets regardless of these flags.
+
+
+| Preset                                                | `overlap_ic_load` | `async_export`                   | Rationale                                                                                                                   |
+| ----------------------------------------------------- | ----------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `hres_0.1`                                            | **On** (default)  | **On** for `K \gtrsim 4`         | IC build (GRIB/regrid) dominates prepare (~2 min); each export step is ~5 s vs ~0.7 s forward. Largest win from both flags. |
+| `era5_pretrained`, `hres_t0_finetuned`, `tc_tracking` | On (default)      | Optional                         | Modest prepare overlap (~4–8 s saved). Export is smaller per step; async helps mainly on longer rollouts.                   |
+| `cams`                                                | On (default)      | Optional for long rollouts       | Medium grid; export cost grows with step count.                                                                             |
+| `wave`                                                | On (default)      | Optional if exporting many steps | Ingress can be heavy when GRIB cache is cold.                                                                               |
+| `small_pretrained`                                    | Off               | Off                              | Fast IC and tiny NetCDF; overhead of threading not worth it.                                                                |
+
+
+Turn overlap off when debugging ingress, profiling serial prepare stages, or when the initial condition is already a pre-built NetCDF and `load()` alone is sufficient. Turn async export off for single-step smoke tests, very short rollouts ($K=1$ or $K=2$), or when debugging export correctness.
+
+#### Recommended service path ($0.1^{\circ}$ example)
+
+```python
+from datetime import datetime
+
+from flash_aurora import AuroraEngine, DataDownloader
+
+engine = AuroraEngine.from_preset(
+    "hres_0.1",
+    asset_root="/path/to/assets",
+    inference_precision="bf16_mixed@fp32",
+    overlap_ic_load=True,
+    async_export=True,
+    export_pool_size=2,
+)
+dl = DataDownloader.from_preset("hres_0.1", asset_root=engine.config.asset_root)
+request = dl.ingest_request(
+    datetime(2022, 5, 11, 6),
+    time_index=1,
+    download=True,
+)
+
+batch = engine.prepare(request, rollout_steps=4)
+paths = list(engine.rollout_and_export(batch, steps=4))
+engine.release_gpu()
+```
+
+#### Debug / baseline settings
+
+```python
+engine = AuroraEngine.from_preset(
+    "era5_pretrained",
+    asset_root="/path/to/assets",
+    overlap_ic_load=False,
+    async_export=False,
+)
+engine.load()
+batch = InitialConditionBuilder(engine.config).from_source(request)
+paths = list(engine.rollout_and_export(batch, steps=4))
+```
+
+**Configuration arguments.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`, `overlap_ic_load`, `async_export`, `export_pool_size`, `export_max_inflight`, `export_use_egress_stream`, `ic_cache`, `forward_warmup_iters`. Inspect registered names with `DEFAULT_PRESETS.names()`.
+
+**Utilities.** `ecmwf_credential_status()` reports ECMWF API readiness before MARS requests; `normalize_user_path()` and `AssetStore` constrain file access to allowed roots under `asset_root`.
+
+## Precision tiers
+
+Precision tiers use the label `backbone@encoder_decoder`, for example `bf16_mixed@fp32`.
 
 **Backbone token (left):** matrix-multiply and window-attention mode for the Swin3D backbone.
 
 
-| Token        | Backbone                                                                                          |
-| ------------ | ------------------------------------------------------------------------------------------------- |
-| `fp32`       | Strict FP32 GEMM; PyTorch scaled dot-product attention (SDPA) unless a higher tier replaces it.   |
-| `tf32`       | TF32 Tensor Core GEMM; CuTe DSL window attention (FP32 I/O).                                      |
+| Token        | Backbone                                                                                        |
+| ------------ | ----------------------------------------------------------------------------------------------- |
+| `fp32`       | Strict FP32 GEMM; PyTorch scaled dot-product attention (SDPA) unless a higher tier replaces it. |
+| `tf32`       | TF32 Tensor Core GEMM; CuTe DSL window attention (FP32 I/O).                                    |
 | `bf16_mixed` | Hybrid BF16 on attention QKV/proj and MLP, TF32 elsewhere; CuTe DSL window attention (BF16).    |
-| `bf16`       | Full backbone BF16 GEMM with fused CuTe DSL attention.                                              |
+| `bf16`       | Full backbone BF16 GEMM with fused CuTe DSL attention.                                          |
 
 
 **Encoder/decoder token (right):** Perceiver GEMM precision, either `fp32` (strict) or `tf32` (Tensor Cores).
 
-Set a tier on the model (`inference_precision=...`) or on `EngineConfig` when using `AuroraEngine`.
+Set a tier with `inference_precision=...` in `AuroraEngine.from_preset()` or on `EngineConfig`.
 
-### Triton fusion on every custom tier
+### Triton fusion
 
-All custom `inference_precision` tiers (`fp32@*`, `tf32@*`, `bf16_mixed@*`, `bf16@*`) enable the same Triton fusion base:
-
-- **Fused window layout** (`use_triton_layout`): roll, pad, partition, and reverse in fused kernels instead of many small eager allocations.
-- **Fused AdaLN and residual** (`use_triton_adaln`): adaptive layer normalization and FiLM modulation fused with the residual add on the Swin hot path.
-
-These kernels run regardless of whether the backbone uses FP32, TF32, or BF16 GEMM. They reduce peak activation memory and improve memory bandwidth relative to the decomposed PyTorch Swin path. CuTe DSL window attention and backbone GEMM precision stack on this Triton base for `tf32` and BF16 tiers. The pure PyTorch reference in benchmarks (`pytorch_backbone_fp32_encoder_decoder_fp32`) disables Triton and CuTe DSL for accuracy baselining only.
+All custom precision tiers (`fp32@`*, `tf32@*`, `bf16_mixed@*`, `bf16@*`) enable the same Triton fusion base. Fused window layout (`use_triton_layout`) rolls, pads, partitions, and reverses in fused kernels instead of many small eager allocations. Fused AdaLN and residual (`use_triton_adaln`) combine adaptive layer normalization and FiLM modulation with the residual add on the Swin hot path. These kernels run regardless of whether the backbone uses FP32, TF32, or BF16 GEMM. They reduce peak activation memory and improve memory bandwidth relative to the decomposed PyTorch Swin path. CuTe DSL window attention and GEMM precision are layered on top of this fusion base. The PyTorch reference (`pytorch_backbone_fp32_encoder_decoder_fp32`) disables Triton and CuTe DSL for accuracy baselines.
 
 `InferenceWorkspacePool` optionally reuses a scratch buffer for the backbone-decoder concat on fixed-shape inference, avoiding repeated large allocations.
 
-## Window attention kernel performance
+## Window attention kernels
 
-Swin window self-attention is the dominant cost in the Aurora backbone. Flash-Aurora replaces PyTorch `scaled_dot_product_attention` on this path with hand-written **CuTe DSL** kernels (`flash_aurora/aurora/ops/cute/`), following the tiled fused multi-head attention (FMHA) structure used in FlashAttention: load $Q$, $K$, $V$ tiles into shared memory, form logits $S = \mathrm{scale}\, Q K^\top$ with warp MMA, apply the Swin mask, run **row-wise online softmax** in FP32 registers, then accumulate $O \leftarrow \mathrm{softmax}(S)\, V$ without materializing the full $N \times N$ attention matrix.
+Swin window self-attention is the dominant cost in the Aurora backbone. Flash-Aurora replaces PyTorch `scaled_dot_product_attention` on this path with CuTe DSL kernels in `flash_aurora/aurora/ops/cute/`. The kernel follows a fused multi-head attention structure: load $Q$, $K$, and $V$ tiles into shared memory, form logits $S = \mathrm{scale} QK^\top$, apply the Swin mask, compute row-wise online softmax in FP32, then accumulate $O \leftarrow \mathrm{softmax}(S)V$ without materializing the full $N \times N$ attention matrix.
 
-**Tensor layout.** Inputs are $(B_{\mathrm{win}}, H, N, D_h)$, where $B_{\mathrm{win}} = B \cdot n_W$ folds batch and window index, $N$ is tokens per window (144 on the default $0.25^{\circ}$ encoder), and $D_h$ is head dimension (64). Shifted-window masks are FP32 additive biases of $-100$ in PyTorch; the CuTe path packs them once to a compact `uint8` mask and applies the equivalent unscaled bias inside the kernel so logits match SDPA.
+**Tensor layout.** Inputs are $(B_{\mathrm{win}}, H, N, D_h)$, where $B_{\mathrm{win}} = B \cdot n_W$ folds batch and window index, $N$ is tokens per window ($144$ on the default $0.25^{\circ}$ encoder), and $D_h$ is the head dimension. Shifted-window masks are FP32 additive biases of $-100$ in PyTorch. The CuTe path packs them once as a compact `uint8` mask and applies the equivalent unscaled bias inside the kernel so logits match SDPA.
 
 **Two precision modes** (`WinAttnPrecision`) trade Tensor Core throughput against fidelity to strict FP32. The model selects the mode from activation dtype at the callsite (`swin3d.WindowAttention`).
 
-| Mode | Activations | $QK^\top$ MMA | Softmax / $PV$ | FP32 fidelity |
-|------|-------------|---------------|----------------|---------------|
-| `TF32_ACC_FP32` | FP32 in/out | TF32 Tensor Cores (`mma.sync…tf32.tf32.f32`) | FP32 online softmax; $P$ cast to BF16 for the $PV$ tile; $V$ may be converted on load | Matches **strict FP32** SDPA within $\sim 10^{-3}$ relative error (kernel tests vs `allow_tf32=False` reference). Used by `tf32@*` tiers. |
-| `BF16_MIXED` | BF16 in/out | BF16 Tensor Cores with **FP32 accumulators** (`mma.sync…bf16.bf16.f32`) | Same FP32 softmax; $PV$ stays in the BF16 MMA path | Matches **BF16 SDPA** within $\sim 2\%$ relative error. End-to-end `bf16_mixed@*` runs attention in BF16 but keeps FP32 activations between Swin blocks so the rest of the backbone stays numerically close to FP32. |
 
-In both modes the numerically sensitive steps—logit scaling, masked softmax normalization, and row sums—stay in **FP32**. Lower precision is confined to the two GEMMs ($QK^\top$ and $PV$), which is the standard mixed-precision recipe for attention: approximate the matmuls, keep the exponential normalization exact. `TF32_ACC_FP32` therefore tracks FP32 SDPA (not cuDNN TF32 SDPA) to about three significant figures; `BF16_MIXED` accepts the larger BF16 matmul error but remains within upstream per-variable drift tolerances on full-model rollouts (see **Precision drift** below).
+| Mode            | Activations | $QK^\top$ MMA                                                           | Softmax / $PV$                                                                        | FP32 fidelity                                                                                                                                                                                                      |
+| --------------- | ----------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TF32_ACC_FP32` | FP32 in/out | TF32 Tensor Cores (`mma.sync…tf32.tf32.f32`)                            | FP32 online softmax; $P$ cast to BF16 for the $PV$ tile; $V$ may be converted on load | Matches **strict FP32** SDPA within $\sim 10^{-3}$ relative error (kernel tests vs `allow_tf32=False` reference). Used by `tf32@`* tiers.                                                                          |
+| `BF16_MIXED`    | BF16 in/out | BF16 Tensor Cores with **FP32 accumulators** (`mma.sync…bf16.bf16.f32`) | Same FP32 softmax; $PV$ stays in the BF16 MMA path                                    | Matches **BF16 SDPA** within $\sim 2$ relative error. End-to-end `bf16_mixed@`* runs attention in BF16 but keeps FP32 activations between Swin blocks so the rest of the backbone stays numerically close to FP32. |
 
-**Kernel variants.** Tile sizes $(tile_m, tile_n)$ are chosen from $N$ and $D_h$ (`_smem_utils.py`). When $tile_n \ge N$ (production $N=144$), the attention fits in a **single KV tile**; the default BF16 kernel uses a 128-thread `cp.async` mainloop. When $tile_n < N$ (coarser downsampled stages), a **TMA stream** kernel double-buffers $K$ and $V$. TF32 uses an analogous tiled loop; on single-pass paths $V$ is cast FP32$\to$BF16 inside the kernel to fuse away a host-side cast. A **QKV-packed** entry point avoids separate $Q$, $K$, $V$ tensors on the fused BF16 attention chain. Kernels JIT-compile per $(D_h, N, \mathrm{has\_bias}, tile)$ via CuTe DSL and are cached for the process.
+
+In both modes, logit scaling, masked softmax normalization, and row sums stay in FP32. Lower precision is confined to the two GEMMs, $QK^\top$ and $PV$. `TF32_ACC_FP32` tracks FP32 SDPA to about three significant figures. `BF16_MIXED` accepts the larger BF16 matmul error but remains within upstream per-variable drift tolerances on full-model rollouts (see Precision drift below).
+
+**Kernel variants.** Tile sizes $(tile_m, tile_n)$ are chosen from $N$ and $D_h$ in `_smem_utils.py`. When $tile_n \ge N$ (production $N = 144$), attention fits in a single KV tile. When $tile_n < N$, the TMA stream kernel double-buffers $K$ and $V$. A QKV-packed entry point avoids separate $Q$, $K$, and $V$ tensors in the fused BF16 attention chain. Kernels JIT-compile per $(D_h, N, \mathrm{hasbias}, \mathrm{tile})$ and are cached for the process.
 
 ### Microbenchmarks
 
@@ -100,154 +515,157 @@ Measured with `benchmark/bench_window_attn.py` on an **NVIDIA RTX PRO 6000 Black
 **Shifted-window mask** (Swin relative position bias $-100$):
 
 
-| Mode           | Stage 1 ($B_{\mathrm{win}}=1800$, $H=8$) | Speedup vs SDPA |
-| -------------- | --------------------------------------- | --------------- |
-| BF16 CuTe DSL  | 0.829 ms vs 1.014 ms                    | 1.22x           |
-| TF32 CuTe DSL  | 1.906 ms vs 3.221 ms                    | 1.69x           |
+| Mode          | Stage 1 ($B_{\mathrm{win}}=1800$, $H=8$) | Speedup vs SDPA |
+| ------------- | ---------------------------------------- | --------------- |
+| BF16 CuTe DSL | 0.829 ms vs 1.014 ms                     | 1.22x           |
+| TF32 CuTe DSL | 1.906 ms vs 3.221 ms                     | 1.69x           |
 
 
 Production inference on the default $0.25^{\circ}$ grid uses $N=144$ windows per stage. BF16 CuTe DSL attention requires at least 32 tokens per window; on coarser downsampled stages with smaller $N$, use `tf32` or PyTorch SDPA.
 
-## End-to-end benchmarks
+## Benchmarks
 
-**Hardware and software:** NVIDIA RTX PRO 6000 Blackwell Server Edition, PyTorch **2.12.1+cu130**, CUDA 13.0, `CUTE_DSL_ARCH=sm_120a`, batch size 1, real cached ingress (no download). Custom tiers include the Triton fusion base (layout and AdaLN). The PyTorch FP32 reference (`pytorch_backbone_fp32_encoder_decoder_fp32`) disables Triton and CuTe DSL. Finetuned presets report `lora_eager` versus `lora_merged`; pretrained presets report a single forward latency (no LoRA).
+Benchmarks were run on NVIDIA RTX PRO 6000 Blackwell Server Edition, PyTorch **2.12.1+cu130**, CUDA 13.0, `CUTE_DSL_ARCH=sm_120a`, batch size 1, and cached ingress. Custom tiers include Triton layout and AdaLN fusion. The PyTorch FP32 reference (`pytorch_backbone_fp32_encoder_decoder_fp32`) disables Triton and CuTe DSL. Finetuned presets report `lora_eager` and `lora_merged`; pretrained presets report forward latency.
 
-The `wave` preset is omitted from every benchmark table. Its ingress requires MARS wave GRIB from the ECMWF archive; personal API accounts typically lack MARS access, so reproducible end-to-end runs are not available in this environment (see `docs/example_wave.ipynb` for manual cache setup).
+The `wave` preset is omitted from benchmark tables. It requires MARS wave GRIB from the ECMWF archive; personal API accounts typically lack MARS access. See `docs/example_wave.ipynb` for manual cache setup.
 
-**Note on `bf16@*`:** excluded from latency tables (no speed win over `bf16_mixed@*`; worse precision drift). See the precision section below.
+`bf16@`* is excluded from latency tables because it does not improve speed over `bf16_mixed@*` and has larger drift.
 
 ### Forward latency (all presets)
 
-Two harness modes are reported side by side.
+Two harness modes are reported.
 
-| Mode | Flag | Use |
-|------|------|-----|
-| Fair speedup | `--isolate-tiers` (default) | Each preset-by-tier pair in a fresh subprocess; use for vs-ref ratios and headline numbers. |
-| Single-process | `--no-isolate-tiers` | All tiers in one process; illustrates how cuDNN autotune warms across tiers and can deflate the PyTorch FP32 reference when it is timed after custom kernels. Custom-tier absolute latency is stable; only vs ref is misleading. |
 
-Both modes use warmup 2 and repeat 5. Speedup vs ref uses `lora_merged` on finetuned presets and forward latency on pretrained presets, each relative to `pytorch_backbone_fp32_encoder_decoder_fp32`. Machine-readable reports: `benchmark/latency_all_isolated.md` (fair) and `benchmark/latency_all_single_process.md` (artifact).
+| Mode           | Flag                        | Use                                                                                                                                                                                                                              |
+| -------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fair speedup   | `--isolate-tiers` (default) | Each preset-by-tier pair in a fresh subprocess; use for vs-ref ratios and headline numbers.                                                                                                                                      |
+| Single-process | `--no-isolate-tiers`        | All tiers in one process; illustrates how cuDNN autotune warms across tiers and can deflate the PyTorch FP32 reference when it is timed after custom kernels. Custom-tier absolute latency is stable; only vs ref is misleading. |
 
-**Single-process reference deflation:** On `era5_pretrained`, the PyTorch FP32 reference is ${\sim}2128$ ms when isolated but ${\sim}1135$ ms when timed after Triton/CuTe DSL tiers in the same process (${\sim}1.9\times$ faster). `bf16_mixed@fp32` remains ${\sim}676$ ms in both runs, so the headline ratio shifts from ${\sim}3.15\times$ to ${\sim}1.68\times$ even though production custom latency is unchanged.
 
-**Finetuned insight:** On finetuned models, custom-precision tier gaps are narrower than the headline pretrained-vs-ref ratio suggests once encoder and decoder time (${\sim}190$ ms on $721 \times 1440$) and backbone copy/cast overhead are included (see `bench_aurora_finetuned_stage_timing.py`). LoRA eager adds a second low-rank GEMM ($1.28\times$--$1.38\times$ eager/merged on weather presets). LoRA merge is orthogonal to precision tier choice. On CAMS, fair isolated `bf16_mixed@*` shows ${\sim}1.31\times$ eager/merged; `lora_merged` (${\sim}571$ ms) is the production end-to-end metric.
+Both modes use warmup $2$ and repeat $5$. Speedup uses `lora_merged` on finetuned presets and forward latency on pretrained presets, each relative to `pytorch_backbone_fp32_encoder_decoder_fp32`. Machine-readable reports are `benchmark/latency_all_isolated.md` and `benchmark/latency_all_single_process.md`.
 
-#### Fair speedup (`--isolate-tiers`)
+**Single-process reference deflation.** On `era5_pretrained`, the PyTorch FP32 reference is ${\sim}2128$ ms when isolated but ${\sim}1135$ ms when timed after Triton/CuTe DSL tiers in the same process. `bf16_mixed@fp32` remains ${\sim}676$ ms in both runs. The speedup ratio changes even though custom latency is unchanged.
+
+**Finetuned models.** On finetuned models, encoder and decoder time plus backbone copy/cast overhead narrow the gap between custom tiers. LoRA eager adds a second low-rank GEMM; LoRA merge is independent of precision tier choice. For CAMS, `lora_merged` with `tf32@`* is the production latency path if strict `pm10` tolerance is required. Otherwise, `bf16_mixed@*` still keeps the balance of precision and speed.
+
+#### Cold-start speedup (`--isolate-tiers`)
 
 Generated 2026-06-23; full tables: `benchmark/latency_all_isolated.md`.
 
 ##### `era5_pretrained` ($721 \times 1440$)
 
 
-| Tier | forward (ms) | vs PyTorch FP32 ref |
-|------|-------------:|--------------------:|
-| `bf16_mixed@fp32` | 676.4 | 3.15x |
-| `bf16_mixed@tf32` | 676.8 | 3.14x |
-| `tf32@fp32` | 1077.5 | 1.98x |
-| `tf32@tf32` | 919.2 | 2.32x |
-| `fp32@fp32` | 1945.0 | 1.09x |
-| PyTorch autocast | 1004.4 | 2.12x |
-| PyTorch FP32 ref | 2128.2 | base |
+| Tier              | forward (ms) | vs PyTorch FP32 ref |
+| ----------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 676.4        | 3.15x               |
+| `bf16_mixed@tf32` | 676.8        | 3.14x               |
+| `tf32@fp32`       | 1077.5       | 1.98x               |
+| `tf32@tf32`       | 919.2        | 2.32x               |
+| `fp32@fp32`       | 1945.0       | 1.09x               |
+| PyTorch autocast  | 1004.4       | 2.12x               |
+| PyTorch FP32 ref  | 2128.2       | base                |
 
 
 ##### `small_pretrained` ($400 \times 800$)
 
 
-| Tier | forward (ms) | vs PyTorch FP32 ref |
-|------|-------------:|--------------------:|
-| `bf16_mixed@fp32` | 42.4 | 2.40x |
-| `bf16_mixed@tf32` | 42.4 | 2.40x |
-| `tf32@fp32` | 64.1 | 1.59x |
-| `tf32@tf32` | 57.3 | 1.78x |
-| `fp32@fp32` | 94.7 | 1.08x |
-| PyTorch autocast | 56.3 | 1.81x |
-| PyTorch FP32 ref | 101.9 | base |
+| Tier              | forward (ms) | vs PyTorch FP32 ref |
+| ----------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 42.4         | 2.40x               |
+| `bf16_mixed@tf32` | 42.4         | 2.40x               |
+| `tf32@fp32`       | 64.1         | 1.59x               |
+| `tf32@tf32`       | 57.3         | 1.78x               |
+| `fp32@fp32`       | 94.7         | 1.08x               |
+| PyTorch autocast  | 56.3         | 1.81x               |
+| PyTorch FP32 ref  | 101.9        | base                |
 
 
 ##### `hres_t0_finetuned` ($721 \times 1440$, LoRA)
 
 
-| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
-|------|----------------:|-----------------:|-------------:|--------------------:|
-| `bf16_mixed@fp32` | 881.7 | 638.7 | 1.38x | 3.23x |
-| `bf16_mixed@tf32` | 881.6 | 638.4 | 1.38x | 3.23x |
-| `tf32@fp32` | 1249.6 | 1006.3 | 1.24x | 2.05x |
-| `tf32@tf32` | 1091.5 | 846.5 | 1.29x | 2.44x |
-| `fp32@fp32` | 2115.5 | 1890.4 | 1.12x | 1.09x |
-| PyTorch autocast | 1104.4 | 967.7 | 1.14x | 2.13x |
-| PyTorch FP32 ref | 2307.9 | 2061.9 | 1.12x | base |
+| Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
+| ----------------- | --------------- | ---------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 881.7           | 638.7            | 1.38x        | 3.23x               |
+| `bf16_mixed@tf32` | 881.6           | 638.4            | 1.38x        | 3.23x               |
+| `tf32@fp32`       | 1249.6          | 1006.3           | 1.24x        | 2.05x               |
+| `tf32@tf32`       | 1091.5          | 846.5            | 1.29x        | 2.44x               |
+| `fp32@fp32`       | 2115.5          | 1890.4           | 1.12x        | 1.09x               |
+| PyTorch autocast  | 1104.4          | 967.7            | 1.14x        | 2.13x               |
+| PyTorch FP32 ref  | 2307.9          | 2061.9           | 1.12x        | base                |
 
 
 ##### `hres_0.1` ($1801 \times 3600$, LoRA)
 
 
-| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
-|------|----------------:|-----------------:|-------------:|--------------------:|
-| `bf16_mixed@fp32` | 898.0 | 672.0 | 1.34x | 2.97x |
-| `bf16_mixed@tf32` | 898.6 | 672.4 | 1.34x | 2.97x |
-| `tf32@fp32` | 1247.7 | 1019.9 | 1.22x | 1.96x |
-| `tf32@tf32` | 1091.1 | 861.3 | 1.27x | 2.32x |
-| `fp32@fp32` | 2051.0 | 1838.0 | 1.12x | 1.09x |
-| PyTorch autocast | 1112.1 | 986.2 | 1.13x | 2.02x |
-| PyTorch FP32 ref | 2227.5 | 1994.6 | 1.12x | base |
+| Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
+| ----------------- | --------------- | ---------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 898.0           | 672.0            | 1.34x        | 2.97x               |
+| `bf16_mixed@tf32` | 898.6           | 672.4            | 1.34x        | 2.97x               |
+| `tf32@fp32`       | 1247.7          | 1019.9           | 1.22x        | 1.96x               |
+| `tf32@tf32`       | 1091.1          | 861.3            | 1.27x        | 2.32x               |
+| `fp32@fp32`       | 2051.0          | 1838.0           | 1.12x        | 1.09x               |
+| PyTorch autocast  | 1112.1          | 986.2            | 1.13x        | 2.02x               |
+| PyTorch FP32 ref  | 2227.5          | 1994.6           | 1.12x        | base                |
 
 
 ##### `cams` ($451 \times 900$, LoRA)
 
 
-| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
-|------|----------------:|-----------------:|-------------:|--------------------:|
-| `bf16_mixed@fp32` | 747.3 | 571.0 | 1.31x | 2.96x |
-| `bf16_mixed@tf32` | 747.5 | 571.9 | 1.31x | 2.96x |
-| `tf32@fp32` | 1096.1 | 916.5 | 1.20x | 1.85x |
-| `tf32@tf32` | 898.1 | 718.3 | 1.25x | 2.35x |
-| `fp32@fp32` | 1734.6 | 1562.3 | 1.11x | 1.08x |
-| PyTorch autocast | 985.7 | 888.6 | 1.11x | 1.90x |
-| PyTorch FP32 ref | 1874.5 | 1691.6 | 1.11x | base |
+| Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
+| ----------------- | --------------- | ---------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 747.3           | 571.0            | 1.31x        | 2.96x               |
+| `bf16_mixed@tf32` | 747.5           | 571.9            | 1.31x        | 2.96x               |
+| `tf32@fp32`       | 1096.1          | 916.5            | 1.20x        | 1.85x               |
+| `tf32@tf32`       | 898.1           | 718.3            | 1.25x        | 2.35x               |
+| `fp32@fp32`       | 1734.6          | 1562.3           | 1.11x        | 1.08x               |
+| PyTorch autocast  | 985.7           | 888.6            | 1.11x        | 1.90x               |
+| PyTorch FP32 ref  | 1874.5          | 1691.6           | 1.11x        | base                |
 
 
 ##### `tc_tracking` ($721 \times 1440$, LoRA)
 
 
-| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
-|------|----------------:|-----------------:|-------------:|--------------------:|
-| `bf16_mixed@fp32` | 881.7 | 638.5 | 1.38x | 3.23x |
-| `bf16_mixed@tf32` | 881.7 | 638.3 | 1.38x | 3.23x |
-| `tf32@fp32` | 1249.6 | 1006.1 | 1.24x | 2.05x |
-| `tf32@tf32` | 1092.0 | 847.0 | 1.29x | 2.43x |
-| `fp32@fp32` | 2115.1 | 1890.9 | 1.12x | 1.09x |
-| PyTorch autocast | 1104.2 | 967.4 | 1.14x | 2.13x |
-| PyTorch FP32 ref | 2307.9 | 2059.9 | 1.12x | base |
+| Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
+| ----------------- | --------------- | ---------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 881.7           | 638.5            | 1.38x        | 3.23x               |
+| `bf16_mixed@tf32` | 881.7           | 638.3            | 1.38x        | 3.23x               |
+| `tf32@fp32`       | 1249.6          | 1006.1           | 1.24x        | 2.05x               |
+| `tf32@tf32`       | 1092.0          | 847.0            | 1.29x        | 2.43x               |
+| `fp32@fp32`       | 2115.1          | 1890.9           | 1.12x        | 1.09x               |
+| PyTorch autocast  | 1104.2          | 967.4            | 1.14x        | 2.13x               |
+| PyTorch FP32 ref  | 2307.9          | 2059.9           | 1.12x        | base                |
 
-#### Single-process artifact (`--no-isolate-tiers`)
 
-Custom tiers run first in one process; the PyTorch FP32 reference is timed last, so cuDNN state from Triton/CuTe DSL is already warm. Custom-tier absolute latency matches the isolated run; vs ref is understated.
+#### Non-isolated benchmarking artifact (`--no-isolate-tiers`)
+
+Custom tiers run first in one cold-start and the PyTorch FP32 reference is timed last. cuDNN state from earlier tiers is already warm, so vs-ref speedup is understated. Custom-tier absolute latency matches the isolated run.
 
 ##### `era5_pretrained` ($721 \times 1440$)
 
 
-| Tier | forward (ms) | vs PyTorch FP32 ref |
-|------|-------------:|--------------------:|
-| `bf16_mixed@fp32` | 676.7 | 1.68x |
-| `bf16_mixed@tf32` | 677.1 | 1.68x |
-| `tf32@fp32` | 920.7 | 1.23x |
-| `tf32@tf32` | 921.3 | 1.23x |
-| `fp32@fp32` | 944.9 | 1.20x |
-| PyTorch autocast | 846.5 | 1.34x |
-| PyTorch FP32 ref | 1135.5 | base |
+| Tier              | forward (ms) | vs PyTorch FP32 ref |
+| ----------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 676.7        | 1.68x               |
+| `bf16_mixed@tf32` | 677.1        | 1.68x               |
+| `tf32@fp32`       | 920.7        | 1.23x               |
+| `tf32@tf32`       | 921.3        | 1.23x               |
+| `fp32@fp32`       | 944.9        | 1.20x               |
+| PyTorch autocast  | 846.5        | 1.34x               |
+| PyTorch FP32 ref  | 1135.5       | base                |
 
 
 ##### `small_pretrained` ($400 \times 800$)
 
 
-| Tier | forward (ms) | vs PyTorch FP32 ref |
-|------|-------------:|--------------------:|
-| `bf16_mixed@fp32` | 41.9 | 1.59x |
-| `bf16_mixed@tf32` | 41.8 | 1.59x |
-| `tf32@fp32` | 57.7 | 1.15x |
-| `tf32@tf32` | 57.1 | 1.17x |
-| `fp32@fp32` | 59.6 | 1.12x |
-| PyTorch autocast | 49.5 | 1.34x |
-| PyTorch FP32 ref | 66.5 | base |
+| Tier              | forward (ms) | vs PyTorch FP32 ref |
+| ----------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 41.9         | 1.59x               |
+| `bf16_mixed@tf32` | 41.8         | 1.59x               |
+| `tf32@fp32`       | 57.7         | 1.15x               |
+| `tf32@tf32`       | 57.1         | 1.17x               |
+| `fp32@fp32`       | 59.6         | 1.12x               |
+| PyTorch autocast  | 49.5         | 1.34x               |
+| PyTorch FP32 ref  | 66.5         | base                |
 
 
 ##### `hres_t0_finetuned` ($721 \times 1440$, LoRA)
@@ -283,16 +701,14 @@ Custom tiers run first in one process; the PyTorch FP32 reference is timed last,
 
 | Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
 | ----------------- | --------------- | ---------------- | ------------ | ------------------- |
-| `bf16_mixed@fp32` | 747.4 | 571.4 | 1.31x | 1.53x |
-| `bf16_mixed@tf32` | 747.6 | 571.2 | 1.31x | 1.53x |
-| `tf32@fp32` | 897.9 | 719.0 | 1.25x | 1.22x |
-| `tf32@tf32` | 898.0 | 719.8 | 1.25x | 1.21x |
-| `fp32@fp32` | 915.3 | 738.8 | 1.24x | 1.18x |
-| PyTorch autocast | 788.0 | 690.4 | 1.14x | 1.27x |
-| PyTorch FP32 ref | 1054.5 | 874.5 | 1.21x | base |
+| `bf16_mixed@fp32` | 747.4           | 571.4            | 1.31x        | 1.53x               |
+| `bf16_mixed@tf32` | 747.6           | 571.2            | 1.31x        | 1.53x               |
+| `tf32@fp32`       | 897.9           | 719.0            | 1.25x        | 1.22x               |
+| `tf32@tf32`       | 898.0           | 719.8            | 1.25x        | 1.21x               |
+| `fp32@fp32`       | 915.3           | 738.8            | 1.24x        | 1.18x               |
+| PyTorch autocast  | 788.0           | 690.4            | 1.14x        | 1.27x               |
+| PyTorch FP32 ref  | 1054.5          | 874.5            | 1.21x        | base                |
 
-
-On CAMS in single-process mode, the PyTorch FP32 reference merged latency (${\sim}875$ ms) is still deflated relative to fair isolated (${\sim}1692$ ms), so vs-ref speedup (${\sim}1.53\times$) understates the fair ratio (${\sim}2.96\times$). Custom-tier absolute ms matches the isolated run.
 
 ##### `tc_tracking` ($721 \times 1440$, LoRA)
 
@@ -308,7 +724,7 @@ On CAMS in single-process mode, the PyTorch FP32 reference merged latency (${\si
 | PyTorch FP32 ref  | 1308.5          | 1059.3           | 1.24x        | base                |
 
 
-Recommended production tiers: `bf16_mixed@fp32` or `bf16_mixed@tf32` for weather presets (always `lora_merged`); on CAMS use `lora_merged` with `bf16_mixed@*` for speed, or `tf32@fp32` if strict `pm10` tolerance is required (see precision tables).
+Recommended production tiers are `bf16_mixed@fp32` or `bf16_mixed@tf32` for weather presets with `lora_merged`. For CAMS, use `lora_merged` with `bf16_mixed@*` for speed, or `tf32@fp32` when strict `pm10` tolerance is required.
 
 ### Official per-variable tolerances
 
@@ -420,9 +836,9 @@ All tiers pass on every variable.
 | PyTorch autocast  | 6.99e-05 | 4.25e-03 | 4.14e-03 | 1.63e-05 | 4.03e-03 | **5.23e-03** | **6.23e-03** | 3.92e-04 | 8.51e-04 | 1.14e-03 | 1.71e-04 | 4.70e-03 | 3.09e-05 | 1.69e-03 | 2.78e-03 | 9.99e-04 | 1.45e-05 | 5.05e-04 | 8.76e-06 | 2.99e-05 | 3.90e-04 | 5.28e-05 |
 
 
-On CAMS, `bf16_mixed@*` exceeds $\tau_{\mathrm{pm10}} = 5\times10^{-3}$ by about 4% (meteorological channels remain within tolerance). `tf32@*` and `fp32@fp32` pass all 22 variables.
+On CAMS, `bf16_mixed@`* exceeds $\tau_{\mathrm{pm10}} = 5\times10^{-3}$ by about 4% (meteorological channels remain within tolerance). `tf32@*` and `fp32@fp32` pass all 22 variables.
 
-**Excluded tier `bf16@fp32` (not recommended):** on CAMS, $\bar{e}_{\mathrm{pm2p5}} = 5.32\times10^{-3}$ and $\bar{e}_{\mathrm{pm10}} = 6.35\times10^{-3}$; on `era5_pretrained`, $\bar{e}_{10u} = 1.53\times10^{-3}$ and $\bar{e}_v = 1.96\times10^{-3}$ (within $\tau$ but $2$--$3\times$ higher than `bf16_mixed@fp32`). Latency matches `bf16_mixed@*` on pretrained ERA5 (680.5 ms vs 681.9 ms) and offers no benefit.
+**Excluded tier `bf16@fp32` (not recommended):** on CAMS, $\bar{e}*{\mathrm{pm2p5}} = 5.32\times10^{-3}$ and $\bar{e}*{\mathrm{pm10}} = 6.35\times10^{-3}$; on `era5_pretrained`, $\bar{e}_{10u} = 1.53\times10^{-3}$ and $\bar{e}_v = 1.96\times10^{-3}$ (within $\tau$ but $2$--$3\times$ higher than `bf16_mixed@fp32`). Latency matches `bf16_mixed@`* on pretrained ERA5 (680.5 ms vs 681.9 ms) and offers no benefit.
 
 ### Reproducing the benchmarks
 
@@ -474,355 +890,6 @@ CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_finetuned_stage_timin
 ```
 
 Legacy single-preset timing: `benchmark/bench_aurora_pretrained.py` (subset of `bench_aurora_latency_all.py` for `era5_pretrained` only).
-
-## Engine (`flash_aurora.engine`)
-
-`flash_aurora.engine` is the inference service layer. It binds Aurora variants, upstream data profiles, checkpoint resolution, batch validation, multi-step rollout, and NetCDF export behind a preset-driven API. Tutorial notebooks under `docs/example_*.ipynb` exercise each preset in process. For out-of-process deployment, see `docs/example_scheduler.py` and **Forecast scheduler (ZMQ)** below.
-
-### Architecture
-
-The engine has four layers. Data flows from download and adapters into a validated `Batch`, through the loaded model, and optionally to disk as forecast NetCDF.
-
-
-| Layer   | Path              | Role                                                                                           |
-| ------- | ----------------- | ---------------------------------------------------------------------------------------------- |
-| Core    | `engine/core/`    | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`.           |
-| Ingress | `engine/ingress/` | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, static fields. |
-| Egress  | `engine/egress/`  | `RolloutExporter`, CPU offload, step-wise NetCDF naming.                                       |
-| Runtime | `engine/runtime/` | CUDA Graph warmup (`GraphPool`), cross-process `GpuGuard`, VRAM budget estimates.              |
-
-
-A preset pairs a `ModelVariantSpec` (checkpoint, variable lists, grid shape $H \times W$, timestep $\Delta t$) with a `SourceProfile` (schema, latitude convention, cache layout). `DataDownloader.ensure()` fills the preset cache. `InitialConditionBuilder` reads cached files or adapter requests and attaches Hugging Face static fields. `BatchValidator` checks tensor shapes and variable names against the variant. `AuroraEngine.load()` resolves checkpoints, applies `inference_precision`, and optionally acquires a `GpuGuard` lease from estimated VRAM. `predict()` runs one forward step; `rollout_stream()` chains $K$ steps with model-internal history, advancing valid time by $\Delta t$ per step. `rollout_and_export()` writes CPU-side NetCDF under `export_dir`.
-
-### Presets and data sources
-
-
-| Preset              | Model                 | Grid $H \times W$   | Source                   | Download backend       |
-| ------------------- | --------------------- | ------------------- | ------------------------ | ---------------------- |
-| `era5_pretrained`   | AuroraPretrained      | $721 \times 1440$   | CDS ERA5                 | CDS                    |
-| `hres_t0_finetuned` | Aurora (LoRA)         | $721 \times 1440$   | WeatherBench2 HRES       | WB2 + ERA5 static      |
-| `small_pretrained`  | AuroraSmallPretrained | $400 \times 800$    | CDS ERA5                 | CDS                    |
-| `hres_0.1`          | AuroraHighRes         | $1801 \times 3600$  | IFS GRIB analysis        | ECMWF Open Data / GRIB |
-| `cams`              | AuroraAirPollution    | $451 \times 900$    | CAMS reanalysis          | ADS                    |
-| `wave`              | AuroraWave            | $721 \times 1440$   | WB2 met + MARS wave GRIB | WB2 + MARS             |
-| `tc_tracking`       | Aurora (LoRA)         | $721 \times 1440$   | WeatherBench2 HRES       | WB2 + ERA5 static      |
-
-
-Personal ECMWF accounts typically lack MARS archive access. For `wave`, set direction of `{day}-wave.grib` under the cache manually or use an institutional MARS credential; see `docs/example_wave.ipynb`.
-
-### Capabilities
-
-- **Checkpoint and static assets.** Local `asset_root` with optional Hugging Face Hub download (`allow_hub_download`, mirror via `HF_MIRROR_ENDPOINT`).
-- **Precision wiring.** `EngineConfig.inference_precision` selects the Triton fusion base and, when set, TF32/BF16 GEMM and CuTe DSL window attention (see above).
-- **Automated ingress.** CDS (ERA5), ADS (CAMS), WeatherBench2 (HRES met), ECMWF Open Data (0.1-degree GRIB), and MARS (wave GRIB when permitted). Credentials merge from environment variables, `~/.cdsapirc`, `~/.ecmwfapirc`, and optional constructor kwargs.
-- **Multi-step rollout.** `rollout_stream(batch, K)` and `run_from_netcdf(..., steps=K)`; optional `RolloutObserver` hooks per step.
-- **NetCDF export.** `rollout_and_export()` writes forecast steps to `export_dir`. Optional async pipeline (Earth-2 style) overlaps GPU to CPU offload and disk writes with the next forward step.
-- **Prepare overlap.** `prepare()` can build initial conditions on a CPU worker thread while the model loads on the main thread.
-- **CUDA graph (experimental, off by default).** Optional backbone-only capture via `engine.config.cuda_graph=True`. Not recommended for production: CuTe/Triton paths are already fast, capture covers only the Swin backbone (encoder/decoder stay eager), and static buffers add VRAM. See **CUDA graph status** below.
-- **GPU scheduling.** `GpuGuard` (default on) estimates VRAM from variant, precision tier, and rollout depth; large jobs queue when memory is saturated. Disable with `gpu_guard=False` or `FLASH_AURORA_GPU_GUARD=0`.
-
-### Forecast scheduler (ZMQ)
-
-`flash_aurora.scheduler` wraps the same `AuroraEngine` and `DataDownloader` in a long-lived **forecast worker** that owns one GPU and one preset. Clients send JSON commands over ZeroMQ and receive a stream of job events. Use this path when inference should run outside a notebook kernel, when several callers share one GPU slot, or when a script must release VRAM on exit.
-
-**Processing model.** The worker binds a command socket (PULL) and an event socket (PUSH). Default TCP addresses are `tcp://127.0.0.1:9755` (commands) and `tcp://127.0.0.1:9756` (events). Jobs are handled **sequentially**: only one rollout executes at a time, and further submissions wait in the socket buffer until the current job finishes. Each `ForecastRequest.preset` must match the worker preset exactly.
-
-**Event protocol.** A successful forecast emits `accepted`, `preparing`, `running`, one `step` event per rollout step, then `completed`. With `output_mode="export_paths"` (default), each `step` carries an `export_path`. With `output_mode="metadata_only"`, each `step` carries a `valid_time` and no NetCDF is written. Failures emit `failed` with an error string.
-
-**Tutorial script.** `docs/example_scheduler.py` starts a worker subprocess, runs a health check, submits an export job and a metadata-only job, then shuts the worker down. Prerequisite: checkpoint and ERA5 cache under an absolute `AURORA_ASSET_ROOT` (populate via `docs/example_era5.ipynb` or an explicit path). The demo sets `download=False` and reads cached ingress only.
-
-```bash
-export AURORA_ASSET_ROOT=/path/to/data/aurora
-uv run python docs/example_scheduler.py
-```
-
-To attach to a worker you started separately, pass `--client-only` and the same `--command-addr` / `--event-addr`.
-
-**Persistent worker.** For a service that stays up across many clients, start the worker in its own terminal:
-
-```bash
-export AURORA_ASSET_ROOT=/path/to/data/aurora
-
-uv run python -m flash_aurora.scheduler \
-  --preset era5_pretrained \
-  --asset-root "$AURORA_ASSET_ROOT" \
-  --inference-precision bf16_mixed@fp32 \
-  --command-addr tcp://127.0.0.1:9755 \
-  --event-addr tcp://127.0.0.1:9756
-```
-
-Point `ForecastClientConfig` at the same addresses. Send `shutdown` through the client (or SIGINT to the worker process) when tearing down the service.
-
-**Client sketch.**
-
-```python
-from flash_aurora.scheduler import ForecastClient, ForecastClientConfig, ForecastRequest
-
-client = ForecastClient(
-    ForecastClientConfig(
-        command_addr="tcp://127.0.0.1:9755",
-        event_addr="tcp://127.0.0.1:9756",
-    )
-)
-for event in client.forecast(
-    ForecastRequest(
-        request_id="job-1",
-        preset="era5_pretrained",
-        steps=4,
-        valid_time="2023-01-01T06:00:00",
-        time_index=1,
-        download=False,
-        export_dir="/path/to/output",
-    )
-):
-    print(event.kind, event.export_path or event.valid_time or "")
-
-client.shutdown_worker()  # stop a worker this client owns
-client.close()
-```
-
-For incremental progress UI, call `client.submit(request)` and iterate `client.events(request.request_id)` instead of the blocking `forecast()` helper.
-
-
-| Module | Role |
-| ------ | ---- |
-| `scheduler/worker.py` | `ForecastWorker`, CLI entry (`python -m flash_aurora.scheduler`). |
-| `scheduler/client.py` | `ForecastClient` command submission and event streaming. |
-| `scheduler/protocol.py` | JSON wire types (`ForecastRequest`, `ForecastEvent`, `ForecastCommand`). |
-
-Unit tests live under `tests/scheduler/`. Integration tests require a GPU and cached assets (`pytest tests/scheduler/ -m "not integration and not gpu"` for protocol and mock worker tests).
-
-### Core API
-
-**Engine lifecycle.**
-
-```python
-from datetime import datetime
-from pathlib import Path
-
-from flash_aurora import AuroraEngine, DataDownloader
-
-# 1. Create engine (checkpoint loads on first prepare)
-engine = AuroraEngine.from_preset(
-    "era5_pretrained",  # preset: era5_pretrained, hres_0.1, cams, ...
-    asset_root=Path("/path/to/assets"),  # local root for checkpoints and downloads
-    checkpoint_path=None,  # explicit checkpoint file; preset default when None
-    allow_hub_download=True,  # fetch checkpoint from Hugging Face when missing locally
-    hf_endpoint=None,  # Hugging Face API base URL
-    hf_mirror=False,  # True uses built-in HF mirror endpoint
-    hf_revision=None,  # Hugging Face revision or tag
-    hf_token=None,  # token for private or gated models
-    export_dir=None,  # default NetCDF export directory for rollout_and_export
-    inference_precision="bf16_mixed@fp32",  # tier label backbone@encoder_decoder
-    overlap_ic_load=True,  # default: IC build overlaps model load on first prepare
-    async_export=False,  # async NetCDF writes in rollout_and_export
-    export_pool_size=2,  # thread pool size when async_export is True
-    export_max_inflight=None,  # max queued async exports; default pool_size - 1
-    export_use_egress_stream=True,  # dedicated CUDA stream for async export D2H
-    ic_cache=False,  # disk cache for repeated same-day IC builds
-    forward_warmup_iters=2,  # untimed forwards after prepare; 0 disables
-    presets=None,  # optional custom PresetRegistry
-)
-# EngineConfig-only (set after from_preset):
-engine.config.cuda_graph = False  # experimental; default off (low ROI, see CUDA graph status)
-engine.config.device = "cuda:0"  # inference device
-engine.config.gpu_guard = True  # queue large jobs when VRAM is saturated
-engine.config.gpu_guard_timeout = 3600.0  # seconds to wait for GPU slot
-engine.config.gpu_rollout_steps = 1  # rollout depth used for VRAM estimate
-
-# 2. Downloader (ensure runs only when cache files are missing)
-downloader = DataDownloader.from_preset(
-    "era5_pretrained",  # must match engine preset
-    asset_root=engine.config.asset_root,
-    user_cwd=None,  # base for relative paths; current working directory when None
-    presets=None,  # optional custom PresetRegistry
-    credentials=None,  # optional DownloadCredentials bundle
-    cds_api_key=None,  # CDS API key for ERA5
-    cds_api_url=None,  # CDS API URL
-    ads_api_key=None,  # ADS API key for CAMS
-    ads_api_url=None,  # ADS API URL
-    ecmwf_api_key=None,  # ECMWF Open Data key for HRES
-    ecmwf_api_url=None,  # ECMWF Open Data URL
-    ecmwf_email=None,  # ECMWF account email for HRES
-    workers=None,  # parallel download workers; preset default when None
-)
-
-# 3. Build ingest request (download=True calls ensure when cache is missing)
-request = downloader.ingest_request(
-    datetime(2023, 1, 1, 6),  # any valid UTC time for the initial condition
-    cache_dir=None,  # override cache directory; preset layout when None
-    time_index=1,  # 0..3 for 00/06/12/18 UTC cycle
-    download=True,  # False skips auto-download even if cache is missing
-    credentials=None,  # optional per-call credential override
-    cds_api_key=None,
-    cds_api_url=None,
-    ads_api_key=None,
-    ads_api_url=None,
-    ecmwf_api_key=None,
-    ecmwf_api_url=None,
-    ecmwf_email=None,
-    prompt=False,  # prompt for credentials when missing
-    workers=None,  # parallel download workers for this ensure call
-)
-
-# 4. Prepare IC batch on CPU, load model, run forward warmup
-batch = engine.prepare(
-    request,
-    rollout_steps=4,  # rollout depth for GPU guard VRAM estimate
-    overlap=None,  # None uses engine.config.overlap_ic_load; True or False to override
-)
-
-# 5. Autoregressive rollout
-forecasts = list(
-    engine.rollout_stream(
-        batch,
-        steps=4,  # number of 6-hour lead steps
-        observers=None,  # optional RolloutObserver hooks per step
-    )
-)
-
-# 6. Optional NetCDF export
-# paths = list(
-#     engine.rollout_and_export(
-#         batch,
-#         steps=4,
-#         export_dir=None,  # None uses engine.config.export_dir
-#         async_export=None,  # None uses engine.config.async_export
-#     )
-# )
-
-# 7. Release GPU reservation and optionally move model to CPU
-engine.release_gpu(move_model_to_cpu=True)
-```
-
-**Download and ingest.**
-
-```python
-from datetime import datetime
-from flash_aurora import AuroraEngine, DataDownloader
-from flash_aurora.engine import InitialConditionBuilder
-
-engine = AuroraEngine.from_preset("era5_pretrained", asset_root="/path/to/assets")
-dl = DataDownloader.from_preset("era5_pretrained", asset_root="/path/to/assets")
-dl.ensure(valid_time=datetime(2023, 1, 1, 6))
-
-request = dl.ingest_request(datetime(2023, 1, 1, 6), time_index=1, download=False)
-batch = InitialConditionBuilder(engine.config).from_source(request)
-forecasts = list(engine.rollout_stream(batch, steps=4))
-paths = list(engine.rollout_and_export(batch, steps=4))
-```
-
-### Lifecycle optimizations
-
-Cold-start time is usually dominated by **CPU ingress** (`build_ic`), **model init** (`build_model` / CuTe JIT), and **NetCDF export**—not GPU forward. Two optional optimizations address that; both are configured on `EngineConfig` / `from_preset()` and can be overridden per call.
-
-| Field | Default | What it does |
-|-------|---------|--------------|
-| `overlap_ic_load` | `True` | `prepare()` / `prepare_from_netcdf()` runs IC build on a background thread while the model is built and checkpoint-loaded. |
-| `async_export` | `False` | `rollout_and_export()` pipelines egress-stream GPU to CPU copy and background NetCDF writes (Earth-2 `AsyncZarrBackend` pattern, one file per step). |
-| `export_pool_size` | `2` | Thread-pool size for async NetCDF writes. |
-| `export_max_inflight` | `None` | Max queued writes before back-pressure (`pool_size - 1` when unset). |
-| `export_use_egress_stream` | `True` | Use a dedicated CUDA stream for D2H during async export. |
-| `ic_cache` | `False` | Cache the post-processed `Batch` on disk so repeated prepares with the same inputs replay bit-for-bit (see below). |
-| `forward_warmup_iters` | `2` | Untimed forward passes after `prepare()` / before first rollout step to compile CuTe kernels (set `0` to disable). |
-
-**Per-call overrides:** `engine.prepare(request, overlap=False)` and `engine.rollout_and_export(batch, steps=K, async_export=True)` take precedence over the config for that invocation only.
-
-### CUDA graph status
-
-`EngineConfig.cuda_graph` defaults to `False`. When enabled, `forward_warmup` may call `capture_inference_cuda_graph()` after dummy forwards.
-
-**Not necessary for Aurora**
-
-1. **Compute is already fast.** Custom tiers (CuTe window attention + Triton layout/AdaLN) dominate the old PyTorch path. CUDA graph mainly removes CPU kernel-launch overhead; on a warmed `bf16_mixed` run that is a small fraction of forward time (~680 ms/step on 0.25° and 0.1° presets).
-2. **Capture scope is partial.** Default `cuda_graph_scope='backbone'`: encoder and Perceiver decoder still run eagerly every step. Only Swin3D is replayed via `graph.replay()`, after a `copy_` into static buffers.
-3. **Memory cost.** Static graph buffers increase allocated VRAM (roughly +400–500 MiB on a small-grid smoke test; more on full grids).
-4. **`full_gpu` is experimental.** Capturing encoder + backbone + decoder in one graph is fragile (Python metadata, hooks) and not wired in the engine path.
-
-**When it might help later:** micro-batched or launch-bound deployments where forward is already sub-100 ms and every microsecond counts. That requires a fuller graph (or wider scope), finetuned rollout-step handling, and engine-level benchmarks on production presets—not the current backbone-only prototype.
-
-Use `forward_warmup_iters` for CuTe JIT warmup; treat `cuda_graph` as research-only unless you profile a clear win on your grid and preset.
-
-### IC cache (`ic_cache`)
-
-Optional disk cache for **repeat runs on the same initial field**. Applies to all presets via `InitialConditionBuilder`:
-
-- `from_source(request)` — keyed by preset, calendar day, `time_index`, and input file hashes (CDS/GRIB/NetCDF cache layout or `raw_paths`).
-- `from_netcdf_path(path)` / `prepare_from_netcdf(path)` — keyed by preset and user NetCDF content hash.
-
-Cache files live under `{cache_dir}/.ic-cache/` (download workflow) or beside the user NetCDF. Enable when benchmarking or serving the same analysis day repeatedly:
-
-```python
-engine = AuroraEngine.from_preset(
-    "hres_0.1",
-    asset_root="/path/to/assets",
-    ic_cache=True,
-)
-batch = engine.prepare(request)  # cold once, then fast on cache hit
-```
-
-Default is `False` so arbitrary one-off user NetCDF paths do not write multi-GB cache files unless opted in.
-
-**Which presets benefit**
-
-Measured on RTX PRO 6000 (`bf16_mixed@fp32`, forward warmup 2). Forward/step is ~680 ms on 0.25° and 0.1° presets regardless of these flags.
-
-| Preset | `overlap_ic_load` | `async_export` | Rationale |
-|--------|-------------------|----------------|-----------|
-| `hres_0.1` | **On** (default) | **On** for `K \gtrsim 4` | IC build (GRIB/regrid) dominates prepare (~2 min); each export step is ~5 s vs ~0.7 s forward. Largest win from both flags. |
-| `era5_pretrained`, `hres_t0_finetuned`, `tc_tracking` | On (default) | Optional | Modest prepare overlap (~4–8 s saved). Export is smaller per step; async helps mainly on longer rollouts. |
-| `cams` | On (default) | Optional for long rollouts | Medium grid; export cost grows with step count. |
-| `wave` | On (default) | Optional if exporting many steps | Ingress can be heavy when GRIB cache is cold. |
-| `small_pretrained` | Off | Off | Fast IC and tiny NetCDF; overhead of threading not worth it. |
-
-**When to turn overlap off:** debugging ingress, profiling serial prepare stages, or when IC is already a pre-built NetCDF and `load()` alone is enough.
-
-**When to turn async export off:** single-step smoke tests, very short rollouts (`K=1–2`), or debugging export correctness.
-
-**Recommended service path (0.1° example)**
-
-```python
-from datetime import datetime
-
-from flash_aurora import AuroraEngine, DataDownloader
-
-engine = AuroraEngine.from_preset(
-    "hres_0.1",
-    asset_root="/path/to/assets",
-    inference_precision="bf16_mixed@fp32",
-    overlap_ic_load=True,
-    async_export=True,
-    export_pool_size=2,
-)
-dl = DataDownloader.from_preset("hres_0.1", asset_root=engine.config.asset_root)
-request = dl.ingest_request(
-    datetime(2022, 5, 11, 6),
-    time_index=1,
-    download=True,
-)
-
-batch = engine.prepare(request, rollout_steps=4)
-paths = list(engine.rollout_and_export(batch, steps=4))
-engine.release_gpu()
-```
-
-**Serial fallback (debug / baseline)**
-
-```python
-engine = AuroraEngine.from_preset(
-    "era5_pretrained",
-    asset_root="/path/to/assets",
-    overlap_ic_load=False,
-    async_export=False,
-)
-engine.load()
-batch = InitialConditionBuilder(engine.config).from_source(request)
-paths = list(engine.rollout_and_export(batch, steps=4))
-```
-
-**Configuration surface.** Key fields on `EngineConfig`: `variant`, `source`, `asset_root`, `checkpoint_path`, `inference_precision`, `cuda_graph`, `device`, `export_dir`, `allow_hub_download`, `gpu_guard`, `gpu_rollout_steps`, `overlap_ic_load`, `async_export`, `export_pool_size`, `export_max_inflight`, `export_use_egress_stream`, `ic_cache`, `forward_warmup_iters`. Inspect registered names with `DEFAULT_PRESETS.names()`.
-
-**Utilities.** `ecmwf_credential_status()` reports ECMWF API readiness before MARS requests; `normalize_user_path()` and `AssetStore` constrain file access to allowed roots under `asset_root`.
 
 ## Testing notes
 
