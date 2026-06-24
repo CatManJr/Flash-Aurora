@@ -32,22 +32,15 @@ dependencies = [
     "gcsfs>=2026.6.0",
     "ecmwf-api-client>=1.7.0",
     "pyzmq>=26.0.0",
+    "cfgrib",
+    "eccodes",
+    "ipykernel>=7.3.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.2",
-    "ipykernel>=7.3.0",
     "ipywidgets>=8.1.0",
-]
-download = [
-    "gcsfs",
-    "zarr",
-    "ecmwf-api-client",
-]
-grib = [
-    "cfgrib",
-    "eccodes",
 ]
 
 [tool.hatch.build.targets.wheel]

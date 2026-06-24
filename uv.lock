@@ -626,10 +626,13 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cdsapi" },
+    { name = "cfgrib" },
+    { name = "eccodes" },
     { name = "ecmwf-api-client" },
     { name = "einops" },
     { name = "gcsfs" },
     { name = "huggingface-hub" },
+    { name = "ipykernel" },
     { name = "matplotlib" },
     { name = "netcdf4" },
     { name = "numpy" },
@@ -651,32 +654,20 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "ipykernel" },
     { name = "ipywidgets" },
     { name = "pytest" },
-]
-download = [
-    { name = "ecmwf-api-client" },
-    { name = "gcsfs" },
-    { name = "zarr" },
-]
-grib = [
-    { name = "cfgrib" },
-    { name = "eccodes" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "cdsapi" },
-    { name = "cfgrib", marker = "extra == 'grib'" },
-    { name = "eccodes", marker = "extra == 'grib'" },
+    { name = "cfgrib" },
+    { name = "eccodes" },
     { name = "ecmwf-api-client", specifier = ">=1.7.0" },
-    { name = "ecmwf-api-client", marker = "extra == 'download'" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "gcsfs", specifier = ">=2026.6.0" },
-    { name = "gcsfs", marker = "extra == 'download'" },
     { name = "huggingface-hub", specifier = ">=1.8.0" },
-    { name = "ipykernel", marker = "extra == 'dev'", specifier = ">=7.3.0" },
+    { name = "ipykernel", specifier = ">=7.3.0" },
     { name = "ipywidgets", marker = "extra == 'dev'", specifier = ">=8.1.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "netcdf4" },
@@ -695,9 +686,8 @@ requires-dist = [
     { name = "triton", specifier = ">=3.6.0" },
     { name = "xarray" },
     { name = "zarr", specifier = ">=3.2.1" },
-    { name = "zarr", marker = "extra == 'download'" },
 ]
-provides-extras = ["dev", "download", "grib"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "fonttools"
