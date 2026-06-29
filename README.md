@@ -842,23 +842,36 @@ On CAMS, `bf16_mixed@`* exceeds $\tau_{\mathrm{pm10}} = 5\times10^{-3}$ by about
 
 ### Reproducing the benchmarks
 
-All commands assume PyTorch **2.12.1** from `uv.lock`, CUDA 13.0, and `CUTE_DSL_ARCH=sm_120a` on Blackwell. Populate `asset_root` with checkpoints and cached ingress NetCDF before running.
+All commands assume PyTorch **2.12.1** from `uv.lock`, CUDA 13.0, and `CUTE_DSL_ARCH=sm_120a` on Blackwell.
+
+**Prerequisites** (first run on a fresh machine):
+
+```bash
+export AURORA_ASSET_ROOT=/root/autodl-tmp/aurora   # data disk; any absolute path is fine
+export CDSAPI_KEY='<api_key>'  # Copernicus CDS — https://cds.climate.copernicus.eu/how-to-api
+```
+
+Set `CDSAPI_KEY` before downloading ERA5 ingress (presets `era5_pretrained`, `small_pretrained`, and ERA5 static for `hres_t0_finetuned`). Use the API key from the CDS API page (no legacy `UID:` prefix). This skips the interactive CDS prompt, which is unreliable in browser terminals (AutoDL, Cursor) where paste at a password prompt often fails. Equivalent: a `~/.cdsapirc` file with `url:` and `key:` lines.
+
+Checkpoints and HF static pickles download on first run. When `huggingface.co` is unreachable, the engine uses `hf-mirror.com` automatically; `benchmark/bench_aurora_pretrained.py` enables the mirror by default.
 
 **End-to-end latency** (all presets except `wave`, every tier, `lora_eager` vs `lora_merged` where applicable):
 
 Fair speedup (default):
 
 ```bash
+export CDSAPI_KEY='<api_key>'
 CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_latency_all.py \
-  --asset-root /path/to/assets --warmup 2 --repeat 5 \
+  --asset-root "$AURORA_ASSET_ROOT" --warmup 2 --repeat 5 \
   --isolate-tiers --report-out benchmark/latency_all_isolated.md
 ```
 
 Single-process artifact (cuDNN cross-tier warmup demo; ref timed after custom tiers):
 
 ```bash
+export CDSAPI_KEY='<api_key>'
 CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_latency_all.py \
-  --asset-root /path/to/assets --warmup 2 --repeat 5 \
+  --asset-root "$AURORA_ASSET_ROOT" --warmup 2 --repeat 5 \
   --no-isolate-tiers --defer-ref \
   --report-out benchmark/latency_all_single_process.md
 ```
@@ -876,8 +889,9 @@ CUTE_DSL_ARCH=sm_120a BENCH_MEASURED=200 uv run python benchmark/bench_window_at
 **Precision drift** (seed 42, `lora_merged` on finetuned models):
 
 ```bash
+export CDSAPI_KEY='<api_key>'
 CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_precision_all.py \
-  --asset-root /path/to/assets --seed 42
+  --asset-root "$AURORA_ASSET_ROOT" --seed 42
 ```
 
 Report: `benchmark/precision_all_seed42.md`.
@@ -885,11 +899,51 @@ Report: `benchmark/precision_all_seed42.md`.
 **Stage timing** (encoder / backbone / decoder breakdown; optional cast profiling):
 
 ```bash
+export CDSAPI_KEY='<api_key>'
 CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_finetuned_stage_timing.py \
-  --asset-root /path/to/assets --profile-casts
+  --asset-root "$AURORA_ASSET_ROOT" --profile-casts
 ```
 
-Legacy single-preset timing: `benchmark/bench_aurora_pretrained.py` (subset of `bench_aurora_latency_all.py` for `era5_pretrained` only).
+**ERA5 pretrained** (real CDS ingress + all precision tiers; subset of `bench_aurora_latency_all.py`):
+
+```bash
+export CDSAPI_KEY='<api_key>'
+CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_pretrained.py \
+  --asset-root "$AURORA_ASSET_ROOT" --suite legacy --warmup 1 --repeat 3
+```
+
+Use `--skip-download` when checkpoint and `era5/` cache are already present; use `--no-prompt` only if credentials are preconfigured and you want to fail fast instead of prompting.
+
+**Pipeline parallelism** (encoder / backbone / decoder across GPUs — latency + per-device VRAM):
+
+Single-process only; pass a `DistributedConfig` with two or more CUDA devices. On 32 GiB cards, `era5_pretrained` typically uses encoder+decoder on `cuda:0` and backbone on `cuda:1`.
+
+```bash
+export CDSAPI_KEY='<api_key>'
+
+# Stage timing + per-GPU memory profile
+CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_pipeline_profile.py \\
+  --preset era5_pretrained --asset-root "$AURORA_ASSET_ROOT" \\
+  --inference-precision bf16_mixed@fp32 --skip-download --force --warmup 1 --repeat 5
+
+# Programmatic use
+python - <<'PY'
+from pathlib import Path
+from flash_aurora.engine.core.engine import AuroraEngine
+from flash_aurora.engine.distributed import DistributedConfig
+
+engine = AuroraEngine.from_preset(
+    "era5_pretrained",
+    asset_root=Path("/root/autodl-tmp/aurora"),
+    inference_precision="bf16_mixed@fp32",
+    distributed=DistributedConfig(devices=("cuda:0", "cuda:1"), max_vram_gib_per_device=32.0, force=True),
+)
+engine.load()
+print(engine.distributed_status())
+PY
+```
+
+Implementation lives under `flash_aurora/engine/distributed/` (`pipeline.py`, `plan.py`, `config.py`).
 
 ## Testing notes
 

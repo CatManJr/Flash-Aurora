@@ -479,6 +479,40 @@ def test_mars_service_rejects_invalid_ecmwfapirc(tmp_path: Path, monkeypatch: py
             pass
 
 
+def test_ensure_era5_prompts_for_cds_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash_aurora.engine.ingress.download.credentials import DownloadCredentials
+
+    config = DEFAULT_PRESETS.get("era5_pretrained")
+    config.asset_root = tmp_path
+    downloader = DataDownloader(config)
+    valid_time = datetime(2023, 1, 1, 6)
+    cache = tmp_path / "era5"
+
+    def fake_download(cache_dir: Path, day: str, *, include_static: bool = True, workers: int = 1):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        paths = expected_paths(config.source, valid_time, cache_dir)
+        for path in paths.values():
+            path.write_bytes(b"data")
+        return paths
+
+    monkeypatch.delenv("CDSAPI_KEY", raising=False)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("flash_aurora.engine.ingress.download.paths.user_home", lambda: fake_home)
+
+    with patch(
+        "flash_aurora.engine.ingress.download.backends.cds.download_era5_day",
+        side_effect=fake_download,
+    ), patch(
+        "flash_aurora.engine.ingress.download.downloader.prompt_cds_credentials",
+        return_value=DownloadCredentials(cds_api_key="prompt-token"),
+    ) as prompted:
+        result = downloader.ensure(valid_time, cache_dir=cache, prompt=True)
+
+    prompted.assert_called_once()
+    assert result.complete
+
+
 def test_ensure_wave_prompts_for_ecmwf_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from flash_aurora.engine.ingress.download.credentials import DownloadCredentials
 

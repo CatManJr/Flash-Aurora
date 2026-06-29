@@ -14,6 +14,8 @@ from flash_aurora.engine.ingress.download.backends import DownloadBackendError, 
 from flash_aurora.engine.ingress.download.credentials import (
     DownloadCredentials,
     merge_credentials,
+    prompt_ads_credentials,
+    prompt_cds_credentials,
     prompt_ecmwf_credentials,
     use_download_credentials,
 )
@@ -144,8 +146,14 @@ class DataDownloader:
                 ecmwf_email=ecmwf_email,
             ),
         )
-        if prompt and self.config.source.name == "wb2_wam" and creds.ecmwf_settings() is None:
-            creds = prompt_ecmwf_credentials(creds)
+        if prompt:
+            source_name = self.config.source.name
+            if source_name in {"cds_era5", "wb2_hres"} and creds.cds_settings() is None:
+                creds = prompt_cds_credentials(creds)
+            elif source_name == "cams" and creds.ads_settings() is None:
+                creds = prompt_ads_credentials(creds)
+            elif source_name == "wb2_wam" and creds.ecmwf_settings() is None:
+                creds = prompt_ecmwf_credentials(creds)
         if self.config.source.name == "wb2_wam" and creds.ecmwf_settings() is None:
             from flash_aurora.engine.ingress.download.mars import _mars_config_error
 

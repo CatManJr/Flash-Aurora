@@ -22,8 +22,9 @@ ensure_repo_paths()
 
 from _asset_root import default_asset_root
 
-_DEFAULT_ASSET_ROOT = default_asset_root()
+_AUTODL_DEFAULT_ASSET_ROOT = Path("/root/autodl-tmp/aurora")
 _CHECKPOINT_NAME = "aurora-0.25-pretrained.ckpt"
+_DEFAULT_ASSET_ROOT = _AUTODL_DEFAULT_ASSET_ROOT
 _PYTORCH_BASELINE_KEY = "pytorch_backbone_fp32_encoder_decoder_fp32"
 
 _LEGACY_NAMED_TIERS: tuple[tuple[str, str, str], ...] = (
@@ -169,6 +170,96 @@ def print_startup_gpu_state(*, device: torch.device) -> None:
     print_cuda_memory_summary(device_index=device.index or 0)
 
 
+def resolve_bench_asset_root(asset_root: Path | str | None = None) -> Path:
+    """Resolve benchmark asset root: explicit path, env var, or AutoDL default."""
+    if asset_root is not None:
+        expanded = Path(asset_root).expanduser()
+        if not expanded.is_absolute():
+            raise ValueError(f"asset_root must be an absolute path, got {asset_root!r}")
+        return expanded.resolve()
+    from flash_aurora.engine.core.asset_root import resolve_asset_root
+
+    env_root = resolve_asset_root()
+    if env_root is not None:
+        return env_root
+    if _AUTODL_DEFAULT_ASSET_ROOT.parent.exists():
+        return _AUTODL_DEFAULT_ASSET_ROOT
+    return default_asset_root()
+
+
+def _era5_benchmark_config(asset_root: Path, *, hf_mirror: bool) -> Any:
+    from dataclasses import replace
+
+    from flash_aurora.engine.core.hub import HF_MIRROR_ENDPOINT
+    from flash_aurora.engine.core.presets import DEFAULT_PRESETS
+
+    config = DEFAULT_PRESETS.get("era5_pretrained")
+    return replace(
+        config,
+        asset_root=asset_root,
+        allow_hub_download=True,
+        hf_endpoint=HF_MIRROR_ENDPOINT if hf_mirror else config.hf_endpoint,
+    )
+
+
+def ensure_pretrained_assets(
+    asset_root: Path | str | None = None,
+    *,
+    era5_cache: Path | None = None,
+    checkpoint: Path | None = None,
+    valid_time: datetime | None = None,
+    hf_mirror: bool = True,
+    download_era5: bool = True,
+    prompt: bool = True,
+    verbose: bool = True,
+) -> tuple[Path, Path]:
+    """Download checkpoint (HF mirror) and ERA5 NetCDF via ``DataDownloader.ensure``."""
+    from flash_aurora.engine.core.paths import AssetStore
+    from flash_aurora.engine.core.hub import HF_MIRROR_ENDPOINT
+    from flash_aurora.engine.ingress.download import DataDownloader
+    from flash_aurora.hub import apply_hub_endpoint
+
+    root = resolve_bench_asset_root(asset_root)
+    root.mkdir(parents=True, exist_ok=True)
+    cache = (era5_cache or root / "era5").expanduser().resolve()
+    vt = valid_time or datetime(2023, 1, 1, 6)
+    ckpt = (checkpoint or root / _CHECKPOINT_NAME).expanduser().resolve()
+
+    config = _era5_benchmark_config(root, hf_mirror=hf_mirror)
+    if hf_mirror:
+        apply_hub_endpoint(HF_MIRROR_ENDPOINT)
+
+    store = AssetStore(root=root)
+    if not ckpt.is_file():
+        if verbose:
+            print(f"[download] checkpoint -> {ckpt}", flush=True)
+        fetched = store.fetch_hub_file(
+            config.variant.checkpoint_filename,
+            repo=config.variant.hf_repo,
+            allow_download=True,
+            explicit=root,
+            hub=config.hub_download_options(),
+        )
+        if verbose:
+            print(f"[download] checkpoint ready: {fetched}", flush=True)
+
+    downloader = DataDownloader(config)
+    missing = downloader.missing(vt, cache_dir=cache)
+    if download_era5 and missing:
+        if verbose:
+            print(f"[download] ERA5 ({', '.join(missing)}) -> {cache}", flush=True)
+        result = downloader.ensure(vt, cache_dir=cache, prompt=prompt)
+        if verbose:
+            print(
+                f"[download] ERA5 ready: downloaded={result.downloaded} skipped={result.skipped}",
+                flush=True,
+            )
+    elif missing and verbose:
+        print(f"[warn] missing ERA5 files: {missing} under {cache}", flush=True)
+
+    return ckpt, cache
+
+
 def format_peak_memory(peak_alloc_mb: float, peak_reserved_mb: float) -> str:
     """Human-readable peak line; reserved often exceeds allocated (CUDA caching pool)."""
     alloc_gib = peak_alloc_mb / 1024.0
@@ -185,25 +276,42 @@ def load_era5_batch(
     era5_cache: Path | None = None,
     valid_time: datetime | None = None,
     time_index: int = 1,
+    download: bool = True,
+    hf_mirror: bool = True,
+    prompt: bool = True,
 ) -> Any:
-    """Build a validated IC ``Batch`` from cached CDS ERA5 NetCDF files."""
-    from dataclasses import replace
-
-    from flash_aurora.engine.core.presets import DEFAULT_PRESETS
+    """Build a validated IC ``Batch`` from CDS ERA5 NetCDF (download via ``DataDownloader``)."""
+    from flash_aurora.engine.core.hub import HF_MIRROR_ENDPOINT
     from flash_aurora.engine.ingress.build_ic import InitialConditionBuilder
     from flash_aurora.engine.ingress.download import DataDownloader
+    from flash_aurora.hub import apply_hub_endpoint
 
-    asset_root = asset_root.expanduser().resolve()
-    cache = (era5_cache or asset_root / "era5").expanduser().resolve()
+    root = resolve_bench_asset_root(asset_root)
+    cache = (era5_cache or root / "era5").expanduser().resolve()
     vt = valid_time or datetime(2023, 1, 1, 6)
 
-    config = replace(
-        DEFAULT_PRESETS.get("era5_pretrained"),
-        asset_root=asset_root,
-        allow_hub_download=False,
-    )
+    config = _era5_benchmark_config(root, hf_mirror=hf_mirror)
+    if hf_mirror:
+        apply_hub_endpoint(HF_MIRROR_ENDPOINT)
+
+    if download:
+        ensure_pretrained_assets(
+            root,
+            era5_cache=cache,
+            valid_time=vt,
+            hf_mirror=hf_mirror,
+            download_era5=True,
+            prompt=prompt,
+        )
+
     downloader = DataDownloader(config)
-    request = downloader.ingest_request(vt, cache_dir=cache, time_index=time_index, download=False)
+    request = downloader.ingest_request(
+        vt,
+        cache_dir=cache,
+        time_index=time_index,
+        download=download,
+        prompt=prompt,
+    )
     return InitialConditionBuilder(config).from_source(request)
 
 

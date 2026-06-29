@@ -19,15 +19,17 @@ class DownloadCredentials:
     """Optional API credentials for ingress downloads.
 
     Resolution order for CDS: explicit fields here -> ``CDSAPI_*`` env vars ->
-    ``~/.cdsapirc``. Keys are never logged when ``use_download_credentials`` is active.
+    ``~/.cdsapirc``. The key is the CDS API key (no legacy ``UID:`` prefix).
+    Keys are never logged when ``use_download_credentials`` is active.
 
-    ADS (CAMS) uses ``ADSAPI_*`` or the same Copernicus key via ``CDSAPI_*`` with the
-    ADS endpoint forced in :func:`flash_aurora.engine.ingress.download.ads.ads_client`.
+    ADS (CAMS) uses ``ADSAPI_*`` or the same Copernicus API key via
+    ``CDSAPI_*`` with the ADS endpoint forced in
+    :func:`flash_aurora.engine.ingress.download.ads.ads_client`.
 
     ECMWF MARS uses ``ECMWF_API_*`` env vars, then ``~/.ecmwfapirc`` JSON
     (``url``, ``key``, ``email``). Pass ``prompt=True`` to
     :meth:`flash_aurora.engine.ingress.download.downloader.DataDownloader.ensure`
-    to fill missing MARS fields interactively.
+    to fill missing CDS, ADS, or MARS fields interactively.
     """
 
     cds_api_key: str | None = None
@@ -155,6 +157,22 @@ def merge_credentials(*layers: DownloadCredentials | None) -> DownloadCredential
     for layer in layers:
         merged = merged.merge(layer)
     return merged.fill_missing(DownloadCredentials.from_config_files())
+
+
+def prompt_cds_credentials(credentials: DownloadCredentials) -> DownloadCredentials:
+    """Fill missing CDS fields interactively (terminal or notebook stdin)."""
+    key = credentials.cds_api_key
+    if key is None:
+        key = getpass.getpass("CDS API key: ").strip() or None
+    return credentials.merge(DownloadCredentials(cds_api_key=key))
+
+
+def prompt_ads_credentials(credentials: DownloadCredentials) -> DownloadCredentials:
+    """Fill missing ADS fields interactively (terminal or notebook stdin)."""
+    key = credentials.ads_api_key or credentials.cds_api_key
+    if key is None:
+        key = getpass.getpass("ADS API key: ").strip() or None
+    return credentials.merge(DownloadCredentials(ads_api_key=key))
 
 
 def prompt_ecmwf_credentials(credentials: DownloadCredentials) -> DownloadCredentials:

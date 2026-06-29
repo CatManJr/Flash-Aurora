@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end precision benchmark for AuroraPretrained on real ERA5 ingress data.
 
-Loads cached CDS NetCDF under ``<asset-root>/era5/``, runs each inference tier,
+Uses ``DataDownloader`` (CDS) for ERA5 NetCDF and Hugging Face mirror for the
+checkpoint/static pickle under ``<asset-root>/``. Runs each inference tier,
 times ``forward``, and compares outputs against the PyTorch FP32 baseline.
 
 **Default suite (10 tiers)** - same grid as ``bench_small_pretrained.py``:
@@ -12,11 +13,14 @@ times ``forward``, and compares outputs against the PyTorch FP32 baseline.
 
 Examples::
 
-    CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_aurora_pretrained.py \\
-        --asset-root /path/to/assets
+    export CDSAPI_KEY='<api_key>'
+    uv run python benchmark/bench_aurora_pretrained.py \\
+        --asset-root /root/autodl-tmp/aurora
 
     uv run python benchmark/bench_aurora_pretrained.py --suite legacy --warmup 1 --repeat 1
-    uv run python benchmark/bench_aurora_pretrained.py --tiers tf32 bf16_mixed@fp32
+    uv run python benchmark/bench_aurora_pretrained.py --skip-download  # local cache only
+    uv run python benchmark/bench_aurora_pretrained.py --no-hf-mirror
+    uv run python benchmark/bench_aurora_pretrained.py --no-prompt  # fail if CDS creds missing
 
     # CuTe window attn vs SDPA (per-variable max_abs table)
     uv run python benchmark/bench_aurora_pretrained.py --ablate-cute --warmup 1 --repeat 1
@@ -51,6 +55,7 @@ from _pretrained_era5 import (  # noqa: E402
     print_startup_gpu_state,
     print_summary_table,
     purge_gpu,
+    resolve_bench_asset_root,
     run_ablate_cute,
     run_tier,
     tiers_from_args,
@@ -116,26 +121,49 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=1, help="Warmup forwards before timing (default: 1)")
     parser.add_argument("--repeat", type=int, default=3, help="Timed forwards per tier (default: 3)")
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Do not download checkpoint or ERA5; require files under asset-root",
+    )
+    parser.add_argument(
+        "--no-hf-mirror",
+        action="store_true",
+        help="Use official huggingface.co instead of hf-mirror.com",
+    )
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Do not interactively prompt for CDS credentials when missing",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
 
     device = torch.device("cuda")
-    asset_root = args.asset_root.expanduser().resolve()
+    asset_root = resolve_bench_asset_root(args.asset_root)
+    download = not args.skip_download
+    hf_mirror = not args.no_hf_mirror
+    prompt = not args.no_prompt
+    valid_time = datetime.fromisoformat(args.valid_time)
     checkpoint = (args.checkpoint or asset_root / _CHECKPOINT_NAME).expanduser().resolve()
-    if not checkpoint.is_file():
-        raise SystemExit(f"checkpoint not found: {checkpoint}")
 
     print_startup_gpu_state(device=device)
+    print(f"[config] asset_root={asset_root} download={download} hf_mirror={hf_mirror} prompt={prompt}")
 
-    valid_time = datetime.fromisoformat(args.valid_time)
     batch = load_era5_batch(
         asset_root,
         era5_cache=args.era5_cache,
         valid_time=valid_time,
         time_index=args.time_index,
+        download=download,
+        hf_mirror=hf_mirror,
+        prompt=prompt,
     ).to(device)
+
+    if not checkpoint.is_file():
+        raise SystemExit(f"checkpoint not found: {checkpoint}")
 
     lat = batch.metadata.lat.numel()
     lon = batch.metadata.lon.numel()

@@ -30,7 +30,7 @@ def ads_client():
     Credentials are never written to the repository. Resolution order:
 
     1. ``ads_api_key`` / ``ADSAPI_KEY`` (optional ``ads_api_url`` / ``ADSAPI_URL``)
-    2. ``cds_api_key`` / ``CDSAPI_KEY`` with the ADS endpoint (same Copernicus UID key)
+    2. ``cds_api_key`` / ``CDSAPI_KEY`` with the ADS endpoint (same API key as CDS)
     3. ``key:`` from ``~/.cdsapirc`` with the ADS endpoint (URL line in the file is ignored)
     """
     active = active_download_credentials()
@@ -53,7 +53,7 @@ def ads_client():
 
     raise AdsConfigError(
         "Missing ADS credentials. Pass ads_api_key to DataDownloader.ensure(), "
-        "set ADSAPI_KEY (or CDSAPI_KEY with the same Copernicus key), "
+        "set ADSAPI_KEY (or CDSAPI_KEY with the same API key), "
         f"or create {safe_config_label(cdsapirc_path())} with a key: line "
         "(the ADS API URL is applied automatically). "
         "If you used getpass(), the string in parentheses is only a prompt—not your API key."

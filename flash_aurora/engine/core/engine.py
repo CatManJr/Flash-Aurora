@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Generator, Iterable
 
@@ -29,6 +30,13 @@ from flash_aurora.engine.runtime.gpu_guard import (
     resolve_guard_dir,
     try_local_cuda_cleanup,
 )
+from flash_aurora.engine.distributed import (
+    DistributedConfig,
+    apply_pipeline_parallel,
+    is_pipeline_parallel,
+    plan_parallelism,
+)
+from flash_aurora.engine.distributed.pipeline import distributed_status, restore_pipeline_parallel
 
 
 class AuroraEngine:
@@ -49,6 +57,7 @@ class AuroraEngine:
         self._gpu_ticket: GpuGuardTicket | None = None
         self._forward_warmed = False
         self._closed = False
+        self._parallel_plan = None
 
     def __enter__(self) -> AuroraEngine:
         return self
@@ -113,6 +122,7 @@ class AuroraEngine:
         export_use_egress_stream: bool | None = None,
         ic_cache: bool | None = None,
         forward_warmup_iters: int | None = None,
+        distributed: "DistributedConfig | None" = None,
         presets: PresetRegistry | None = None,
     ) -> AuroraEngine:
         registry = presets or DEFAULT_PRESETS
@@ -150,6 +160,10 @@ class AuroraEngine:
             config.ic_cache = ic_cache
         if forward_warmup_iters is not None:
             config.forward_warmup_iters = forward_warmup_iters
+        if distributed is not None:
+            config.distributed = distributed
+            config.cuda_graph = False
+            config.gpu_guard = False
         engine = cls(config, presets=registry)
         engine.config.preset_name = name
         return engine
@@ -187,6 +201,8 @@ class AuroraEngine:
 
     def acquire_gpu(self, *, rollout_steps: int | None = None) -> GpuGuardTicket | None:
         """Reserve GPU memory across processes (share small jobs, queue large ones)."""
+        if self.config.distributed is not None:
+            return None
         if self._gpu_ticket is not None:
             return self._gpu_ticket
         if not self.config.gpu_guard or not gpu_guard_enabled():
@@ -210,8 +226,36 @@ class AuroraEngine:
             self._gpu_ticket.release()
             self._gpu_ticket = None
         if move_model_to_cpu and self._model is not None:
+            if is_pipeline_parallel(self._model):
+                restore_pipeline_parallel(self._model)
             self._model.cpu()
-        try_local_cuda_cleanup(device_index=self._device_index())
+            self._parallel_plan = None
+        distributed = self.config.distributed
+        if distributed is not None:
+            for device_name in distributed.devices:
+                if device_name.startswith("cuda:"):
+                    try_local_cuda_cleanup(device_index=int(device_name.split(":", 1)[1]))
+        else:
+            try_local_cuda_cleanup(device_index=self._device_index())
+
+    def distributed_status(self) -> dict[str, object]:
+        """Return pipeline-parallel placement metadata when multi-GPU inference is active."""
+        if self._model is None:
+            return {"enabled": False, "loaded": False}
+        if is_pipeline_parallel(self._model):
+            status: dict[str, object] = distributed_status(self._model)
+        else:
+            status = {"enabled": False}
+        status["loaded"] = True
+        if self.config.distributed is not None:
+            status["strategy"] = "pipeline"
+        if self._parallel_plan is not None:
+            status["plan"] = {
+                "devices": self._parallel_plan.devices,
+                "estimated_peak_gib": self._parallel_plan.estimated_peak_gib,
+                "estimated_per_device_gib": self._parallel_plan.estimated_per_device_gib,
+            }
+        return status
 
     def gpu_guard_status(self):
         """Return active leases and queue entries for this engine's device."""
@@ -221,13 +265,17 @@ class AuroraEngine:
     def load(self, *, rollout_steps: int | None = None) -> Aurora:
         try:
             self.acquire_gpu(rollout_steps=rollout_steps)
-            self._model = self._load_model_to_device()[0]
+            self._model = self._load_model_to_device(rollout_steps=rollout_steps)[0]
             return self._model
         except Exception:
             self.release_gpu()
             raise
 
-    def _load_model_to_device(self) -> tuple[Aurora, LoadTiming]:
+    def _load_model_to_device(
+        self,
+        *,
+        rollout_steps: int | None = None,
+    ) -> tuple[Aurora, LoadTiming]:
         t0 = time.perf_counter()
         model = self._loader.build_model()
         build_model_ms = (time.perf_counter() - t0) * 1000.0
@@ -237,17 +285,31 @@ class AuroraEngine:
         self._loader.load(model)
         load_ckpt_ms = (time.perf_counter() - t0) * 1000.0
 
-        device = torch.device(self.config.device)
-        if device.type == "cuda" and not torch.cuda.is_available():
-            device = torch.device("cpu")
-
-        t0 = time.perf_counter()
-        if device.type == "cuda":
-            model.to(device, non_blocking=True)
-            torch.cuda.synchronize(device)
+        distributed = self.config.distributed
+        if distributed is not None:
+            steps = rollout_steps if rollout_steps is not None else distributed.rollout_steps
+            dist_config = replace(distributed, rollout_steps=steps)
+            plan = plan_parallelism(
+                self.config.variant,
+                dist_config,
+                inference_precision=self.config.inference_precision,
+            )
+            self._parallel_plan = plan
+            self.config.device = plan.input_device
+            apply_pipeline_parallel(model, plan)
+            model_h2d_ms = 0.0
         else:
-            model.to(device)
-        model_h2d_ms = (time.perf_counter() - t0) * 1000.0
+            device = torch.device(self.config.device)
+            if device.type == "cuda" and not torch.cuda.is_available():
+                device = torch.device("cpu")
+
+            t0 = time.perf_counter()
+            if device.type == "cuda":
+                model.to(device, non_blocking=True)
+                torch.cuda.synchronize(device)
+            else:
+                model.to(device)
+            model_h2d_ms = (time.perf_counter() - t0) * 1000.0
 
         timing = LoadTiming(
             build_model_ms=build_model_ms,
@@ -288,7 +350,7 @@ class AuroraEngine:
         """
         self.acquire_gpu(rollout_steps=rollout_steps)
         build_ic = lambda: self._builder().from_source(request)
-        load = self._load_model_to_device
+        load = lambda: self._load_model_to_device(rollout_steps=rollout_steps)
         use_overlap = self._resolve_overlap(overlap)
 
         try:
@@ -314,7 +376,7 @@ class AuroraEngine:
         resolved = Path(path)
         self.acquire_gpu(rollout_steps=rollout_steps)
         build_ic = lambda: self._builder().from_netcdf_path(resolved)
-        load = self._load_model_to_device
+        load = lambda: self._load_model_to_device(rollout_steps=rollout_steps)
         use_overlap = self._resolve_overlap(overlap)
 
         try:

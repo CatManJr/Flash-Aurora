@@ -124,6 +124,7 @@ class EngineConfig:
     export_use_egress_stream: bool = True
     ic_cache: bool = False
     forward_warmup_iters: int = 2
+    distributed: "DistributedConfig | None" = None
 
     def hub_download_options(self) -> "HubDownloadOptions":
         from flash_aurora.engine.core.hub import HubDownloadOptions
