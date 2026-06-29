@@ -3,7 +3,7 @@
 #
 # Usage (repo root):
 #   ./aurora/scripts/profile_aurora_nsys_pair.sh
-# Optional: export CUTE_DSL_ARCH=sm_120a  # only for cross-compiling to another GPU arch
+# Optional: export CUTE_DSL_ARCH=sm_80  # cross-compile for another GPU arch
 #
 # Outputs:
 #   profiling/nsight/aurora_bf16_mixed_<stamp>.nsys-rep

@@ -18,6 +18,10 @@ from typing import Optional
 
 import torch
 
+from ._arch_env import ensure_cute_dsl_arch
+
+ensure_cute_dsl_arch()
+
 try:
     import cuda.bindings.driver as cuda  # noqa: F401
 

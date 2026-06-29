@@ -38,7 +38,7 @@ def warmup_forwards(
     iters: int,
     device: torch.device,
 ) -> Batch:
-    """Run ``iters`` untimed forwards to compile CuTe kernels and warm caches."""
+    """Run ``iters`` untimed forwards to JIT-compile CuTe kernels on custom-precision paths."""
     if iters <= 0:
         return batch
     with torch.inference_mode():

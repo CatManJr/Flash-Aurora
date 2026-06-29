@@ -267,6 +267,11 @@ class Aurora(torch.nn.Module):
             autocast_encoder_decoder = False
             encoder_decoder_use_tensor_core = False
 
+        if use_cute_window_attn:
+            from flash_aurora.aurora.ops.cute._arch_env import ensure_cute_dsl_arch
+
+            ensure_cute_dsl_arch()
+
         from flash_aurora.aurora.model.custom_op_paths import backbone_dtype_from_name
 
         self.cute_window_attn_dtype = backbone_dtype_from_name(window_attn_compute_dtype_name)
