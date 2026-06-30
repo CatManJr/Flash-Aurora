@@ -4,9 +4,18 @@ Flash-Aurora is an inference stack for the [Microsoft Aurora](https://github.com
 
 ## Highlights
 
+### Better global memory usage
+
+PyTorch Swin3D rollout materializes many short-lived tensors for window roll/pad/partition and for AdaLN block boundaries. Flash-Aurora fuses these on the backbone hot path with Triton (all custom precision tiers):
+
+- **Fused window layout** (`triton_swin3d_layout.py`): cyclic shift, zero-pad, 3D window partition, and the inverse crop/merge run in fused kernels instead of a chain of eager allocations. `InferenceWorkspacePool` can reuse layout buffers across steps with fixed shapes.
+- **Fused AdaLN + residual** (`triton_adaln.py`): LayerNorm, FiLM modulation, and residual add in one kernel, avoiding a full-width AdaLN intermediate in global memory.
+
+On `bf16_mixed@`* and `tf32@*` precision tiers, Triton AdaLN also **keeps FP32 activations between Swin3D blocks**: the `output_fp32` path loads BF16 branch outputs (attention or MLP), computes norm and FiLM in FP32, and stores FP32 residuals directly, without a separate `tensor.to(float32)` copy at each block boundary. That reduces global memory traffic while preserving inter-block precision for deep backbone stacks. See [Triton fusion](#triton-fusion) and [Mixed precision inference](#mixed-precision-inference) below.
+
 ### CuTe DSL powered Aurora Window Attention
 
-Aurora Swin windows are short ($N{=}144$) because patch size are fixed to $14 \times 14$. The CuTe DSL kernels load the **entire window** $K$ and $V$ into shared memory in a **single stage** (`tile_n \ge N`), run QK and PV MMAs with FP32 online softmax locally, and never materialize an $N \times N$ attention matrix in global memory. Two variants (BF16 and TF32-simulated FP32) target these fixed shapes rather than generic long-sequence attention. **1.07-1.22x** vs BF16 SDPA and **1.59-1.69x** vs FP32 SDPA (mainly tensor core advantage, not the kernel's) on encoder-stage window microbenchmarks. See [Window attention kernels](#window-attention-kernels).
+Aurora Swin windows are short ($N{=}144$) because patch size is fixed to $14 \times 14$. The CuTe DSL kernels load the **entire window** $K$ and $V$ into shared memory in a **single stage** (`tile_n \ge N`), run QK and PV MMAs with FP32 online softmax locally, and never materialize an $N \times N$ attention matrix in global memory. Two variants (BF16 and TF32-simulated FP32) target these fixed shapes rather than generic long-sequence attention. **1.07-1.22x** vs BF16 SDPA and **1.59-1.69x** vs FP32 SDPA (mainly tensor core advantage, not the kernel's) on encoder-stage window microbenchmarks. See [Window attention kernels](#window-attention-kernels).
 
 ### Mixed precision inference
 
@@ -24,7 +33,9 @@ Headline latency: **bf16_mixed@fp32** is **about 3.2x** vs PyTorch FP32 on `era5
 
 One ZMQ worker per GPU, each bound to a preset. The coordinator routes forecast requests to a matching idle worker and streams events back to the client. This is job-level scheduling across heterogeneous models, not tensor parallelism inside one rollout. A single client can run `era5_pretrained`, `hres_t0_finetuned`, `hres_0.1`, and `cams` on four GPUs at the same time. When one preset is slow to prepare (for example `hres_0.1`), the client can queue more work on the other workers instead of leaving those GPUs idle. See [Forecast scheduler (ZMQ)](#forecast-scheduler-zmq).
 
-four heterogeneous presets dispatched in parallelrefill faster workers while HRES is pending
+![four heterogeneous presets dispatched in parallel](docs/image/4_workers.png)
+
+![refill faster workers while HRES is pending](docs/image/4_workers_refill.png)
 
 Left: first dispatch, one job per worker and preset. Right: refill while `hres_0.1` is still pending. Faster workers take follow-up jobs so aggregate throughput stays high. Traces from `docs/example_scheduler_distributed_workers.ipynb` on 4x RTX PRO 6000.
 
@@ -37,7 +48,13 @@ Splits encoder, backbone, and spatial decoder across two GPUs inside one process
 
 See [Distributed pipeline](#distributed-pipeline) and `benchmark/bench_distributed_rollout.py`.
 
-era5 2-GPU staged rolloutera5 2-GPU overlap rollouthres_0.1 2-GPU staged rollouthres_0.1 2-GPU overlap rollout
+![era5 2-GPU staged rollout](docs/image/distributed_rollout_utilization_2gpu_staged.png)
+
+![era5 2-GPU overlap rollout](docs/image/distributed_rollout_utilization_2gpu_overlap.png)
+
+![hres_0.1 2-GPU staged rollout](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_staged.png)
+
+![hres_0.1 2-GPU overlap rollout](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_overlap.png)
 
 `era5_pretrained` ($721 \times 1440$), staged then overlap. `hres_0.1` ($1801 \times 3600$), staged then overlap.
 
