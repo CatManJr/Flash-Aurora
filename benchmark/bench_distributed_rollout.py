@@ -20,7 +20,7 @@ Examples::
     # CPU / DRAM / GPU utilization curves (HPC-style figure)
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_distributed_rollout.py \\
         --preset era5_pretrained --steps 4 --skip-download --force --no-prompt \\
-        --plot-utilization benchmark/results/distributed_rollout_utilization.png
+        --plot-utilization docs/image/distributed_rollout_utilization_5090.png
 """
 
 from __future__ import annotations
@@ -172,10 +172,14 @@ def _run_mode(
 
     for iteration in range(warmup + repeat):
         purge_gpu()
+        # CuTe JIT persists in-process; drop the engine and skip repeat warmup forwards
+        # so 24 GiB cards can survive warmup=1 repeat=3 on hres_0.1.
+        forward_warmup_iters = 2 if iteration == 0 else 0
         engine = AuroraEngine.from_preset(
             preset,
             asset_root=asset_root,
             inference_precision=inference_precision,
+            forward_warmup_iters=forward_warmup_iters,
             distributed=DistributedConfig(
                 devices=devices,
                 max_vram_gib_per_device=max_vram_gib,
@@ -215,6 +219,7 @@ def _run_mode(
         last_status = engine.distributed_status()
         peak = _peak_allocated_gib(devices)
         engine.release_gpu()
+        del engine
         purge_gpu()
 
         if len(paths) != steps:
@@ -428,8 +433,9 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "Write notebook-style 2×2 CPU/DRAM/GPU/VRAM figures; "
-            "one file per mode ({stem}_{mode}.png or {dir}/{mode}.png)"
+            "Write notebook-style 2x2 CPU/DRAM/GPU/VRAM figures. "
+            "Use a GPU tag in the stem, e.g. docs/image/distributed_rollout_utilization_4090.png "
+            "writes docs/image/distributed_rollout_utilization_4090_{preset}_{mode}.png"
         ),
     )
     parser.add_argument(
@@ -529,9 +535,11 @@ def main() -> None:
                 docs_dir.mkdir(parents=True, exist_ok=True)
                 for plot_path_written in plot_paths:
                     docs_copy = docs_dir / plot_path_written.name
-                    shutil.copy2(plot_path_written, docs_copy)
+                    if plot_path_written.resolve() != docs_copy.resolve():
+                        shutil.copy2(plot_path_written, docs_copy)
                     print(f"[plot] {plot_path_written}")
-                    print(f"[plot] {docs_copy}")
+                    if plot_path_written.resolve() != docs_copy.resolve():
+                        print(f"[plot] {docs_copy}")
 
     if not reports:
         raise SystemExit("no presets ready to benchmark (missing checkpoint or ingress cache)")

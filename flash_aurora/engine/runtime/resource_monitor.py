@@ -333,8 +333,8 @@ def plot_distributed_rollout_utilization(
     """Save one notebook-style 2×2 figure per rollout mode.
 
     *output_path* may be a directory (writes ``{mode}.png``) or a file stem such as
-    ``docs/image/distributed_rollout_utilization.png`` (writes
-    ``distributed_rollout_utilization_{mode}.png``).
+    ``docs/image/distributed_rollout_utilization_4090_era5_pretrained.png`` (writes
+    ``distributed_rollout_utilization_4090_era5_pretrained_{mode}.png``).
     """
     if not traces:
         raise ValueError("traces must not be empty")
