@@ -44,19 +44,27 @@ Left: one job per worker and preset. Right: faster workers take follow-up jobs w
 Splits encoder, backbone, and spatial decoder across two GPUs inside one process (`DistributedConfig`, not `torchrun`). Large presets such as `era5_pretrained` and `hres_0.1` do not fit a single card in this VRAM range. Spatial decoder split cuts peak decoder VRAM from about 28 GiB on one card to about 14 GiB per card on ERA5.
 
 - **Staged** (`overlap_rollout=False`): each rollout step is serialized. Decode step $k$, write step $k$ to NetCDF, then start step $k{+}1$. While `cuda:0` exports, `cuda:1` sits idle.
-- **Overlap export** (`overlap_rollout=True`, default): step $k{-}1$ export on `cuda:0` runs in parallel with step $k$ backbone on `cuda:1`. Encoder and decoder for step $k$ run after both CUDA streams finish. **1.38x** on `era5_pretrained` and **1.29x** on `hres_0.1` vs staged (4-step rollout, 2x RTX 5090). Large grids run nearer VRAM limits under overlap.
+- **Overlap export** (`overlap_rollout=True`, default): step $k{-}1$ export on `cuda:0` runs in parallel with step $k$ backbone on `cuda:1`. Encoder and decoder for step $k$ run after both CUDA streams finish. On 2x RTX 5090 (32 GiB): **1.38x** on `era5_pretrained` and **1.29x** on `hres_0.1` vs staged (4-step rollout). On 2x RTX 4090 (24 GiB): **1.46x** on `era5_pretrained`; `hres_0.1` is near parity because export and backbone already saturate both cards.
 
 See [Distributed pipeline](#distributed-pipeline) and `benchmark/bench_distributed_rollout.py`.
 
-| `era5_pretrained` staged | `era5_pretrained` overlap |
+| `era5_pretrained` staged (5090) | `era5_pretrained` overlap (5090) |
 | :--: | :--: |
-| ![era5 2-GPU staged rollout](docs/image/distributed_rollout_utilization_2gpu_staged.png) | ![era5 2-GPU overlap rollout](docs/image/distributed_rollout_utilization_2gpu_overlap.png) |
+| ![era5 2-GPU staged rollout on 5090](docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu_staged.png) | ![era5 2-GPU overlap rollout on 5090](docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu_overlap.png) |
 
-| `hres_0.1` staged | `hres_0.1` overlap |
+| `hres_0.1` staged (5090) | `hres_0.1` overlap (5090) |
 | :--: | :--: |
-| ![hres_0.1 2-GPU staged rollout](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_staged.png) | ![hres_0.1 2-GPU overlap rollout](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_overlap.png) |
+| ![hres_0.1 2-GPU staged rollout on 5090](docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu_staged.png) | ![hres_0.1 2-GPU overlap rollout on 5090](docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu_overlap.png) |
 
-`era5_pretrained` ($721 \times 1440$), staged left and overlap right. `hres_0.1` ($1801 \times 3600$), staged left and overlap right.
+| `era5_pretrained` staged (4090) | `era5_pretrained` overlap (4090) |
+| :--: | :--: |
+| ![era5 2-GPU staged rollout on 4090](docs/image/distributed_rollout_utilization_4090_era5_pretrained_2gpu_staged.png) | ![era5 2-GPU overlap rollout on 4090](docs/image/distributed_rollout_utilization_4090_era5_pretrained_2gpu_overlap.png) |
+
+| `hres_0.1` staged (4090) | `hres_0.1` overlap (4090) |
+| :--: | :--: |
+| ![hres_0.1 2-GPU staged rollout on 4090](docs/image/distributed_rollout_utilization_4090_hres_0.1_2gpu_staged.png) | ![hres_0.1 2-GPU overlap rollout on 4090](docs/image/distributed_rollout_utilization_4090_hres_0.1_2gpu_overlap.png) |
+
+`era5_pretrained` ($721 \times 1440$), staged left and overlap right. `hres_0.1` ($1801 \times 3600$), staged left and overlap right. Filename pattern: `distributed_rollout_utilization_{gpu}_{preset}_{mode}.png`.
 
 ## Install
 
@@ -1089,11 +1097,15 @@ Step $0$ has no prior export, so encoder, backbone, and decoder run back-to-back
 
 On `era5_pretrained`, `cuda:0` is lightly loaded during backbone (about 8% of forward time vs about 63% on `cuda:1`), so export can run behind backbone without fighting for the same SMs.
 
-On `hres_0.1`, the grid is $2.5\times$ wider and $2.5\times$ taller than ERA5. Each export step moves more data and both devices stay busier. Overlap still wins on throughput (**1.29x** vs staged in our 4-step run), but peak VRAM rises from cuda:0=27.2 and cuda:1=27.9 GiB (staged) to cuda:0=29.1 and cuda:1=28.0 GiB (overlap). Use overlap when you need throughput on large grids, not as a default that always lowers load.
+On `hres_0.1`, the grid is $2.5\times$ wider and $2.5\times$ taller than ERA5. Each export step moves more data and both devices stay busier. On 2x RTX 5090, overlap still wins on throughput (**1.29x** vs staged in our 4-step run), but peak VRAM rises from cuda:0=27.2 and cuda:1=27.9 GiB (staged) to cuda:0=29.1 and cuda:1=28.0 GiB (overlap). On 2x RTX 4090 (24 GiB), overlap does not improve latency for `hres_0.1` because both GPUs are already busy and cuda:0 runs nearer its memory ceiling under overlap.
 
 #### 4-step rollout benchmark
 
-`bf16_mixed@fp32`, warmup 1, repeat 3, 2x RTX 5090 (about 32 GiB). Each mode runs in a fresh subprocess so JIT and cuDNN state do not carry between modes.
+`bf16_mixed@fp32`, warmup 1, repeat 3. Each mode runs in a fresh subprocess so JIT and cuDNN state do not carry between modes.
+
+##### 2x NVIDIA RTX 5090 (32 GiB)
+
+NVIDIA RTX PRO 6000 Blackwell Server Edition class, PyTorch **2.12.1**, `CUTE_DSL_ARCH=sm_120a`, `--max-vram-gib 32`.
 
 **era5_pretrained** ($721 \times 1440$)
 
@@ -1104,7 +1116,7 @@ On `hres_0.1`, the grid is $2.5\times$ wider and $2.5\times$ taller than ERA5. E
 | `2gpu_overlap` (default)   | 4816       | 1204          | cuda:0=13.9, cuda:1=18.8 |
 
 
-Overlap export vs staged rollout: **1.38x** faster (about 1835 ms saved over 4 steps). Utilization plots: [staged](docs/image/distributed_rollout_utilization_2gpu_staged.png), [overlap](docs/image/distributed_rollout_utilization_2gpu_overlap.png).
+Overlap export vs staged rollout: **1.38x** faster (about 1835 ms saved over 4 steps). Utilization plots: [staged](docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu_staged.png), [overlap](docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu_overlap.png).
 
 **hres_0.1** ($1801 \times 3600$, AuroraHighRes LoRA merged)
 
@@ -1115,7 +1127,33 @@ Overlap export vs staged rollout: **1.38x** faster (about 1835 ms saved over 4 s
 | `2gpu_overlap` (default)   | 14112      | 3528          | cuda:0=29.1, cuda:1=28.0 |
 
 
-Overlap export vs staged rollout: **1.29x** faster (about 4024 ms saved over 4 steps). Both GPUs run nearer VRAM and utilization limits because export on `cuda:0` overlaps backbone on `cuda:1` while large-grid tensors stay on device longer. Utilization plots: [staged](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_staged.png), [overlap](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_overlap.png).
+Overlap export vs staged rollout: **1.29x** faster (about 4024 ms saved over 4 steps). Utilization plots: [staged](docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu_staged.png), [overlap](docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu_overlap.png).
+
+##### 2x NVIDIA GeForce RTX 4090 (24 GiB)
+
+Host: **32 vCPU** AMD EPYC 9654 96-Core Processor, **120 GiB** system memory, PyTorch **2.12.1**, `CUTE_DSL_ARCH=sm_89`, `--max-vram-gib 24 --force`.
+
+**era5_pretrained** ($721 \times 1440$)
+
+
+| mode                       | total (ms) | per step (ms) | peak alloc (GiB)         |
+| -------------------------- | ---------- | ------------- | ------------------------ |
+| `2gpu_staged` (no overlap) | 12934      | 3233          | cuda:0=13.1, cuda:1=17.9 |
+| `2gpu_overlap` (default)   | 8831       | 2208          | cuda:0=12.5, cuda:1=17.9 |
+
+
+Overlap export vs staged rollout: **1.46x** faster (about 4102 ms saved over 4 steps). Utilization plots: [staged](docs/image/distributed_rollout_utilization_4090_era5_pretrained_2gpu_staged.png), [overlap](docs/image/distributed_rollout_utilization_4090_era5_pretrained_2gpu_overlap.png).
+
+**hres_0.1** ($1801 \times 3600$, AuroraHighRes LoRA merged)
+
+
+| mode                       | total (ms) | per step (ms) | peak alloc (GiB)         |
+| -------------------------- | ---------- | ------------- | ------------------------ |
+| `2gpu_staged` (no overlap) | 14458      | 3614          | cuda:0=20.4, cuda:1=22.6 |
+| `2gpu_overlap` (default)   | 14422      | 3606          | cuda:0=23.7, cuda:1=22.6 |
+
+
+Overlap export vs staged rollout: **1.00x** (about 36 ms saved over 4 steps). Peak cuda:0 rises under overlap while cuda:1 stays flat. Utilization plots: [staged](docs/image/distributed_rollout_utilization_4090_hres_0.1_2gpu_staged.png), [overlap](docs/image/distributed_rollout_utilization_4090_hres_0.1_2gpu_overlap.png).
 
 ```bash
 export AURORA_ASSET_ROOT=/path/to/aurora
@@ -1126,11 +1164,18 @@ CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_pipeline_profile.py \\
   --preset era5_pretrained --asset-root "$AURORA_ASSET_ROOT" \\
   --inference-precision bf16_mixed@fp32 --skip-download --force --warmup 1 --repeat 5
 
-# Multi-step rollout: staged vs overlap + utilization figures (one 2x2 PNG per mode)
+# Multi-step rollout: staged vs overlap + utilization figures (5090)
 CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_distributed_rollout.py \\
   --preset era5_pretrained hres_0.1 --inference-precision bf16_mixed@fp32 \\
   --steps 4 --skip-download --force --warmup 1 --repeat 3 --no-prompt \\
-  --plot-utilization docs/image/distributed_rollout_utilization.png
+  --plot-utilization docs/image/distributed_rollout_utilization_5090.png
+
+# Same harness on 2x RTX 4090 (24 GiB); set max VRAM to match card size
+CUTE_DSL_ARCH=sm_89 uv run python benchmark/bench_distributed_rollout.py \\
+  --preset era5_pretrained hres_0.1 --inference-precision bf16_mixed@fp32 \\
+  --steps 4 --skip-download --force --warmup 1 --repeat 3 --no-prompt \\
+  --max-vram-gib 24 \\
+  --plot-utilization docs/image/distributed_rollout_utilization_4090.png
 
 # Programmatic use
 python - <<'PY'
