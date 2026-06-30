@@ -50,7 +50,8 @@ Dependencies are declared in `pyproject.toml` and pinned by `uv.lock`. CuTe DSL 
 | `flash_aurora/engine/core/`                  | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle.                        |
 | `flash_aurora/engine/ingress/`               | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, optional IC disk cache.                             |
 | `flash_aurora/engine/egress/`                | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                     |
-| `flash_aurora/engine/runtime/`               | `GraphPool`, `GpuGuard`, VRAM budget estimates, IC/load overlap, `ResourceMonitor`.                                                 |
+| `flash_aurora/engine/runtime/`               | `GraphPool`, `GpuGuard`, VRAM budget estimates, IC/load overlap, `ResourceMonitor`, CUDA memory helpers.                            |
+| `flash_aurora/engine/distributed/`           | `DistributedConfig`, VRAM planner (`plan.py`), pipeline forward (`pipeline.py`, `rollout_pipeline.py`), spatial decoder split (`decoder_spatial.py`); single-process multi-GPU rollout. |
 | `flash_aurora/scheduler/worker.py`           | `ForecastWorker`, single-GPU job queue, CLI (`python -m flash_aurora.scheduler`).                                                   |
 | `flash_aurora/scheduler/coordinator.py`      | `ForecastCoordinator`, multi-worker dispatch, queueing, sticky sessions.                                                            |
 | `flash_aurora/scheduler/coordinator_main.py` | Coordinator CLI entry.                                                                                                              |
@@ -59,10 +60,10 @@ Dependencies are declared in `pyproject.toml` and pinned by `uv.lock`. CuTe DSL 
 | `flash_aurora/scheduler/processes.py`        | Scoped stale-process cleanup, process-tree termination, graceful shutdown helpers.                                                  |
 | `flash_aurora/scheduler/supervisor.py`       | `SchedulerSupervisor`, system-wide orphan reclaim.                                                                                  |
 | `docs/`                                      | Tutorial notebooks: in-process presets (`example_*.ipynb`) and ZMQ scheduler (`example_scheduler_*.ipynb`, `example_scheduler.py`). |
-| `benchmark/`                                 | Kernel- and model-level timing scripts (`bench_aurora_latency_all.py`, `bench_window_attn.py`, etc.).                               |
+| `benchmark/`                                 | Kernel- and model-level timing scripts (`bench_aurora_latency_all.py`, `bench_window_attn.py`, `bench_distributed_rollout.py`, etc.). |
 | `tests/aurora/`                              | Model fork and rollout unit tests.                                                                                                  |
 | `tests/kernels/`                             | Triton and CuTe kernel tests.                                                                                                       |
-| `tests/engine/`                              | Engine, ingress, egress, runtime, and GPU guard tests.                                                                              |
+| `tests/engine/`                              | Engine, ingress, egress, runtime, distributed pipeline, and GPU guard tests.                                                      |
 | `tests/scheduler/`                           | Protocol, worker, coordinator, process cleanup, and supervisor tests.                                                               |
 
 
@@ -70,26 +71,27 @@ Run tests: `./scripts/run_tests.sh`
 
 ## Reading guide
 
-Use the Engine section first if you want to run forecasts or integrate Flash-Aurora in another application. Use the Forecast scheduler section when inference must run outside the notebook process or when one host has multiple GPUs. Tutorial notebooks under `docs/` cover each preset in process and both scheduler deployment modes. Use the benchmark sections when comparing precision tiers or reproducing reported latency and drift numbers.
+Use the Engine section first if you want to run forecasts or integrate Flash-Aurora in another application. Use `engine.distributed` when a preset does not fit one GPU (see [Distributed pipeline](#distributed-pipeline)). Use the Forecast scheduler section when inference must run outside the notebook process or when one host has multiple GPUs. Tutorial notebooks under `docs/` cover each preset in process and both scheduler deployment modes. Use the benchmark sections when comparing precision tiers or reproducing reported latency and drift numbers.
 
 ## Engine (`flash_aurora.engine`)
 
-`flash_aurora.engine` is the preset-driven inference layer. It combines model variants, data profiles, checkpoint resolution, batch validation, rollout, and NetCDF export. In-process tutorials live under `docs/example_*.ipynb`. Out-of-process serving is documented in the Forecast scheduler (ZMQ) section below.
+`flash_aurora.engine` is the preset-driven inference layer. It combines model variants, data profiles, checkpoint resolution, batch validation, rollout, NetCDF export, and optional single-process pipeline parallelism across GPUs (`engine.distributed`). In-process tutorials live under `docs/example_*.ipynb`. Out-of-process serving is documented in the Forecast scheduler (ZMQ) section below.
 
 ### Architecture
 
-The engine has four layers. Data flows from download and adapters into a validated `Batch`, through `prepare()` (initial-condition construction and model load), autoregressive rollout, and optionally to forecast NetCDF.
+The engine has five layers. Data flows from download and adapters into a validated `Batch`, through `prepare()` (initial-condition construction and model load), autoregressive rollout, and optionally to forecast NetCDF.
 
 
-| Layer   | Path              | Role                                                                                                                                  |
-| ------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Core    | `engine/core/`    | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle (`close`, `release_gpu`). |
-| Ingress | `engine/ingress/` | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, static fields, optional IC disk cache (`ic_cache`).   |
-| Egress  | `engine/egress/`  | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                       |
-| Runtime | `engine/runtime/` | `GraphPool`, cross-process `GpuGuard`, VRAM budget estimates, IC/load overlap (`rollout_prep`), `ResourceMonitor`.                    |
+| Layer       | Path                    | Role                                                                                                                                  |
+| ----------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Core        | `engine/core/`          | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle (`close`, `release_gpu`). |
+| Ingress     | `engine/ingress/`       | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, static fields, optional IC disk cache (`ic_cache`).   |
+| Egress      | `engine/egress/`        | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                       |
+| Runtime     | `engine/runtime/`       | `GraphPool`, cross-process `GpuGuard`, VRAM budget estimates, IC/load overlap (`rollout_prep`), `ResourceMonitor`.                    |
+| Distributed | `engine/distributed/`   | `DistributedConfig`, `plan_parallelism`, encoder/backbone/decoder placement, `distributed_rollout` with optional overlap export.        |
 
 
-A preset pairs a `ModelVariantSpec` with a `SourceProfile`. The model spec defines checkpoint files, variables, grid shape $H \times W$, and timestep $\Delta t$. The source profile defines schema, latitude convention, and cache layout. `DataDownloader.ensure()` fills the cache. `InitialConditionBuilder` reads cached files or adapter requests and attaches static fields. `BatchValidator` checks tensor shapes and variable names. `AuroraEngine.prepare()` builds the initial condition, loads the checkpoint, and can overlap IC construction with model initialization. `AuroraEngine.load()` resolves checkpoints, applies `inference_precision`, and can acquire a `GpuGuard` lease. `rollout_stream()` advances $K$ autoregressive steps by $\Delta t$ per step. `rollout_and_export()` writes NetCDF files under `export_dir`. `release_gpu()` releases the lease between jobs; `close()` performs terminal teardown without moving weights to CPU.
+A preset pairs a `ModelVariantSpec` with a `SourceProfile`. The model spec defines checkpoint files, variables, grid shape $H \times W$, and timestep $\Delta t$. The source profile defines schema, latitude convention, and cache layout. `DataDownloader.ensure()` fills the cache. `InitialConditionBuilder` reads cached files or adapter requests and attaches static fields. `BatchValidator` checks tensor shapes and variable names. `AuroraEngine.prepare()` builds the initial condition, loads the checkpoint, and can overlap IC construction with model initialization. `AuroraEngine.load()` resolves checkpoints, applies `inference_precision`, and can acquire a `GpuGuard` lease. When `EngineConfig.distributed` is set, `load()` also applies pipeline placement via `apply_pipeline_parallel()`. `rollout_stream()` advances $K$ autoregressive steps by $\Delta t$ per step; with overlap export enabled, the distributed path hides NetCDF D2H behind backbone work on the next step. `rollout_and_export()` writes NetCDF files under `export_dir`. `release_gpu()` releases the lease between jobs; `close()` performs terminal teardown without moving weights to CPU.
 
 ### Presets and data sources
 
@@ -109,7 +111,24 @@ Personal ECMWF accounts typically lack MARS archive access. For `wave`, place `{
 
 ### Capabilities
 
-The engine supports local checkpoint and static asset management with optional Hugging Face Hub download (`allow_hub_download`, mirror via `HF_MIRROR_ENDPOINT`). `EngineConfig.inference_precision` selects the Triton fusion base and, when set, TF32/BF16 GEMM and CuTe DSL window attention. Ingress covers CDS (ERA5), ADS (CAMS), WeatherBench2 (HRES meteorology), ECMWF Open Data ($0.1^{\circ}$ GRIB), and MARS (wave GRIB when permitted); credentials merge from environment variables, `~/.cdsapirc`, `~/.ecmwfapirc`, and optional constructor kwargs. Multi-step rollout is available through `rollout_stream(batch, K)` and `run_from_netcdf(..., steps=K)`, with optional `RolloutObserver` hooks per step. `rollout_and_export()` writes forecast steps to `export_dir`; an optional async pipeline (Earth-2 style) overlaps GPU-to-CPU offload and disk writes with the next forward step. `prepare()` can build initial conditions on a background thread while the model loads (`overlap_ic_load`, default on). Optional `ic_cache` stores post-processed batches on disk for repeated runs on the same analysis time. Experimental CUDA graph capture (`engine.config.cuda_graph=True`) is off by default; see CUDA graph status below. `GpuGuard` (default on) estimates VRAM from variant, precision tier, and rollout depth and queues large jobs when memory is saturated; disable with `gpu_guard=False` or `FLASH_AURORA_GPU_GUARD=0`. Idempotent `close()`, context managers, and `release_gpu(move_model_to_cpu=...)` release the `GpuGuard` lease and CUDA cache; terminal `close()` skips CPU weight migration, and exception paths in `load()`, `prepare()`, and `rollout_stream()` call `release_gpu()` before propagating errors. `ResourceMonitor` samples host CPU, DRAM, per-device GPU utilization, and VRAM over time; `plot_resource_usage()` renders utilization curves for scheduler tutorials and operational diagnostics.
+The engine supports local checkpoint and static asset management with optional Hugging Face Hub download (`allow_hub_download`, mirror via `HF_MIRROR_ENDPOINT`). `EngineConfig.inference_precision` selects the Triton fusion base and, when set, TF32/BF16 GEMM and CuTe DSL window attention. `EngineConfig.distributed` (`DistributedConfig`) enables single-process pipeline parallelism across two or more GPUs: `plan_parallelism()` picks encoder, backbone, and decoder placement from preset shape and per-device VRAM limits; optional spatial decoder split and overlap export are configured there. See [Distributed pipeline](#distributed-pipeline) below and in End to End Benchmarks for staged vs overlap rollout and timing tables. Ingress covers CDS (ERA5), ADS (CAMS), WeatherBench2 (HRES meteorology), ECMWF Open Data ($0.1^{\circ}$ GRIB), and MARS (wave GRIB when permitted); credentials merge from environment variables, `~/.cdsapirc`, `~/.ecmwfapirc`, and optional constructor kwargs. Multi-step rollout is available through `rollout_stream(batch, K)` and `run_from_netcdf(..., steps=K)`, with optional `RolloutObserver` hooks per step. `rollout_and_export()` writes forecast steps to `export_dir`; an optional async pipeline (Earth-2 style) overlaps GPU-to-CPU offload and disk writes with the next forward step. `prepare()` can build initial conditions on a background thread while the model loads (`overlap_ic_load`, default on). Optional `ic_cache` stores post-processed batches on disk for repeated runs on the same analysis time. Experimental CUDA graph capture (`engine.config.cuda_graph=True`) is off by default; see CUDA graph status below. `GpuGuard` (default on) estimates VRAM from variant, precision tier, and rollout depth and queues large jobs when memory is saturated; disable with `gpu_guard=False` or `FLASH_AURORA_GPU_GUARD=0`. Idempotent `close()`, context managers, and `release_gpu(move_model_to_cpu=...)` release the `GpuGuard` lease and CUDA cache; terminal `close()` skips CPU weight migration, and exception paths in `load()`, `prepare()`, and `rollout_stream()` call `release_gpu()` before propagating errors. `ResourceMonitor` samples host CPU, DRAM, per-device GPU utilization, and VRAM over time; `plot_resource_usage()` renders utilization curves for scheduler tutorials and operational diagnostics. `AuroraEngine.distributed_status()` reports the active pipeline plan when distributed mode is enabled.
+
+### Distributed pipeline (`engine/distributed/`)
+
+Single-process pipeline parallelism for presets that exceed one GPU (not `torchrun`). All Aurora presets share the same encoder / backbone / decoder layout; distributed mode only changes device placement and rollout export scheduling. Checkpoint loading and forward math are unchanged.
+
+
+| Module               | Role                                                                                                                                    |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `config.py`          | `DistributedConfig`, `ParallelPlan`, stage enum.                                                                                        |
+| `plan.py`            | `plan_parallelism()`, `requires_parallelism()`, VRAM and compute heuristics per variant.                                                |
+| `pipeline.py`        | `apply_pipeline_parallel()`, patched multi-device `forward`.                                                                            |
+| `rollout_pipeline.py`| `distributed_rollout()`; staged steps or overlap export across CUDA streams.                                                           |
+| `decoder_spatial.py` | West/east spatial decoder split when two GPUs share decode work.                                                                        |
+| `batch_utils.py`     | Cross-device batch field moves for pipeline stages.                                                                                     |
+
+
+Pass `distributed=DistributedConfig(devices=("cuda:0", "cuda:1"), ...)` to `AuroraEngine.from_preset()` or set `engine.config.distributed` before `load()`. Workers accept the same settings via `--distributed-devices cuda:0,cuda:1` (see scheduler CLI). Benchmarks: `benchmark/bench_distributed_rollout.py`.
 
 ### Forecast scheduler (ZMQ)
 
@@ -275,6 +294,7 @@ engine = AuroraEngine.from_preset(
     export_use_egress_stream=True,  # dedicated CUDA stream for async export D2H
     ic_cache=False,  # disk cache for repeated same-day IC builds
     forward_warmup_iters=2,  # untimed forwards after prepare; 0 disables
+    distributed=None,  # DistributedConfig for pipeline parallelism; None is single-GPU
     presets=None,  # optional custom PresetRegistry
 )
 # EngineConfig-only (set after from_preset):
