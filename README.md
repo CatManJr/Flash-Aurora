@@ -4,21 +4,23 @@ Flash-Aurora is an inference stack for the [Microsoft Aurora](https://github.com
 
 ## Highlights
 
-**CuTe DSL window attention.** 2 kernels (BF16 and 1xTF32 simulated FP32) tuned for Aurora window shapes ($N{=}144/36/9$) with FP32 online softmax. **1.07-1.22x** vs BF16 SDPA and **1.59-1.69x** vs FP32 SDPA on encoder-stage window microbenchmarks. See [Window attention kernels](#window-attention-kernels).
+**CuTe DSL window attention.** 2 kernels (BF16 and 1xTF32 simulated FP32) tuned for Aurora window shapes ($patch_size = 14 \Rightarrow N{=}144$) with FP32 online softmax. **1.07-1.22x** vs BF16 SDPA and **1.59-1.69x** vs FP32 SDPA on encoder-stage window microbenchmarks. See [Window attention kernels](#window-attention-kernels).
 
 **Mixed precision.** Tiers use the label `backbone@encoder_decoder` (see [Precision tiers](#precision-tiers)). Default production tier is `bf16_mixed@fp32`:
 
-- **`bf16_mixed` backbone:** BF16 CuTe DSL window attention and BF16 MLP; TF32 Tensor Core GEMM on the remaining Swin matmul; FP32 activations between blocks via Triton fusion so deep backbone stages stay numerically close to FP32.
-- **`tf32` backbone:** TF32 Tensor Core GEMM throughout Swin plus CuTe DSL attention with FP32 I/O; near-FP32 fidelity on attention, moderate speedup over strict `fp32`.
-- **`fp32` backbone:** Strict FP32 GEMM and PyTorch SDPA; accuracy baseline for drift tables, still with Triton layout and AdaLN fusion.
+- **bf16_mixed backbone:** BF16 CuTe DSL window attention and BF16 MLP; TF32 Tensor Core GEMM on the remaining Swin matmul; FP32 activations between blocks via Triton fusion so deep backbone stages stay numerically close to FP32.
+- **tf32 backbone:** TF32 Tensor Core GEMM throughout Swin plus CuTe DSL attention with FP32 I/O; near-FP32 fidelity on attention, moderate speedup over strict `fp32`.
+- **fp32 backbone:** Strict FP32 GEMM and PyTorch SDPA; accuracy baseline for drift tables, still with Triton layout and AdaLN fusion.
 
-Encoder and Perceiver decoder stay **`@fp32`** because they map between full-grid fields and latent tokens. Matmul error there feeds straight into output variables, while the Swin backbone dominates runtime (about 63% on `era5_pretrained`). Tensor Core matmul on encoder/decoder buys little latency on weather presets but widens per-variable drift; see [Precision drift](#precision-drift-seed-42-lora_merged-on-finetuned-presets).
+Encoder and Perceiver decoder stay **@fp32** because they map between full-grid fields and latent tokens. Matmul error there feeds straight into output variables, while the Swin backbone dominates runtime (about 63% on `era5_pretrained`). Tensor Core matmul on encoder/decoder buys little latency on weather presets but widens per-variable drift; see [Precision drift](#precision-drift-seed-42-lora_merged-on-finetuned-presets).
 
-Headline latency: **`bf16_mixed@fp32`** is **~3.2x** vs PyTorch FP32 on `era5_pretrained` (~680 ms/step) and **~3x** on finetuned presets with merged LoRA. Full tables: [End to End Benchmarks](#end-to-end-benchmarks).
+Headline latency: **bf16_mixed@fp32** is **about 3.2x** vs PyTorch FP32 on `era5_pretrained` (about 680 ms/step) and **about 3x** on finetuned presets with merged LoRA. Full tables: [End to End Benchmarks](#end-to-end-benchmarks).
 
 **Multi-GPU serving.** One ZMQ worker per GPU, each bound to a preset. The coordinator routes forecast requests to a matching idle worker and streams events back to the client. This is job-level scheduling across heterogeneous models, not tensor parallelism inside one rollout. A single client can run `era5_pretrained`, `hres_t0_finetuned`, `hres_0.1`, and `cams` on four GPUs at the same time. When one preset is slow to prepare (for example `hres_0.1`), the client can queue more work on the other workers instead of leaving those GPUs idle. See [Forecast scheduler (ZMQ)](#forecast-scheduler-zmq).
 
-<p align="center"><img src="docs/image/4_workers.png" width="49%" alt="four heterogeneous presets dispatched in parallel" /> <img src="docs/image/4_workers_refill.png" width="49%" alt="refill faster workers while HRES is pending" /><br/><sub>Left: first dispatch, one job per worker and preset. Right: refill while `hres_0.1` is still pending. Faster workers take follow-up jobs so aggregate throughput stays high. Traces from `docs/example_scheduler_distributed_workers.ipynb` on 4x RTX PRO 6000.</sub></p>
+four heterogeneous presets dispatched in parallelrefill faster workers while HRES is pending
+
+Left: first dispatch, one job per worker and preset. Right: refill while `hres_0.1` is still pending. Faster workers take follow-up jobs so aggregate throughput stays high. Traces from `docs/example_scheduler_distributed_workers.ipynb` on 4x RTX PRO 6000.
 
 **Pipeline parallelism for GPUs less than 40GB.** Splits encoder, backbone, and spatial decoder across two GPUs inside one process (`DistributedConfig`, not `torchrun`). Large presets such as `era5_pretrained` and `hres_0.1` do not fit a single card in this VRAM range. Spatial decoder split cuts peak decoder VRAM from about 28 GiB on one card to about 14 GiB per card on ERA5.
 
@@ -27,7 +29,9 @@ Headline latency: **`bf16_mixed@fp32`** is **~3.2x** vs PyTorch FP32 on `era5_pr
 
 See [Distributed pipeline](#distributed-pipeline) and `benchmark/bench_distributed_rollout.py`.
 
-<p align="center"><img src="docs/image/distributed_rollout_utilization_2gpu_staged.png" width="49%" alt="era5 2-GPU staged rollout" /> <img src="docs/image/distributed_rollout_utilization_2gpu_overlap.png" width="49%" alt="era5 2-GPU overlap rollout" /><br/><img src="docs/image/distributed_rollout_utilization_hres_0.1_2gpu_staged.png" width="49%" alt="hres_0.1 2-GPU staged rollout" /> <img src="docs/image/distributed_rollout_utilization_hres_0.1_2gpu_overlap.png" width="49%" alt="hres_0.1 2-GPU overlap rollout" /><br/><sub>`era5_pretrained` ($721 \times 1440$), staged left and overlap right. `hres_0.1` ($1801 \times 3600$), staged left and overlap right.</sub></p>
+era5 2-GPU staged rolloutera5 2-GPU overlap rollouthres_0.1 2-GPU staged rollouthres_0.1 2-GPU overlap rollout
+
+`era5_pretrained` ($721 \times 1440$), staged then overlap. `hres_0.1` ($1801 \times 3600$), staged then overlap.
 
 ## Install
 
@@ -42,29 +46,29 @@ Dependencies are declared in `pyproject.toml` and pinned by `uv.lock`. CuTe DSL 
 ## Repository layout
 
 
-| Path                                         | Role                                                                                                                                |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `flash_aurora/aurora/`                       | Aurora model (upstream README preserved in place). See `NOTICE.md` and `LICENSE.txt`.                                               |
-| `flash_aurora/aurora/ops/triton/`            | Fused Swin3D layout, AdaLN, and GELU kernels.                                                                                       |
-| `flash_aurora/aurora/ops/cute/`              | CuTe DSL window self-attention and dense GEMM kernels.                                                                              |
-| `flash_aurora/engine/core/`                  | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle.                        |
-| `flash_aurora/engine/ingress/`               | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, optional IC disk cache.                             |
-| `flash_aurora/engine/egress/`                | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                     |
-| `flash_aurora/engine/runtime/`               | `GraphPool`, `GpuGuard`, VRAM budget estimates, IC/load overlap, `ResourceMonitor`, CUDA memory helpers.                            |
+| Path                                         | Role                                                                                                                                                                                    |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `flash_aurora/aurora/`                       | Aurora model (upstream README preserved in place). See `NOTICE.md` and `LICENSE.txt`.                                                                                                   |
+| `flash_aurora/aurora/ops/triton/`            | Fused Swin3D layout, AdaLN, and GELU kernels.                                                                                                                                           |
+| `flash_aurora/aurora/ops/cute/`              | CuTe DSL window self-attention and dense GEMM kernels.                                                                                                                                  |
+| `flash_aurora/engine/core/`                  | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle.                                                                            |
+| `flash_aurora/engine/ingress/`               | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, optional IC disk cache.                                                                                 |
+| `flash_aurora/engine/egress/`                | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                                                                         |
+| `flash_aurora/engine/runtime/`               | `GraphPool`, `GpuGuard`, VRAM budget estimates, IC/load overlap, `ResourceMonitor`, CUDA memory helpers.                                                                                |
 | `flash_aurora/engine/distributed/`           | `DistributedConfig`, VRAM planner (`plan.py`), pipeline forward (`pipeline.py`, `rollout_pipeline.py`), spatial decoder split (`decoder_spatial.py`); single-process multi-GPU rollout. |
-| `flash_aurora/scheduler/worker.py`           | `ForecastWorker`, single-GPU job queue, CLI (`python -m flash_aurora.scheduler`).                                                   |
-| `flash_aurora/scheduler/coordinator.py`      | `ForecastCoordinator`, multi-worker dispatch, queueing, sticky sessions.                                                            |
-| `flash_aurora/scheduler/coordinator_main.py` | Coordinator CLI entry.                                                                                                              |
-| `flash_aurora/scheduler/client.py`           | `ForecastClient`, command submission, event streaming.                                                                              |
-| `flash_aurora/scheduler/protocol.py`         | JSON wire types (`ForecastRequest`, `ForecastEvent`, `ForecastCommand`).                                                            |
-| `flash_aurora/scheduler/processes.py`        | Scoped stale-process cleanup, process-tree termination, graceful shutdown helpers.                                                  |
-| `flash_aurora/scheduler/supervisor.py`       | `SchedulerSupervisor`, system-wide orphan reclaim.                                                                                  |
-| `docs/`                                      | Tutorial notebooks: in-process presets (`example_*.ipynb`) and ZMQ scheduler (`example_scheduler_*.ipynb`, `example_scheduler.py`). |
-| `benchmark/`                                 | Kernel- and model-level timing scripts (`bench_aurora_latency_all.py`, `bench_window_attn.py`, `bench_distributed_rollout.py`, etc.). |
-| `tests/aurora/`                              | Model fork and rollout unit tests.                                                                                                  |
-| `tests/kernels/`                             | Triton and CuTe kernel tests.                                                                                                       |
-| `tests/engine/`                              | Engine, ingress, egress, runtime, distributed pipeline, and GPU guard tests.                                                      |
-| `tests/scheduler/`                           | Protocol, worker, coordinator, process cleanup, and supervisor tests.                                                               |
+| `flash_aurora/scheduler/worker.py`           | `ForecastWorker`, single-GPU job queue, CLI (`python -m flash_aurora.scheduler`).                                                                                                       |
+| `flash_aurora/scheduler/coordinator.py`      | `ForecastCoordinator`, multi-worker dispatch, queueing, sticky sessions.                                                                                                                |
+| `flash_aurora/scheduler/coordinator_main.py` | Coordinator CLI entry.                                                                                                                                                                  |
+| `flash_aurora/scheduler/client.py`           | `ForecastClient`, command submission, event streaming.                                                                                                                                  |
+| `flash_aurora/scheduler/protocol.py`         | JSON wire types (`ForecastRequest`, `ForecastEvent`, `ForecastCommand`).                                                                                                                |
+| `flash_aurora/scheduler/processes.py`        | Scoped stale-process cleanup, process-tree termination, graceful shutdown helpers.                                                                                                      |
+| `flash_aurora/scheduler/supervisor.py`       | `SchedulerSupervisor`, system-wide orphan reclaim.                                                                                                                                      |
+| `docs/`                                      | Tutorial notebooks: in-process presets (`example_*.ipynb`) and ZMQ scheduler (`example_scheduler_*.ipynb`, `example_scheduler.py`).                                                     |
+| `benchmark/`                                 | Kernel- and model-level timing scripts (`bench_aurora_latency_all.py`, `bench_window_attn.py`, `bench_distributed_rollout.py`, etc.).                                                   |
+| `tests/aurora/`                              | Model fork and rollout unit tests.                                                                                                                                                      |
+| `tests/kernels/`                             | Triton and CuTe kernel tests.                                                                                                                                                           |
+| `tests/engine/`                              | Engine, ingress, egress, runtime, distributed pipeline, and GPU guard tests.                                                                                                            |
+| `tests/scheduler/`                           | Protocol, worker, coordinator, process cleanup, and supervisor tests.                                                                                                                   |
 
 
 Run tests: `./scripts/run_tests.sh`
@@ -82,13 +86,13 @@ Use the Engine section first if you want to run forecasts or integrate Flash-Aur
 The engine has five layers. Data flows from download and adapters into a validated `Batch`, through `prepare()` (initial-condition construction and model load), autoregressive rollout, and optionally to forecast NetCDF.
 
 
-| Layer       | Path                    | Role                                                                                                                                  |
-| ----------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Core        | `engine/core/`          | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle (`close`, `release_gpu`). |
-| Ingress     | `engine/ingress/`       | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, static fields, optional IC disk cache (`ic_cache`).   |
-| Egress      | `engine/egress/`        | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                       |
-| Runtime     | `engine/runtime/`       | `GraphPool`, cross-process `GpuGuard`, VRAM budget estimates, IC/load overlap (`rollout_prep`), `ResourceMonitor`.                    |
-| Distributed | `engine/distributed/`   | `DistributedConfig`, `plan_parallelism`, encoder/backbone/decoder placement, `distributed_rollout` with optional overlap export.        |
+| Layer       | Path                  | Role                                                                                                                                  |
+| ----------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Core        | `engine/core/`        | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle (`close`, `release_gpu`). |
+| Ingress     | `engine/ingress/`     | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, static fields, optional IC disk cache (`ic_cache`).   |
+| Egress      | `engine/egress/`      | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                       |
+| Runtime     | `engine/runtime/`     | `GraphPool`, cross-process `GpuGuard`, VRAM budget estimates, IC/load overlap (`rollout_prep`), `ResourceMonitor`.                    |
+| Distributed | `engine/distributed/` | `DistributedConfig`, `plan_parallelism`, encoder/backbone/decoder placement, `distributed_rollout` with optional overlap export.      |
 
 
 A preset pairs a `ModelVariantSpec` with a `SourceProfile`. The model spec defines checkpoint files, variables, grid shape $H \times W$, and timestep $\Delta t$. The source profile defines schema, latitude convention, and cache layout. `DataDownloader.ensure()` fills the cache. `InitialConditionBuilder` reads cached files or adapter requests and attaches static fields. `BatchValidator` checks tensor shapes and variable names. `AuroraEngine.prepare()` builds the initial condition, loads the checkpoint, and can overlap IC construction with model initialization. `AuroraEngine.load()` resolves checkpoints, applies `inference_precision`, and can acquire a `GpuGuard` lease. When `EngineConfig.distributed` is set, `load()` also applies pipeline placement via `apply_pipeline_parallel()`. `rollout_stream()` advances $K$ autoregressive steps by $\Delta t$ per step; with overlap export enabled, the distributed path hides NetCDF D2H behind backbone work on the next step. `rollout_and_export()` writes NetCDF files under `export_dir`. `release_gpu()` releases the lease between jobs; `close()` performs terminal teardown without moving weights to CPU.
@@ -118,14 +122,14 @@ The engine supports local checkpoint and static asset management with optional H
 Single-process pipeline parallelism for presets that exceed one GPU (not `torchrun`). All Aurora presets share the same encoder / backbone / decoder layout; distributed mode only changes device placement and rollout export scheduling. Checkpoint loading and forward math are unchanged.
 
 
-| Module               | Role                                                                                                                                    |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `config.py`          | `DistributedConfig`, `ParallelPlan`, stage enum.                                                                                        |
-| `plan.py`            | `plan_parallelism()`, `requires_parallelism()`, VRAM and compute heuristics per variant.                                                |
-| `pipeline.py`        | `apply_pipeline_parallel()`, patched multi-device `forward`.                                                                            |
-| `rollout_pipeline.py`| `distributed_rollout()`; staged steps or overlap export across CUDA streams.                                                           |
-| `decoder_spatial.py` | West/east spatial decoder split when two GPUs share decode work.                                                                        |
-| `batch_utils.py`     | Cross-device batch field moves for pipeline stages.                                                                                     |
+| Module                | Role                                                                                     |
+| --------------------- | ---------------------------------------------------------------------------------------- |
+| `config.py`           | `DistributedConfig`, `ParallelPlan`, stage enum.                                         |
+| `plan.py`             | `plan_parallelism()`, `requires_parallelism()`, VRAM and compute heuristics per variant. |
+| `pipeline.py`         | `apply_pipeline_parallel()`, patched multi-device `forward`.                             |
+| `rollout_pipeline.py` | `distributed_rollout()`; staged steps or overlap export across CUDA streams.             |
+| `decoder_spatial.py`  | West/east spatial decoder split when two GPUs share decode work.                         |
+| `batch_utils.py`      | Cross-device batch field moves for pipeline stages.                                      |
 
 
 Pass `distributed=DistributedConfig(devices=("cuda:0", "cuda:1"), ...)` to `AuroraEngine.from_preset()` or set `engine.config.distributed` before `load()`. Workers accept the same settings via `--distributed-devices cuda:0,cuda:1` (see scheduler CLI). Benchmarks: `benchmark/bench_distributed_rollout.py`.
@@ -437,13 +441,13 @@ Default is `False` so arbitrary one-off user NetCDF paths do not write multi-GB 
 Measured on RTX PRO 6000 (`bf16_mixed@fp32`, forward warmup $2$). Forward latency is ${\sim}680$ ms per step on $0.25^{\circ}$ and $0.1^{\circ}$ presets regardless of these flags.
 
 
-| Preset                                                | `overlap_ic_load` | `async_export`                   | Rationale                                                                                                                   |
-| ----------------------------------------------------- | ----------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `hres_0.1`                                            | **On** (default)  | **On** for `K \gtrsim 4`         | IC build (GRIB/regrid) dominates prepare (~2 min); each export step is ~5 s vs ~0.7 s forward. Largest win from both flags. |
-| `era5_pretrained`, `hres_t0_finetuned`, `tc_tracking` | On (default)      | Optional                         | Modest prepare overlap (~4–8 s saved). Export is smaller per step; async helps mainly on longer rollouts.                   |
-| `cams`                                                | On (default)      | Optional for long rollouts       | Medium grid; export cost grows with step count.                                                                             |
-| `wave`                                                | On (default)      | Optional if exporting many steps | Ingress can be heavy when GRIB cache is cold.                                                                               |
-| `small_pretrained`                                    | Off               | Off                              | Fast IC and tiny NetCDF; overhead of threading not worth it.                                                                |
+| Preset                                                | `overlap_ic_load` | `async_export`                   | Rationale                                                                                                                                  |
+| ----------------------------------------------------- | ----------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `hres_0.1`                                            | **On** (default)  | **On** for `K \gtrsim 4`         | IC build (GRIB/regrid) dominates prepare (about 2 min); each export step is about 5 s vs about 0.7 s forward. Largest win from both flags. |
+| `era5_pretrained`, `hres_t0_finetuned`, `tc_tracking` | On (default)      | Optional                         | Modest prepare overlap (about 4–8 s saved). Export is smaller per step; async helps mainly on longer rollouts.                             |
+| `cams`                                                | On (default)      | Optional for long rollouts       | Medium grid; export cost grows with step count.                                                                                            |
+| `wave`                                                | On (default)      | Optional if exporting many steps | Ingress can be heavy when GRIB cache is cold.                                                                                              |
+| `small_pretrained`                                    | Off               | Off                              | Fast IC and tiny NetCDF; overhead of threading not worth it.                                                                               |
 
 
 Turn overlap off when debugging ingress, profiling serial prepare stages, or when the initial condition is already a pre-built NetCDF and `load()` alone is sufficient. Turn async export off for single-step smoke tests, very short rollouts ($K=1$ or $K=2$), or when debugging export correctness.
@@ -967,7 +971,7 @@ Encoder, backbone, and spatial decoder can run on separate GPUs.
 
 Single-process only (one Python interpreter, not `torchrun`). Pass a `DistributedConfig` with two or more CUDA devices. On 32 GiB cards, `era5_pretrained` does **not** fit a single GPU.
 
-#### Pipeline placement (2x5090, `era5_pretrained`)
+#### Pipeline placement (2x RTX 5090, `era5_pretrained`)
 
 The planner in `plan.py` assigns stages to minimize peak VRAM per device. For the default 2-GPU layout:
 
@@ -975,7 +979,7 @@ The planner in `plan.py` assigns stages to minimize peak VRAM per device. For th
 | Device   | Stages                  | Role                                                                                                                                    |
 | -------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `cuda:0` | Encoder + decoder west  | Runs the Perceiver encoder; holds a **replica** of the decoder for the western half of patch columns (`decoder_spatial_parallel=True`). |
-| `cuda:1` | Backbone + decoder east | Runs the Swin backbone (~63% of forward time) and the primary decoder for the eastern patch columns.                                    |
+| `cuda:1` | Backbone + decoder east | Runs the Swin backbone (about 63% of forward time) and the primary decoder for the eastern patch columns.                               |
 
 
 Each autoregressive step runs encoder, then backbone, then decoder. Spatial decoder split does not change the math. Backbone tokens are split along longitude in patch space, each half is decoded independently, and surface and atmos fields are concatenated along width. On `era5_pretrained`, peak decoder VRAM drops from about 28 GiB on one card to about 14 GiB per card. On `hres_0.1` ($1801 \times 3600$) both cards sit near the 32 GiB ceiling (about 27-29 GiB in our runs). Numerical drift stays within bf16 noise.
@@ -994,46 +998,35 @@ Both modes use the same **pipeline placement** above and the same spatial decode
 | Mode               | Config                                                         | Per-step schedule                                                                                                                                                                                                                             |
 | ------------------ | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Staged**         | `overlap_rollout=False` (`2gpu_staged` in benchmarks)          | Run step $k$ (encoder, backbone, decoder), then GPU-to-CPU offload and NetCDF for step $k$, then step $k{+}1$. Export blocks the next forward pass. `cuda:1` waits while `cuda:0` exports.                                                    |
-| **Overlap export** | `overlap_rollout=True` (default, `2gpu_overlap` in benchmarks) | After decoding step $k$, start async D2H and export for step $k{-}1$ on `cuda:0` while backbone for step $k$ runs on `cuda:1`. Streams sync before encoder and decoder for step $k$. Export latency is partially hidden behind backbone work. |
+| **Overlap export** | `overlap_rollout=True` (default, `2gpu_overlap` in benchmarks) | After encoder $s$, async D2H and NetCDF for step $s{-}1$ on `cuda:0` runs in parallel with backbone $s$ on `cuda:1`; streams sync, then decoder $s$. Step $0$ has no parallel window. Export latency is partially hidden behind backbone work. |
 
 
 Disable overlap with `DistributedConfig(overlap_rollout=False)` or scheduler flag `--no-distributed-overlap-rollout`.
 
 #### Overlap export details
 
-When overlap is enabled, each step follows this stream schedule:
+When overlap is enabled, export for step $s{-}1$ does **not** start right after decoder $s{-}1$. The prediction is queued, then at the **start of step $s$** (after encoder $s$) two CUDA streams run in parallel:
 
-1. After decoding step $k$, the prediction tensor is queued for async D2H on `cuda:0` (encoder card).
-2. While that transfer runs, the **backbone for step $k{+}1$** executes on `cuda:1`.
-3. Encoder and decoder stages for step $k{+}1$ still run sequentially after the streams synchronize.
+1. **Encoder** for step $s$ on `cuda:0` (always runs first, alone).
+2. **Parallel window** (only when $s \ge 1$ and a prior step is pending):
+   - **Egress stream** on `cuda:0`: async D2H and NetCDF for step $s{-}1$.
+   - **Backbone stream** on `cuda:1`: latent H2D plus Swin backbone for step $s$.
+3. **Synchronize** both streams.
+4. **Decoder** for step $s$ (west half on `cuda:0`, east half on `cuda:1`), then queue prediction $s$ if another step follows.
+
+Step $0$ has no prior export, so encoder, backbone, and decoder run back-to-back with no parallel window.
+
+**Staged** (`overlap_rollout=False`): after decoder $s$, D2H and NetCDF for $s$ run on `cuda:0` before encoder $s{+}1$ starts. `cuda:1` sits idle during export.
 
 On `era5_pretrained`, `cuda:0` is lightly loaded during backbone (about 8% of forward time vs about 63% on `cuda:1`), so export can run behind backbone without fighting for the same SMs.
 
 On `hres_0.1`, the grid is $2.5\times$ wider and $2.5\times$ taller than ERA5. Each export step moves more data and both devices stay busier. Overlap still wins on throughput (**1.29x** vs staged in our 4-step run), but peak VRAM rises from cuda:0=27.2 and cuda:1=27.9 GiB (staged) to cuda:0=29.1 and cuda:1=28.0 GiB (overlap). Use overlap when you need throughput on large grids, not as a default that always lowers load.
 
-```mermaid
-sequenceDiagram
-    participant C0 as cuda:0 (encoder / dec west)
-    participant C1 as cuda:1 (backbone / dec east)
-    Note over C0,C1: Step k (overlap path)
-    C0->>C0: encoder k
-    C0->>C1: latent H2D
-    par export k-1
-        C0->>C0: D2H + NetCDF k-1
-    and backbone k
-        C1->>C1: backbone k
-    end
-    C0->>C0: decoder west k
-    C1->>C1: decoder east k
-```
-
-
-
 #### 4-step rollout benchmark
 
 `bf16_mixed@fp32`, warmup 1, repeat 3, 2x RTX 5090 (about 32 GiB). Each mode runs in a fresh subprocess so JIT and cuDNN state do not carry between modes.
 
-`**era5_pretrained**` ($721 \times 1440$)
+**era5_pretrained** ($721 \times 1440$)
 
 
 | mode                       | total (ms) | per step (ms) | peak alloc (GiB)         |
@@ -1044,7 +1037,7 @@ sequenceDiagram
 
 Overlap export vs staged rollout: **1.38x** faster (about 1835 ms saved over 4 steps). Utilization plots: [staged](docs/image/distributed_rollout_utilization_2gpu_staged.png), [overlap](docs/image/distributed_rollout_utilization_2gpu_overlap.png).
 
-`**hres_0.1`** ($1801 \times 3600$, AuroraHighRes LoRA merged)
+**hres_0.1** ($1801 \times 3600$, AuroraHighRes LoRA merged)
 
 
 | mode                       | total (ms) | per step (ms) | peak alloc (GiB)         |
