@@ -43,13 +43,17 @@ Left: one job per worker and preset. Right: faster workers take follow-up jobs w
 
 Splits encoder, backbone, and spatial decoder across two GPUs inside one process (`DistributedConfig`, not `torchrun`). Large presets such as `era5_pretrained` and `hres_0.1` do not fit a single card in this VRAM range. Spatial decoder split cuts peak decoder VRAM from about 28 GiB on one card to about 14 GiB per card on ERA5.
 
-Multi-step rollout uses `rollout_stream()` with pipeline forward on both GPUs. `rollout_and_export()` can overlap GPU-to-CPU offload and NetCDF writes with the next forward step when `async_export=True` (default). On 2x RTX 5090 (32 GiB), a 4-step run reaches about **1.3 s** per step on `era5_pretrained` and about **3.6 s** per step on `hres_0.1`, where export dominates.
+Multi-step rollout uses `rollout_stream()` with pipeline forward on both GPUs. `rollout_and_export()` can overlap GPU-to-CPU offload and NetCDF writes with the next forward step when `async_export=True` (default). On 2x RTX 5090 (32 GiB), a 4-step run reaches about **1.3 s** per step on `era5_pretrained` and about **3.6 s** per step on `hres_0.1`, where export dominates. On 2x RTX 4090 (24 GiB), the same harness reports about **2.2 s** per step on `era5_pretrained` and about **3.5 s** per step on `hres_0.1`.
 
 See [Distributed pipeline](#distributed-pipeline) and `benchmark/bench_distributed_rollout.py`.
 
 | `era5_pretrained` (5090) | `hres_0.1` (5090) |
 | :--: | :--: |
 | ![era5 2-GPU rollout on 5090](docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu.png) | ![hres_0.1 2-GPU rollout on 5090](docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu.png) |
+
+| `era5_pretrained` (4090) | `hres_0.1` (4090) |
+| :--: | :--: |
+| ![era5 2-GPU rollout on 4090](docs/image/distributed_rollout_utilization_4090_era5_pretrained_2gpu.png) | ![hres_0.1 2-GPU rollout on 4090](docs/image/distributed_rollout_utilization_4090_hres_0.1_2gpu.png) |
 
 `era5_pretrained` ($721 \times 1440$) and `hres_0.1` ($1801 \times 3600$), 4-step rollout. Filename pattern: `distributed_rollout_utilization_{gpu}_{preset}_2gpu.png`.
 
@@ -1088,22 +1092,27 @@ Utilization plot: [hres_0.1](docs/image/distributed_rollout_utilization_5090_hre
 
 ##### 2x NVIDIA GeForce RTX 4090 (24 GiB)
 
-Host: **32 vCPU** AMD EPYC 9654 96-Core Processor, **120 GiB** system memory. PyTorch **2.12.1**, `CUTE_DSL_ARCH=sm_89`, `--max-vram-gib 24 --force`. Recorded on an earlier release; timings are within a few percent of the current unified `rollout_stream` path.
+Host: **32 vCPU** AMD EPYC 9654 96-Core Processor, **120 GiB** system memory. PyTorch **2.12.1**, `CUTE_DSL_ARCH=sm_89`, `--max-vram-gib 24 --force`.
 
 **era5_pretrained** ($721 \times 1440$)
 
 
 | mode   | total (ms) | per step (ms) | peak alloc (GiB)         |
 | ------ | ---------- | ------------- | ------------------------ |
-| `2gpu` | 8831       | 2208          | cuda:0=12.5, cuda:1=17.9 |
+| `2gpu` | 8790       | 2198          | cuda:0=12.6, cuda:1=17.8 |
 
+
+Utilization plot: [era5_pretrained](docs/image/distributed_rollout_utilization_4090_era5_pretrained_2gpu.png).
 
 **hres_0.1** ($1801 \times 3600$, AuroraHighRes LoRA merged)
 
 
 | mode   | total (ms) | per step (ms) | peak alloc (GiB)         |
 | ------ | ---------- | ------------- | ------------------------ |
-| `2gpu` | 14422      | 3606          | cuda:0=23.7, cuda:1=22.6 |
+| `2gpu` | 13901      | 3475          | cuda:0=20.4, cuda:1=22.6 |
+
+
+Utilization plot: [hres_0.1](docs/image/distributed_rollout_utilization_4090_hres_0.1_2gpu.png).
 
 ```bash
 export AURORA_ASSET_ROOT=/path/to/aurora
