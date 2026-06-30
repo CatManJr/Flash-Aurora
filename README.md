@@ -4,9 +4,13 @@ Flash-Aurora is an inference stack for the [Microsoft Aurora](https://github.com
 
 ## Highlights
 
-**CuTe DSL window attention.** 2 kernels (BF16 and 1xTF32 simulated FP32) tuned for Aurora window shapes ($patch_size = 14 \Rightarrow N{=}144$) with FP32 online softmax. **1.07-1.22x** vs BF16 SDPA and **1.59-1.69x** vs FP32 SDPA on encoder-stage window microbenchmarks. See [Window attention kernels](#window-attention-kernels).
+### CuTe DSL powered Aurora Window Attention
 
-**Mixed precision.** Tiers use the label `backbone@encoder_decoder` (see [Precision tiers](#precision-tiers)). Default production tier is `bf16_mixed@fp32`:
+Aurora Swin windows are short ($N{=}144$) because patch size are fixed to $14 \times 14$. The CuTe DSL kernels load the **entire window** $K$ and $V$ into shared memory in a **single stage** (`tile_n \ge N`), run QK and PV MMAs with FP32 online softmax locally, and never materialize an $N \times N$ attention matrix in global memory. Two variants (BF16 and TF32-simulated FP32) target these fixed shapes rather than generic long-sequence attention. **1.07-1.22x** vs BF16 SDPA and **1.59-1.69x** vs FP32 SDPA (mainly tensor core advantage, not the kernel's) on encoder-stage window microbenchmarks. See [Window attention kernels](#window-attention-kernels).
+
+### Mixed precision inference
+
+Tiers use the label `backbone@encoder_decoder` (see [Precision tiers](#precision-tiers)). Default production tier is `bf16_mixed@fp32`:
 
 - **bf16_mixed backbone:** BF16 CuTe DSL window attention and BF16 MLP; TF32 Tensor Core GEMM on the remaining Swin matmul; FP32 activations between blocks via Triton fusion so deep backbone stages stay numerically close to FP32.
 - **tf32 backbone:** TF32 Tensor Core GEMM throughout Swin plus CuTe DSL attention with FP32 I/O; near-FP32 fidelity on attention, moderate speedup over strict `fp32`.
@@ -16,13 +20,17 @@ Encoder and Perceiver decoder stay **@fp32** because they map between full-grid 
 
 Headline latency: **bf16_mixed@fp32** is **about 3.2x** vs PyTorch FP32 on `era5_pretrained` (about 680 ms/step) and **about 3x** on finetuned presets with merged LoRA. Full tables: [End to End Benchmarks](#end-to-end-benchmarks).
 
-**Multi-GPU serving.** One ZMQ worker per GPU, each bound to a preset. The coordinator routes forecast requests to a matching idle worker and streams events back to the client. This is job-level scheduling across heterogeneous models, not tensor parallelism inside one rollout. A single client can run `era5_pretrained`, `hres_t0_finetuned`, `hres_0.1`, and `cams` on four GPUs at the same time. When one preset is slow to prepare (for example `hres_0.1`), the client can queue more work on the other workers instead of leaving those GPUs idle. See [Forecast scheduler (ZMQ)](#forecast-scheduler-zmq).
+### Asynchronized Multi-GPU serving (for workstation/server GPUs)
+
+One ZMQ worker per GPU, each bound to a preset. The coordinator routes forecast requests to a matching idle worker and streams events back to the client. This is job-level scheduling across heterogeneous models, not tensor parallelism inside one rollout. A single client can run `era5_pretrained`, `hres_t0_finetuned`, `hres_0.1`, and `cams` on four GPUs at the same time. When one preset is slow to prepare (for example `hres_0.1`), the client can queue more work on the other workers instead of leaving those GPUs idle. See [Forecast scheduler (ZMQ)](#forecast-scheduler-zmq).
 
 four heterogeneous presets dispatched in parallelrefill faster workers while HRES is pending
 
 Left: first dispatch, one job per worker and preset. Right: refill while `hres_0.1` is still pending. Faster workers take follow-up jobs so aggregate throughput stays high. Traces from `docs/example_scheduler_distributed_workers.ipynb` on 4x RTX PRO 6000.
 
-**Pipeline parallelism for GPUs less than 40GB.** Splits encoder, backbone, and spatial decoder across two GPUs inside one process (`DistributedConfig`, not `torchrun`). Large presets such as `era5_pretrained` and `hres_0.1` do not fit a single card in this VRAM range. Spatial decoder split cuts peak decoder VRAM from about 28 GiB on one card to about 14 GiB per card on ERA5.
+### Pipeline parallelism for GPUs less than 40GB
+
+Splits encoder, backbone, and spatial decoder across two GPUs inside one process (`DistributedConfig`, not `torchrun`). Large presets such as `era5_pretrained` and `hres_0.1` do not fit a single card in this VRAM range. Spatial decoder split cuts peak decoder VRAM from about 28 GiB on one card to about 14 GiB per card on ERA5.
 
 - **Staged** (`overlap_rollout=False`): each rollout step is serialized. Decode step $k$, write step $k$ to NetCDF, then start step $k{+}1$. While `cuda:0` exports, `cuda:1` sits idle.
 - **Overlap export** (`overlap_rollout=True`, default): step $k{-}1$ export on `cuda:0` runs in parallel with step $k$ backbone on `cuda:1`. Encoder and decoder for step $k$ run after both CUDA streams finish. **1.38x** on `era5_pretrained` and **1.29x** on `hres_0.1` vs staged (4-step rollout, 2x RTX 5090). Large grids run nearer VRAM limits under overlap.
@@ -518,13 +526,17 @@ Set a tier with `inference_precision=...` in `AuroraEngine.from_preset()` or on 
 
 ### Triton fusion
 
-All custom precision tiers (`fp32@`*, `tf32@`*, `bf16_mixed@*`, `bf16@*`) enable the same Triton fusion base. Fused window layout (`use_triton_layout`) rolls, pads, partitions, and reverses in fused kernels instead of many small eager allocations. Fused AdaLN and residual (`use_triton_adaln`) combine adaptive layer normalization and FiLM modulation with the residual add on the Swin hot path. These kernels run regardless of whether the backbone uses FP32, TF32, or BF16 GEMM. They reduce peak activation memory and improve memory bandwidth relative to the decomposed PyTorch Swin path. CuTe DSL window attention and GEMM precision are layered on top of this fusion base. The PyTorch reference (`pytorch_backbone_fp32_encoder_decoder_fp32`) disables Triton and CuTe DSL for accuracy baselines.
+All custom precision tiers (`fp32@`*,* `tf32@`, `bf16_mixed@`*, `bf16@`*) enable the same Triton fusion base. Fused window layout (`use_triton_layout`) rolls, pads, partitions, and reverses in fused kernels instead of many small eager allocations. Fused AdaLN and residual (`use_triton_adaln`) combine adaptive layer normalization and FiLM modulation with the residual add on the Swin hot path. These kernels run regardless of whether the backbone uses FP32, TF32, or BF16 GEMM. They reduce peak activation memory and improve memory bandwidth relative to the decomposed PyTorch Swin path. CuTe DSL window attention and GEMM precision are layered on top of this fusion base. The PyTorch reference (`pytorch_backbone_fp32_encoder_decoder_fp32`) disables Triton and CuTe DSL for accuracy baselines.
 
 `InferenceWorkspacePool` optionally reuses a scratch buffer for the backbone-decoder concat on fixed-shape inference, avoiding repeated large allocations.
 
 ## Window attention kernels
 
-Swin window self-attention is the dominant cost in the Aurora backbone. Flash-Aurora replaces PyTorch `scaled_dot_product_attention` on this path with CuTe DSL kernels in `flash_aurora/aurora/ops/cute/`. The kernel follows a fused multi-head attention structure: load $Q$, $K$, and $V$ tiles into shared memory, form logits $S = \mathrm{scale} QK^\top$, apply the Swin mask, compute row-wise online softmax in FP32, then accumulate $O \leftarrow \mathrm{softmax}(S)V$ without materializing the full $N \times N$ attention matrix.
+Swin window self-attention is the dominant cost in the Aurora backbone. Flash-Aurora replaces PyTorch `scaled_dot_product_attention` on this path with CuTe DSL kernels in `flash_aurora/aurora/ops/cute/`. The kernel follows a fused multi-head attention structure: load $Q$, $K$, and $V$ into shared memory, form logits $S = \mathrm{scale} QK^\top$, apply the Swin mask, compute row-wise online softmax in FP32, then accumulate $O \leftarrow \mathrm{softmax}(S)V$ without materializing the full $N \times N$ attention matrix in global memory.
+
+**Why short windows matter.** Aurora uses fixed small windows ($N = 144$ on the default $0.25^{\circ}$ encoder stage; $36$ and $9$ on deeper Swin stages). That sequence length is short enough that the full $K$ and $V$ rows for one query tile can live in a **single shared-memory tile** on production GPUs. `_smem_utils.py` picks `tile_n` from the per-block SMEM budget: when `tile_n \ge N`, the kernel takes the **single-stage** path (`single_kv_tile=True`, `num_stages=1` in `_kernel_bf16.py` / `_kernel_fp32.py`). One cp.async (BF16) or gmem load (TF32 hybrid) brings the entire window into SMEM; QK and PV MMAs then run locally with FP32 online softmax. There is no multi-stage streaming over $K/V$, no $N \times N$ softmax buffer, and no second global round-trip for the full attention map. This is the main reason the CuTe path targets Aurora window shapes rather than generic long-sequence attention.
+
+When $N$ is too large for the SMEM budget, or on downsampled stages where $N$ is small but BF16 tile rules still apply, the code falls back to a **multi-stage streaming** variant: TMA double-buffering over $K$ and $V$ with half the SMEM budget reserved for occupancy (`WindowAttnFwdBf16Stream`, `num_stages=2`). Production $0.25^{\circ}$ inference stays on the single-stage path for $N=144$.
 
 **Tensor layout.** Inputs are $(B_{\mathrm{win}}, H, N, D_h)$, where $B_{\mathrm{win}} = B \cdot n_W$ folds batch and window index, $N$ is tokens per window ($144$ on the default $0.25^{\circ}$ encoder), and $D_h$ is the head dimension. Shifted-window masks are FP32 additive biases of $-100$ in PyTorch. The CuTe path packs them once as a compact `uint8` mask and applies the equivalent unscaled bias inside the kernel so logits match SDPA.
 
@@ -539,7 +551,7 @@ Swin window self-attention is the dominant cost in the Aurora backbone. Flash-Au
 
 In both modes, logit scaling, masked softmax normalization, and row sums stay in FP32. Lower precision is confined to the two GEMMs, $QK^\top$ and $PV$. `TF32_ACC_FP32` tracks FP32 SDPA to about three significant figures. `BF16_MIXED` accepts the larger BF16 matmul error but remains within upstream per-variable drift tolerances on full-model rollouts (see Precision drift below).
 
-**Kernel variants.** Tile sizes $(tile_m, tile_n)$ are chosen from $N$ and $D_h$ in `_smem_utils.py`. When $tile_n \ge N$ (production $N = 144$), attention fits in a single KV tile. When $tile_n < N$, the TMA stream kernel double-buffers $K$ and $V$. A QKV-packed entry point avoids separate $Q$, $K$, and $V$ tensors in the fused BF16 attention chain. Kernels JIT-compile per $(D_h, N, \mathrm{hasbias}, \mathrm{tile})$ and are cached for the process.
+**Kernel variants.** Tile sizes $(tile_m, tile_n)$ come from `_smem_utils.py` (SMEM budget per GPU architecture). The single-pass vs streaming split above is the main variant selector; QKV-packed entry points avoid separate $Q$, $K$, and $V$ tensors in the fused BF16 chain. Kernels JIT-compile per $(D_h, N, \mathrm{hasbias}, \mathrm{tile})$ and are cached for the process.
 
 ### Microbenchmarks
 
@@ -995,9 +1007,9 @@ All Aurora presets share the same encoder / backbone / decoder layout. Distribut
 Both modes use the same **pipeline placement** above and the same spatial decoder split. They differ only in how **multi-step export** is scheduled inside `rollout_and_export`:
 
 
-| Mode               | Config                                                         | Per-step schedule                                                                                                                                                                                                                             |
-| ------------------ | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Staged**         | `overlap_rollout=False` (`2gpu_staged` in benchmarks)          | Run step $k$ (encoder, backbone, decoder), then GPU-to-CPU offload and NetCDF for step $k$, then step $k{+}1$. Export blocks the next forward pass. `cuda:1` waits while `cuda:0` exports.                                                    |
+| Mode               | Config                                                         | Per-step schedule                                                                                                                                                                                                                              |
+| ------------------ | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Staged**         | `overlap_rollout=False` (`2gpu_staged` in benchmarks)          | Run step $k$ (encoder, backbone, decoder), then GPU-to-CPU offload and NetCDF for step $k$, then step $k{+}1$. Export blocks the next forward pass. `cuda:1` waits while `cuda:0` exports.                                                     |
 | **Overlap export** | `overlap_rollout=True` (default, `2gpu_overlap` in benchmarks) | After encoder $s$, async D2H and NetCDF for step $s{-}1$ on `cuda:0` runs in parallel with backbone $s$ on `cuda:1`; streams sync, then decoder $s$. Step $0$ has no parallel window. Export latency is partially hidden behind backbone work. |
 
 
@@ -1009,8 +1021,8 @@ When overlap is enabled, export for step $s{-}1$ does **not** start right after 
 
 1. **Encoder** for step $s$ on `cuda:0` (always runs first, alone).
 2. **Parallel window** (only when $s \ge 1$ and a prior step is pending):
-   - **Egress stream** on `cuda:0`: async D2H and NetCDF for step $s{-}1$.
-   - **Backbone stream** on `cuda:1`: latent H2D plus Swin backbone for step $s$.
+  - **Egress stream** on `cuda:0`: async D2H and NetCDF for step $s{-}1$.
+  - **Backbone stream** on `cuda:1`: latent H2D plus Swin backbone for step $s$.
 3. **Synchronize** both streams.
 4. **Decoder** for step $s$ (west half on `cuda:0`, east half on `cuda:1`), then queue prediction $s$ if another step follows.
 
