@@ -5,12 +5,12 @@ from dataclasses import dataclass
 
 
 def default_download_workers() -> int:
-    """Default thread count from ``FLASH_AURORA_DOWNLOAD_WORKERS`` (fallback: 4)."""
-    raw = os.environ.get("FLASH_AURORA_DOWNLOAD_WORKERS", "4").strip()
+    """Default thread count from ``FLASH_AURORA_DOWNLOAD_WORKERS`` (fallback: 8)."""
+    raw = os.environ.get("FLASH_AURORA_DOWNLOAD_WORKERS", "8").strip()
     try:
         value = int(raw)
     except ValueError:
-        value = 4
+        value = 8
     return max(1, value)
 
 
@@ -24,7 +24,7 @@ def resolve_download_workers(workers: int | None) -> int:
 class DownloadOptions:
     """Controls parallel ingress downloads."""
 
-    workers: int = 4
+    workers: int = 8
 
     def __post_init__(self) -> None:
         if self.workers < 1:

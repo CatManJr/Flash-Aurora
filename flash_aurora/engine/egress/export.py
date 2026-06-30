@@ -102,9 +102,12 @@ class PipelineRolloutExporter:
 
     def write_step(self, step_index: int, batch: Batch) -> Path:
         cpu_batch = self._offloader.to_owned_cpu(batch)
+        return self.write_owned_step(step_index, cpu_batch)
+
+    def write_owned_step(self, step_index: int, batch: Batch) -> Path:
         if hasattr(self._backend, "write_owned_step"):
-            return self._backend.write_owned_step(step_index, cpu_batch)
-        return self._backend.write_step(step_index, cpu_batch)
+            return self._backend.write_owned_step(step_index, batch)
+        return self._backend.write_step(step_index, batch)
 
     def close(self) -> None:
         self._backend.close()

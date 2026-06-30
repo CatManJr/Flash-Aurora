@@ -38,6 +38,7 @@ class EgressOffloader:
         self._device = device
         self._use_stream = use_stream and device.type == "cuda"
         self._stream: torch.cuda.Stream | None = None
+        self._pending_cpu: Batch | None = None
         if self._use_stream:
             self._stream = torch.cuda.Stream(device=device)
 
@@ -45,15 +46,41 @@ class EgressOffloader:
         if not self._use_stream or self._stream is None:
             return owned_cpu_copy(batch)
 
+        self.begin_async_d2h(batch)
+        return self.finish_async_d2h()
+
+    def begin_async_d2h(self, batch: Batch) -> None:
+        """Start GPU→CPU copy on the egress stream without blocking compute."""
+        if not self._use_stream or self._stream is None:
+            self._pending_cpu = owned_cpu_copy(batch)
+            return
+
         compute_stream = torch.cuda.current_stream(self._device)
         with torch.cuda.stream(self._stream):
             self._stream.wait_stream(compute_stream)
             for tensor in _iter_tensors(batch):
                 if tensor.is_cuda:
                     tensor.record_stream(self._stream)
-            cpu_batch = batch.to("cpu")
+            self._pending_cpu = batch.to("cpu")
+
+    def finish_async_d2h(self) -> Batch:
+        """Wait for :meth:`begin_async_d2h` and return an owned CPU batch."""
+        if not self._use_stream or self._stream is None:
+            pending = getattr(self, "_pending_cpu", None)
+            if pending is None:
+                raise RuntimeError("no async D2H in progress")
+            return pending
+
+        compute_stream = torch.cuda.current_stream(self._device)
         compute_stream.wait_stream(self._stream)
-        return owned_cpu_copy(cpu_batch)
+        pending = getattr(self, "_pending_cpu", None)
+        if pending is None:
+            raise RuntimeError("no async D2H in progress")
+        return owned_cpu_copy(pending)
+
+    @property
+    def egress_stream(self) -> torch.cuda.Stream | None:
+        return self._stream
 
 
 def _iter_tensors(batch: Batch):

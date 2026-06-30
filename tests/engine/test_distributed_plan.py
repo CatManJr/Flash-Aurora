@@ -25,7 +25,7 @@ def test_small_pretrained_fits_single_32gib_device() -> None:
     )
 
 
-def test_two_device_plan_splits_backbone() -> None:
+def test_two_device_plan_balances_vram_across_gpus() -> None:
     variant = DEFAULT_PRESETS.get("era5_pretrained").variant
     plan = plan_parallelism(
         variant,
@@ -38,9 +38,14 @@ def test_two_device_plan_splits_backbone() -> None:
         inference_precision="bf16_mixed@fp32",
     )
     assert plan.encoder_device == "cuda:0"
-    assert plan.decoder_device == "cuda:0"
     assert plan.backbone_device == "cuda:1"
+    assert plan.decoder_device == "cuda:1"
+    assert plan.decoder_spatial_parallel is True
+    assert plan.decoder_spatial_devices == ("cuda:0", "cuda:1")
     assert max(plan.estimated_per_device_gib) <= plan.estimated_peak_gib
+    assert abs(plan.estimated_per_device_gib[0] - plan.estimated_per_device_gib[1]) < (
+        plan.estimated_peak_gib * 0.5
+    )
 
 
 def test_three_device_plan_assigns_one_stage_per_gpu() -> None:

@@ -212,6 +212,7 @@ def ensure_pretrained_assets(
     download_era5: bool = True,
     prompt: bool = True,
     verbose: bool = True,
+    download_workers: int | None = None,
 ) -> tuple[Path, Path]:
     """Download checkpoint (HF mirror) and ERA5 NetCDF via ``DataDownloader.ensure``."""
     from flash_aurora.engine.core.paths import AssetStore
@@ -243,12 +244,21 @@ def ensure_pretrained_assets(
         if verbose:
             print(f"[download] checkpoint ready: {fetched}", flush=True)
 
-    downloader = DataDownloader(config)
+    downloader = DataDownloader(config, workers=download_workers)
     missing = downloader.missing(vt, cache_dir=cache)
     if download_era5 and missing:
         if verbose:
-            print(f"[download] ERA5 ({', '.join(missing)}) -> {cache}", flush=True)
-        result = downloader.ensure(vt, cache_dir=cache, prompt=prompt)
+            print(
+                f"[download] ERA5 ({', '.join(missing)}) -> {cache} "
+                f"({downloader.download_workers} workers)",
+                flush=True,
+            )
+        result = downloader.ensure(
+            vt,
+            cache_dir=cache,
+            prompt=prompt,
+            workers=download_workers,
+        )
         if verbose:
             print(
                 f"[download] ERA5 ready: downloaded={result.downloaded} skipped={result.skipped}",

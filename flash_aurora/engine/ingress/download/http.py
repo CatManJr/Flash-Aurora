@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import warnings
 from typing import Iterator
 from urllib.parse import urlparse
@@ -9,6 +10,8 @@ from flash_aurora.engine.core.redaction import sanitize_exception
 from flash_aurora.engine.ingress.download.progress import download_progress_enabled
 
 UCAR_RDA_HOST = "data.rda.ucar.edu"
+_DEFAULT_FETCH_RETRIES = 3
+_DEFAULT_FETCH_RETRY_DELAY_S = 2.0
 _ucar_insecure_tls: bool = False
 _insecure_warnings_suppressed: bool = False
 
@@ -142,12 +145,30 @@ def _get_with_optional_insecure_retry(
             ) from None
 
 
+def _fetch_retryable(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        token in lowered
+        for token in (
+            "prematurely",
+            "timed out",
+            "timeout",
+            "connection",
+            "temporarily unavailable",
+            "502",
+            "503",
+            "504",
+        )
+    )
+
+
 def fetch_bytes(
     url: str,
     *,
     timeout: float = 120,
     progress: bool | None = None,
     label: str | None = None,
+    retries: int = _DEFAULT_FETCH_RETRIES,
 ) -> bytes:
     """GET ``url`` and return the response body.
 
@@ -158,15 +179,31 @@ def fetch_bytes(
 
     Progress bars follow ``FLASH_AURORA_DOWNLOAD_PROGRESS`` (default ``auto``: on in
     terminals and Jupyter).
+
+    Transient network failures are retried up to ``retries`` times (default 3).
     """
     requests = _require_requests()
     show_progress = download_progress_enabled() if progress is None else progress
-    return _get_with_optional_insecure_retry(
-        requests,
-        url,
-        timeout=timeout,
-        verify=ssl_verify_enabled(),
-        stream=show_progress,
-        label=label,
-        show_progress=show_progress,
-    )
+    attempts = max(1, retries)
+    last_error: RuntimeError | None = None
+
+    for attempt in range(attempts):
+        try:
+            return _get_with_optional_insecure_retry(
+                requests,
+                url,
+                timeout=timeout,
+                verify=ssl_verify_enabled(),
+                stream=show_progress,
+                label=label,
+                show_progress=show_progress,
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            if attempt + 1 >= attempts or not _fetch_retryable(str(exc)):
+                raise
+            time.sleep(_DEFAULT_FETCH_RETRY_DELAY_S * (attempt + 1))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"HTTP GET failed for {url}")

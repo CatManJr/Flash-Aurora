@@ -192,24 +192,54 @@ def _vram_utilization_series(
     ]
 
 
-def plot_resource_usage(
+def resource_samples_to_dict(samples: list[ResourceSample]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for sample in samples:
+        gpus: dict[str, dict[str, object]] = {}
+        for index, gpu in sample.gpus.items():
+            gpus[str(index)] = {
+                "index": gpu.index,
+                "name": gpu.name,
+                "utilization_percent": gpu.utilization_percent,
+                "memory_used_mib": gpu.memory_used_mib,
+                "memory_total_mib": gpu.memory_total_mib,
+            }
+        rows.append(
+            {
+                "time_s": sample.time_s,
+                "cpu_percent": sample.cpu_percent,
+                "dram_used_gib": sample.dram_used_gib,
+                "dram_utilization_percent": sample.dram_utilization_percent,
+                "gpus": gpus,
+            }
+        )
+    return rows
+
+
+def _apply_resource_plot_style() -> None:
+    """Match ``docs/example_scheduler_distributed_workers.ipynb`` plotting settings."""
+    import matplotlib as mpl
+
+    mpl.rcParams.update(
+        {
+            "figure.dpi": 300,
+            "savefig.dpi": 300,
+            "font.size": 12,
+            "axes.titlesize": 14,
+            "axes.labelsize": 12,
+            "figure.facecolor": "white",
+        }
+    )
+
+
+def _plot_resource_grid(
+    axes,
     samples: list[ResourceSample],
-    *,
-    device_labels: dict[int, str] | None = None,
-    title: str = "Resource usage",
+    device_indices: list[int],
+    device_labels: dict[int, str],
 ) -> None:
-    if not samples:
-        print("no resource samples collected")
-        return
-
-    import matplotlib.pyplot as plt
-
-    device_labels = device_labels or {}
-    device_indices = sorted({device_index for sample in samples for device_index in sample.gpus})
+    """Fill a 2×2 axis grid: CPU, DRAM, GPU util, VRAM util."""
     times = [sample.time_s for sample in samples]
-
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
-    fig.suptitle(title)
 
     axes[0, 0].plot(times, [sample.cpu_percent for sample in samples], color="tab:blue")
     axes[0, 0].set_title("CPU utilization")
@@ -227,8 +257,16 @@ def plot_resource_usage(
 
     for device_index in device_indices:
         label = device_labels.get(device_index, f"cuda:{device_index}")
-        axes[1, 0].plot(times, _gpu_utilization_series(samples, device_index), label=label)
-        axes[1, 1].plot(times, _vram_utilization_series(samples, device_index), label=label)
+        axes[1, 0].plot(
+            times,
+            _gpu_utilization_series(samples, device_index),
+            label=label,
+        )
+        axes[1, 1].plot(
+            times,
+            _vram_utilization_series(samples, device_index),
+            label=label,
+        )
 
     axes[1, 0].set_title("GPU utilization")
     axes[1, 0].set_xlabel("seconds")
@@ -244,5 +282,105 @@ def plot_resource_usage(
 
     for ax in axes.flat:
         ax.grid(True, alpha=0.3)
-    plt.tight_layout()
+
+
+def plot_resource_usage_figure(
+    samples: list[ResourceSample],
+    *,
+    output_path: Path | str,
+    device_indices: list[int],
+    device_labels: dict[int, str] | None = None,
+    title: str = "Resource usage",
+) -> Path:
+    """Save a single notebook-style 2×2 utilization figure."""
+    import matplotlib.pyplot as plt
+
+    _apply_resource_plot_style()
+    device_labels = device_labels or {}
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    fig.suptitle(title)
+    _plot_resource_grid(axes, samples, device_indices, device_labels)
+    fig.tight_layout()
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, facecolor="white")
+    plt.close(fig)
+    return output
+
+
+def _utilization_output_paths(
+    output_path: Path | str,
+    mode_names: list[str],
+) -> list[Path]:
+    """Map each rollout mode to its own image path."""
+    output = Path(output_path)
+    if output.suffix:
+        return [output.parent / f"{output.stem}_{mode}{output.suffix}" for mode in mode_names]
+    output.mkdir(parents=True, exist_ok=True)
+    return [output / f"{mode}.png" for mode in mode_names]
+
+
+def plot_distributed_rollout_utilization(
+    traces: dict[str, list[ResourceSample]],
+    *,
+    device_indices: list[int],
+    output_path: Path | str,
+    title: str | None = None,
+    device_labels: dict[int, str] | None = None,
+) -> list[Path]:
+    """Save one notebook-style 2×2 figure per rollout mode.
+
+    *output_path* may be a directory (writes ``{mode}.png``) or a file stem such as
+    ``docs/image/distributed_rollout_utilization.png`` (writes
+    ``distributed_rollout_utilization_{mode}.png``).
+    """
+    if not traces:
+        raise ValueError("traces must not be empty")
+    for name, samples in traces.items():
+        if not samples:
+            raise ValueError(f"no samples for trace {name!r}")
+
+    device_labels = device_labels or {}
+    mode_names = list(traces.keys())
+    paths = _utilization_output_paths(output_path, mode_names)
+
+    written: list[Path] = []
+    for mode, path in zip(mode_names, paths, strict=True):
+        mode_title = mode.replace("_", " ")
+        if title:
+            mode_title = f"{title} ({mode_title})"
+        written.append(
+            plot_resource_usage_figure(
+                traces[mode],
+                output_path=path,
+                device_indices=device_indices,
+                device_labels=device_labels,
+                title=mode_title,
+            )
+        )
+    return written
+
+
+def plot_resource_usage(
+    samples: list[ResourceSample],
+    *,
+    device_labels: dict[int, str] | None = None,
+    title: str = "Resource usage",
+) -> None:
+    if not samples:
+        print("no resource samples collected")
+        return
+
+    import matplotlib.pyplot as plt
+
+    _apply_resource_plot_style()
+    device_labels = device_labels or {}
+    device_indices = sorted({device_index for sample in samples for device_index in sample.gpus})
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    fig.suptitle(title)
+    _plot_resource_grid(axes, samples, device_indices, device_labels)
+    fig.tight_layout()
     plt.show()

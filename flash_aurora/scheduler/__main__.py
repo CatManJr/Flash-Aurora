@@ -37,13 +37,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--forward-warmup-iters", type=int, default=None)
     parser.add_argument("--overlap-ic-load", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--async-export", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--distributed-devices",
+        default=None,
+        help="Comma-separated CUDA devices for pipeline parallel, e.g. cuda:0,cuda:1",
+    )
+    parser.add_argument("--distributed-max-vram-gib", type=float, default=32.0)
+    parser.add_argument("--distributed-force", action="store_true")
+    parser.add_argument(
+        "--no-distributed-overlap-rollout",
+        action="store_true",
+        help="Disable staged rollout export overlap on pipeline workers",
+    )
     parser.add_argument("--poll-timeout-ms", type=int, default=1000)
     return parser
+
+
+def _parse_distributed_devices(raw: str | None) -> tuple[str, ...] | None:
+    if raw is None:
+        return None
+    devices = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return devices or None
 
 
 def main() -> None:
     args = build_parser().parse_args()
     asset_root = normalize_asset_root(args.asset_root)
+    distributed_devices = _parse_distributed_devices(args.distributed_devices)
     config = ForecastWorkerConfig(
         preset=args.preset,
         asset_root=asset_root,
@@ -58,6 +78,10 @@ def main() -> None:
         forward_warmup_iters=args.forward_warmup_iters,
         overlap_ic_load=args.overlap_ic_load,
         async_export=args.async_export,
+        distributed_devices=distributed_devices,
+        distributed_max_vram_gib=args.distributed_max_vram_gib,
+        distributed_force=args.distributed_force,
+        distributed_overlap_rollout=not args.no_distributed_overlap_rollout,
         poll_timeout_ms=args.poll_timeout_ms,
     )
     worker = ForecastWorker(config)

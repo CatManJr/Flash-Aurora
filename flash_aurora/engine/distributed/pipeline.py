@@ -8,7 +8,6 @@ import torch
 from flash_aurora.aurora import Batch
 from flash_aurora.aurora.model.aurora import Aurora
 
-from flash_aurora.engine.distributed.batch_utils import batch_to_device
 from flash_aurora.engine.distributed.config import ParallelPlan
 
 _DISTRIBUTED_PLAN_ATTR = "_flash_aurora_parallel_plan"
@@ -23,77 +22,18 @@ def parallel_plan(model: Aurora) -> ParallelPlan | None:
     return getattr(model, _DISTRIBUTED_PLAN_ATTR, None)
 
 
-def _maybe_sync(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-def _device_context(device: torch.device):
-    if device.type == "cuda":
-        return torch.cuda.device(device)
-    return contextlib.nullcontext()
-
-
 def pipeline_forward(model: Aurora, batch: Batch) -> Batch:
     """Run Aurora forward with encoder / backbone / decoder on separate devices."""
-    plan: ParallelPlan = getattr(model, _DISTRIBUTED_PLAN_ATTR)
-    enc_dev = torch.device(plan.encoder_device)
-    bb_dev = torch.device(plan.backbone_device)
-    dec_dev = torch.device(plan.decoder_device)
+    from flash_aurora.engine.distributed.rollout_pipeline import (
+        run_backbone_stage,
+        run_decoder_stage,
+        run_encoder_stage,
+    )
 
-    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
-    from flash_aurora.aurora.model.nvtx import nvtx_range
-
-    batch = batch_to_device(batch, enc_dev)
-    batch, transformed_batch, patch_res = model._prepare_encoder_batch(batch)
-
-    with _device_context(enc_dev):
-        with nvtx_range("aurora::encoder"):
-            with torch.inference_mode():
-                x = run_with_encoder_decoder_routing(
-                    model.encoder,
-                    transformed_batch,
-                    autocast_bf16=model.autocast_encoder_decoder,
-                    use_tensor_core=model.encoder_decoder_use_tensor_core,
-                    lead_time=model.timestep,
-                )
-
-    if bb_dev != enc_dev:
-        x = x.to(bb_dev, non_blocking=True)
-        _maybe_sync(bb_dev)
-
-    with _device_context(bb_dev):
-        with nvtx_range("aurora::backbone"):
-            with torch.inference_mode():
-                x = model._run_backbone(
-                    x,
-                    lead_time=model.timestep,
-                    patch_res=patch_res,
-                    rollout_step=batch.metadata.rollout_step,
-                )
-
-    if dec_dev != bb_dev:
-        x = x.to(dec_dev, non_blocking=True)
-    if dec_dev != enc_dev:
-        batch = batch_to_device(batch, dec_dev)
-    if dec_dev != bb_dev:
-        _maybe_sync(dec_dev)
-
-    with _device_context(dec_dev):
-        with nvtx_range("aurora::decoder"):
-            with torch.inference_mode():
-                pred = run_with_encoder_decoder_routing(
-                    model.decoder,
-                    x,
-                    batch,
-                    autocast_bf16=model.autocast_encoder_decoder,
-                    use_tensor_core=model.encoder_decoder_use_tensor_core,
-                    lead_time=model.timestep,
-                    patch_res=patch_res,
-                )
-
-    pred = model._finish_prediction(batch, pred)
-    return batch_to_device(pred, enc_dev)
+    with torch.inference_mode():
+        step_batch, x, patch_res = run_encoder_stage(model, batch)
+        x = run_backbone_stage(model, x, step_batch, patch_res)
+        return run_decoder_stage(model, x, step_batch, patch_res)
 
 
 def apply_pipeline_parallel(model: Aurora, plan: ParallelPlan) -> Aurora:
@@ -109,7 +49,14 @@ def apply_pipeline_parallel(model: Aurora, plan: ParallelPlan) -> Aurora:
 
     model.encoder.to(plan.encoder_device)
     model.backbone.to(plan.backbone_device)
-    model.decoder.to(plan.decoder_device)
+    from flash_aurora.engine.distributed.decoder_spatial import apply_decoder_spatial_placement
+
+    apply_decoder_spatial_placement(
+        model,
+        decoder_device=plan.decoder_device,
+        decoder_spatial_parallel=plan.decoder_spatial_parallel,
+        decoder_spatial_devices=plan.decoder_spatial_devices,
+    )
 
     setattr(model, _DISTRIBUTED_PLAN_ATTR, plan)
     setattr(model, _ORIGINAL_FORWARD_ATTR, model.forward)
@@ -119,6 +66,8 @@ def apply_pipeline_parallel(model: Aurora, plan: ParallelPlan) -> Aurora:
 
 def restore_pipeline_parallel(model: Aurora) -> None:
     """Undo pipeline patching and move all submodules to the encoder device."""
+    from flash_aurora.engine.distributed.decoder_spatial import clear_decoder_spatial_replica
+
     original = getattr(model, _ORIGINAL_FORWARD_ATTR, None)
     if original is not None:
         model.forward = original  # type: ignore[method-assign]
@@ -128,6 +77,7 @@ def restore_pipeline_parallel(model: Aurora) -> None:
     if plan is None:
         return
 
+    clear_decoder_spatial_replica(model)
     target = plan.encoder_device
     model.to(target)
     delattr(model, _DISTRIBUTED_PLAN_ATTR)
@@ -143,6 +93,8 @@ def distributed_status(model: Aurora) -> dict[str, Any]:
         "encoder_device": plan.encoder_device,
         "backbone_device": plan.backbone_device,
         "decoder_device": plan.decoder_device,
+        "decoder_spatial_parallel": plan.decoder_spatial_parallel,
+        "decoder_spatial_devices": plan.decoder_spatial_devices,
         "estimated_peak_gib": plan.estimated_peak_gib,
         "estimated_per_device_gib": plan.estimated_per_device_gib,
     }

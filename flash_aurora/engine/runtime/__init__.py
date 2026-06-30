@@ -17,8 +17,10 @@ from flash_aurora.engine.runtime.resource_monitor import (
     ResourceMonitor,
     ResourceSample,
     device_index_from_name,
+    plot_distributed_rollout_utilization,
     plot_resource_usage,
     query_gpu_status,
+    resource_samples_to_dict,
 )
 from flash_aurora.engine.runtime.static_cache import StaticVarsCache
 
@@ -36,8 +38,10 @@ __all__ = [
     "gpu_guard_enabled",
     "gpu_guard_session",
     "is_exclusive_variant",
+    "plot_distributed_rollout_utilization",
     "plot_resource_usage",
     "query_gpu_status",
+    "resource_samples_to_dict",
     "resolve_guard_dir",
     "try_local_cuda_cleanup",
 ]

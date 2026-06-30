@@ -37,6 +37,10 @@ class ForecastWorkerConfig:
     forward_warmup_iters: int | None = None
     overlap_ic_load: bool | None = None
     async_export: bool | None = None
+    distributed_devices: tuple[str, ...] | None = None
+    distributed_max_vram_gib: float = 32.0
+    distributed_force: bool = False
+    distributed_overlap_rollout: bool = True
     poll_timeout_ms: int = 1000
 
 
@@ -88,6 +92,9 @@ class ForecastWorker:
     def worker_id(self) -> str:
         if self._config.worker_id is not None:
             return self._config.worker_id
+        if self._config.distributed_devices:
+            devices = ",".join(self._config.distributed_devices)
+            return f"{self._config.preset}@pipeline[{devices}]"
         return f"{self._config.preset}@{self._config.device or 'cuda:0'}"
 
     @property
@@ -124,8 +131,17 @@ class ForecastWorker:
             kwargs["overlap_ic_load"] = self._config.overlap_ic_load
         if self._config.async_export is not None:
             kwargs["async_export"] = self._config.async_export
+        if self._config.distributed_devices:
+            from flash_aurora.engine.distributed import DistributedConfig
+
+            kwargs["distributed"] = DistributedConfig(
+                devices=self._config.distributed_devices,
+                max_vram_gib_per_device=self._config.distributed_max_vram_gib,
+                force=self._config.distributed_force,
+                overlap_rollout=self._config.distributed_overlap_rollout,
+            )
         engine = AuroraEngine.from_preset(self._config.preset, **kwargs)
-        if self._config.device is not None:
+        if self._config.device is not None and not self._config.distributed_devices:
             engine.config.device = self._config.device
         return engine
 

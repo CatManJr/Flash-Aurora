@@ -54,6 +54,9 @@ class ProfileReport:
     param_gib: dict[str, float]
     plan_estimated_per_device_gib: tuple[float, ...]
     plan_estimated_peak_gib: float
+    decoder_spatial_parallel: bool = False
+    decoder_spatial_devices: tuple[str, ...] = ()
+    estimated_busy_fraction: dict[str, float] | None = None
 
 
 def _load_batch(
@@ -108,6 +111,9 @@ def _report_from_profile(
         param_gib={dev: nbytes / (1024**3) for dev, nbytes in profile.param_bytes.items()},
         plan_estimated_per_device_gib=profile.plan_estimated_per_device_gib,
         plan_estimated_peak_gib=profile.plan_estimated_peak_gib,
+        decoder_spatial_parallel=bool(status.get("decoder_spatial_parallel")),
+        decoder_spatial_devices=tuple(status.get("decoder_spatial_devices", ())),  # type: ignore[arg-type]
+        estimated_busy_fraction=status.get("estimated_busy_fraction"),  # type: ignore[arg-type]
     )
 
 
@@ -120,6 +126,9 @@ def _print_report(report: ProfileReport) -> None:
     print("=" * 72)
     print(f"Placement: encoder={report.encoder_device}  backbone={report.backbone_device}  "
           f"decoder={report.decoder_device}")
+    if report.decoder_spatial_parallel:
+        west, east = report.decoder_spatial_devices
+        print(f"Decoder spatial split: west={west}  east={east}")
     print()
     print("Stage latency (ms, CUDA events per device + wall for transfers)")
     print("-" * 72)
@@ -138,6 +147,20 @@ def _print_report(report: ProfileReport) -> None:
         pct_str = f"{pct:5.1f}%" if label != "TOTAL" else ""
         print(f"  {label:<28} {ms:8.1f} ms  {pct_str}")
     print()
+    print("Measured compute busy fraction (from stage timings)")
+    print("-" * 72)
+    enc_ms = t["encoder"] + t["post"]
+    bb_ms = t["backbone"]
+    dec_ms = t["decoder"]
+    busy_ms = {dev: 0.0 for dev in report.devices}
+    busy_ms[report.encoder_device] += enc_ms
+    busy_ms[report.backbone_device] += bb_ms
+    busy_ms[report.decoder_device] += dec_ms
+    compute_total = enc_ms + bb_ms + dec_ms
+    for dev in sorted(busy_ms):
+        frac = busy_ms[dev] / compute_total if compute_total > 0 else 0.0
+        print(f"  {dev}: {busy_ms[dev]:8.1f} ms  ({100.0 * frac:5.1f}% of compute)")
+    print()
     print("Per-device memory (MiB)")
     print("-" * 72)
     print(f"  {'device':<10} {'params':>10} {'after_load':>12} {'peak_alloc':>12} {'peak_rsv':>12} {'plan_est':>10}")
@@ -155,6 +178,11 @@ def _print_report(report: ProfileReport) -> None:
         print(f"  {dev:<10} {params:10.0f} {after:12.0f} {peak:12.0f} {rsv:12.0f} {est:10.0f}")
     print()
     print(f"Planner single-GPU peak estimate: {report.plan_estimated_peak_gib:.1f} GiB")
+    busy = getattr(report, "estimated_busy_fraction", None)
+    if busy:
+        print("Estimated compute busy fraction (sequential pipeline):")
+        for dev, frac in sorted(busy.items()):
+            print(f"  {dev}: {100.0 * frac:.1f}%")
     print("=" * 72)
 
 
@@ -171,8 +199,11 @@ def main() -> None:
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--no-hf-mirror", action="store_true")
     parser.add_argument("--no-prompt", action="store_true")
+    parser.add_argument("--no-decoder-spatial", action="store_true")
     parser.add_argument("--report-json", type=Path, default=None)
     args = parser.parse_args()
+
+    purge_gpu()
 
     asset_root = resolve_bench_asset_root(args.asset_root)
     devices = tuple(f"cuda:{i}" for i in range(args.num_gpus))
@@ -180,6 +211,7 @@ def main() -> None:
         devices=devices,
         max_vram_gib_per_device=args.max_vram_gib,
         force=args.force,
+        decoder_spatial_parallel=not args.no_decoder_spatial,
     )
 
     engine = AuroraEngine.from_preset(

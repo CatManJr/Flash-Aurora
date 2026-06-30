@@ -8,7 +8,29 @@ import torch
 from flash_aurora.aurora.batch import Batch
 from flash_aurora.aurora.model.aurora import Aurora
 
-__all__ = ["rollout"]
+__all__ = ["advance_rollout_batch", "prepare_rollout_batch", "rollout"]
+
+
+def prepare_rollout_batch(model: Aurora, batch: Batch) -> Batch:
+    """Apply rollout hooks and move ``batch`` to the model device."""
+    batch = model.batch_transform_hook(batch)
+    param = next(model.parameters())
+    return batch.type(param.dtype).crop(model.patch_size).to(param.device)
+
+
+def advance_rollout_batch(batch: Batch, pred: Batch) -> Batch:
+    """Slide history window forward using the latest prediction."""
+    return dataclasses.replace(
+        pred,
+        surf_vars={
+            k: torch.cat([batch.surf_vars[k][:, 1:], v], dim=1)
+            for k, v in pred.surf_vars.items()
+        },
+        atmos_vars={
+            k: torch.cat([batch.atmos_vars[k][:, 1:], v], dim=1)
+            for k, v in pred.atmos_vars.items()
+        },
+    )
 
 
 def rollout(model: Aurora, batch: Batch, steps: int) -> Generator[Batch, None, None]:
@@ -22,28 +44,9 @@ def rollout(model: Aurora, batch: Batch, steps: int) -> Generator[Batch, None, N
     Yields:
         :class:`aurora.Batch`: The prediction after every step.
     """
-    # We will need to concatenate data, so ensure that everything is already of the right form.
-    batch = model.batch_transform_hook(batch)  # This might modify the available variables.
-    # Use an arbitary parameter of the model to derive the data type and device.
-    p = next(model.parameters())
-    batch = batch.type(p.dtype)
-    batch = batch.crop(model.patch_size)
-    batch = batch.to(p.device)
+    batch = prepare_rollout_batch(model, batch)
 
     for _ in range(steps):
         pred = model.forward(batch)
-
         yield pred
-
-        # Add the appropriate history so the model can be run on the prediction.
-        batch = dataclasses.replace(
-            pred,
-            surf_vars={
-                k: torch.cat([batch.surf_vars[k][:, 1:], v], dim=1)
-                for k, v in pred.surf_vars.items()
-            },
-            atmos_vars={
-                k: torch.cat([batch.atmos_vars[k][:, 1:], v], dim=1)
-                for k, v in pred.atmos_vars.items()
-            },
-        )
+        batch = advance_rollout_batch(batch, pred)

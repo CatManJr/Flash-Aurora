@@ -20,6 +20,8 @@ class ParallelPlan:
     decoder_device: str
     estimated_peak_gib: float
     estimated_per_device_gib: tuple[float, ...]
+    decoder_spatial_parallel: bool = False
+    decoder_spatial_devices: tuple[str, ...] = ()
 
     @property
     def input_device(self) -> str:
@@ -48,6 +50,8 @@ class DistributedConfig:
     max_vram_gib_per_device: float = 40.0
     rollout_steps: int = 1
     force: bool = False
+    decoder_spatial_parallel: bool = True
+    overlap_rollout: bool = True
 
     def __post_init__(self) -> None:
         if not self.devices:

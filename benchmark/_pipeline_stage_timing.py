@@ -150,31 +150,64 @@ def _run_pipeline_forward_once(
         _sync(bb_dev)
 
     t_xfer1 = time.perf_counter()
-    if dec_dev != bb_dev:
-        x = x.to(dec_dev, non_blocking=True)
-    if dec_dev != enc_dev:
-        batch = batch_to_device(batch, dec_dev)
-    if dec_dev != bb_dev:
-        _sync(dec_dev)
+    if plan.decoder_spatial_parallel:
+        west_dev = torch.device(plan.decoder_spatial_devices[0])
+        east_dev = torch.device(plan.decoder_spatial_devices[1])
+        if east_dev != bb_dev:
+            _sync(bb_dev)
+    else:
+        if dec_dev != bb_dev:
+            x = x.to(dec_dev, non_blocking=True)
+        if dec_dev != enc_dev:
+            batch = batch_to_device(batch, dec_dev)
+        if dec_dev != bb_dev:
+            _sync(dec_dev)
     bb_to_dec_ms = (time.perf_counter() - t_xfer1) * 1000.0
 
-    with _device_context(dec_dev):
-        e_dec0.record()
+    if plan.decoder_spatial_parallel:
+        from flash_aurora.engine.distributed.decoder_spatial import forward_decoder_spatial_parallel
+
+        west_dev = torch.device(plan.decoder_spatial_devices[0])
+        east_dev = torch.device(plan.decoder_spatial_devices[1])
+        with _device_context(east_dev):
+            e_dec0.record()
         with torch.inference_mode():
-            pred = run_with_encoder_decoder_routing(
-                model.decoder,
+            pred = forward_decoder_spatial_parallel(
+                model,
                 x,
                 batch,
+                patch_res=patch_res,
+                lead_time=model.timestep,
+                spatial_devices=(west_dev, east_dev),
                 autocast_bf16=model.autocast_encoder_decoder,
                 use_tensor_core=model.encoder_decoder_use_tensor_core,
-                lead_time=model.timestep,
-                patch_res=patch_res,
             )
-        e_dec1.record()
+        with _device_context(east_dev):
+            e_dec1.record()
         with torch.inference_mode():
             pred = model._finish_prediction(batch, pred)
-        e_post1.record()
-        _sync(dec_dev)
+        with _device_context(east_dev):
+            e_post1.record()
+        _sync(west_dev)
+        _sync(east_dev)
+    else:
+        with _device_context(dec_dev):
+            e_dec0.record()
+            with torch.inference_mode():
+                pred = run_with_encoder_decoder_routing(
+                    model.decoder,
+                    x,
+                    batch,
+                    autocast_bf16=model.autocast_encoder_decoder,
+                    use_tensor_core=model.encoder_decoder_use_tensor_core,
+                    lead_time=model.timestep,
+                    patch_res=patch_res,
+                )
+            e_dec1.record()
+            with torch.inference_mode():
+                pred = model._finish_prediction(batch, pred)
+            e_post1.record()
+            _sync(dec_dev)
 
     timing = PipelineStageTiming(
         prepare_ms=prepare_ms,
@@ -192,7 +225,9 @@ def _run_pipeline_forward_once(
         + e_dec0.elapsed_time(e_dec1)
         + e_dec1.elapsed_time(e_post1),
     )
-    return timing, batch_to_device(pred, enc_dev)
+    pred = batch_to_device(pred, enc_dev)
+    _sync(enc_dev)
+    return timing, pred
 
 
 def time_pipeline_forward_stages(
@@ -211,10 +246,12 @@ def time_pipeline_forward_stages(
             _run_pipeline_forward_once(model, batch)
         for idx in device_indices:
             torch.cuda.synchronize(idx)
+        if device_indices:
+            torch.cuda.empty_cache()
 
         sums = [0.0] * 8
         pred = None
-        for _ in range(repeat):
+        for i in range(repeat):
             timing, pred = _run_pipeline_forward_once(model, batch)
             sums[0] += timing.prepare_ms
             sums[1] += timing.encoder_ms
@@ -224,6 +261,10 @@ def time_pipeline_forward_stages(
             sums[5] += timing.decoder_ms
             sums[6] += timing.post_ms
             sums[7] += timing.total_ms
+            if i + 1 < repeat:
+                del pred
+                pred = None
+                torch.cuda.empty_cache()
 
         n = float(repeat)
         avg = PipelineStageTiming(
@@ -277,15 +318,26 @@ def build_load_profile(
         name: snap.allocated_mib for name, snap in _snapshot_devices(device_names).items()
     }
     enc_bytes = _param_bytes_on_device(model.encoder, enc_dev)
-    dec_bytes = _param_bytes_on_device(model.decoder, dec_dev)
     bb_bytes = _param_bytes_on_device(model.backbone, bb_dev)
-    param_bytes: dict[str, int] = {}
-    if enc_dev == dec_dev:
-        param_bytes[plan.encoder_device] = enc_bytes + dec_bytes
+    dec_bytes = _param_bytes_on_device(model.decoder, dec_dev)
+    if plan.decoder_spatial_parallel:
+        from flash_aurora.engine.distributed.decoder_spatial import decoder_spatial_replica
+
+        west_dev = torch.device(plan.decoder_spatial_devices[0])
+        replica = decoder_spatial_replica(model)
+        replica_bytes = _param_bytes_on_device(replica, west_dev) if replica is not None else 0
+        param_bytes = {
+            plan.encoder_device: enc_bytes + replica_bytes,
+            plan.backbone_device: bb_bytes + dec_bytes,
+        }
     else:
-        param_bytes[plan.encoder_device] = enc_bytes
-        param_bytes[plan.decoder_device] = dec_bytes
-    param_bytes[plan.backbone_device] = bb_bytes
+        param_bytes = {}
+        if enc_dev == dec_dev:
+            param_bytes[plan.encoder_device] = enc_bytes + dec_bytes
+        else:
+            param_bytes[plan.encoder_device] = enc_bytes
+            param_bytes[plan.decoder_device] = dec_bytes
+        param_bytes[plan.backbone_device] = bb_bytes
 
     reset_peak_stats(device_names)
     timing, _ = time_pipeline_forward_stages(

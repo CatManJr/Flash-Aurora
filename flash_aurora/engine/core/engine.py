@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Generator, Iterable
+from typing import Callable, Generator, Iterable
 
 import torch
 from flash_aurora.aurora import Batch
@@ -255,6 +255,11 @@ class AuroraEngine:
                 "estimated_peak_gib": self._parallel_plan.estimated_peak_gib,
                 "estimated_per_device_gib": self._parallel_plan.estimated_per_device_gib,
             }
+            from flash_aurora.engine.distributed.plan import estimate_device_busy_fraction
+
+            status["estimated_busy_fraction"] = dict(
+                estimate_device_busy_fraction(self._parallel_plan)
+            )
         return status
 
     def gpu_guard_status(self):
@@ -326,7 +331,46 @@ class AuroraEngine:
     def _resolve_async_export(self, async_export: bool | None) -> bool:
         if async_export is not None:
             return async_export
+        distributed = self.config.distributed
+        if distributed is not None and distributed.overlap_rollout:
+            return True
         return self.config.async_export
+
+    def _use_distributed_rollout(self) -> bool:
+        distributed = self.config.distributed
+        if distributed is None or not distributed.overlap_rollout:
+            return False
+        from flash_aurora.engine.distributed.pipeline import is_pipeline_parallel
+
+        return is_pipeline_parallel(self._model)
+
+    def _distributed_rollout_stream(
+        self,
+        batch: Batch,
+        steps: int,
+        *,
+        observers: Iterable[RolloutObserver] | None = None,
+        on_step_export: Callable[[int, Batch], None] | None = None,
+    ) -> Generator[Batch, None, None]:
+        from flash_aurora.engine.distributed.rollout_pipeline import distributed_rollout
+
+        distributed = self.config.distributed
+        assert distributed is not None
+        overlap_export = on_step_export is not None and distributed.overlap_rollout
+
+        with torch.inference_mode():
+            for step_index, pred in enumerate(
+                distributed_rollout(
+                    self._model,
+                    batch,
+                    steps,
+                    overlap_export=overlap_export,
+                    on_step_export=on_step_export,
+                )
+            ):
+                for observer in observers or ():
+                    observer.on_step(step_index, pred)
+                yield pred
 
     def _pipeline_exporter(self, export_dir: Path) -> PipelineRolloutExporter:
         return PipelineRolloutExporter.async_netcdf(
@@ -445,9 +489,12 @@ class AuroraEngine:
             self._gpu_ticket.heartbeat()
         self.validate(batch)
         self._maybe_warmup(batch)
-        session = RolloutSession(self.model, observers)
         try:
-            yield from session.run(batch, steps)
+            if self._use_distributed_rollout():
+                yield from self._distributed_rollout_stream(batch, steps, observers=observers)
+            else:
+                session = RolloutSession(self.model, observers)
+                yield from session.run(batch, steps)
         except Exception:
             self.release_gpu()
             raise
@@ -465,6 +512,24 @@ class AuroraEngine:
 
         resolved_dir = self._resolved_export_dir()
         self._exporter = RolloutExporter(resolved_dir)
+        if self._use_distributed_rollout() and self._resolve_async_export(async_export):
+            with self._pipeline_exporter(resolved_dir) as exporter:
+                exported: dict[int, Path] = {}
+
+                def on_export(step_index: int, cpu_batch: Batch) -> None:
+                    exported[step_index] = exporter.write_owned_step(step_index, cpu_batch)
+
+                for step_index, _prediction in enumerate(
+                    self._distributed_rollout_stream(batch, steps, on_step_export=on_export)
+                ):
+                    prior = step_index - 1
+                    if prior >= 0 and prior in exported:
+                        yield exported[prior]
+                last = steps - 1
+                if last in exported:
+                    yield exported[last]
+            return
+
         if self._resolve_async_export(async_export):
             with self._pipeline_exporter(resolved_dir) as exporter:
                 for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):
