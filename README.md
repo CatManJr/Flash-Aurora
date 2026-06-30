@@ -33,11 +33,11 @@ Headline latency: **bf16_mixed@fp32** is **about 3.2x** vs PyTorch FP32 on `era5
 
 One ZMQ worker per GPU, each bound to a preset. The coordinator routes forecast requests to a matching idle worker and streams events back to the client. This is job-level scheduling across heterogeneous models, not tensor parallelism inside one rollout. A single client can run `era5_pretrained`, `hres_t0_finetuned`, `hres_0.1`, and `cams` on four GPUs at the same time. When one preset is slow to prepare (for example `hres_0.1`), the client can queue more work on the other workers instead of leaving those GPUs idle. See [Forecast scheduler (ZMQ)](#forecast-scheduler-zmq).
 
-![four heterogeneous presets dispatched in parallel](docs/image/4_workers.png)
+| First dispatch | Refill while `hres_0.1` is pending |
+| :--: | :--: |
+| ![four heterogeneous presets dispatched in parallel](docs/image/4_workers.png) | ![refill faster workers while HRES is pending](docs/image/4_workers_refill.png) |
 
-![refill faster workers while HRES is pending](docs/image/4_workers_refill.png)
-
-Left: first dispatch, one job per worker and preset. Right: refill while `hres_0.1` is still pending. Faster workers take follow-up jobs so aggregate throughput stays high. Traces from `docs/example_scheduler_distributed_workers.ipynb` on 4x RTX PRO 6000.
+Left: one job per worker and preset. Right: faster workers take follow-up jobs while `hres_0.1` is still pending. Traces from `docs/example_scheduler_distributed_workers.ipynb` on 4x RTX PRO 6000.
 
 ### Pipeline parallelism for GPUs less than 40GB
 
@@ -48,15 +48,15 @@ Splits encoder, backbone, and spatial decoder across two GPUs inside one process
 
 See [Distributed pipeline](#distributed-pipeline) and `benchmark/bench_distributed_rollout.py`.
 
-![era5 2-GPU staged rollout](docs/image/distributed_rollout_utilization_2gpu_staged.png)
+| `era5_pretrained` staged | `era5_pretrained` overlap |
+| :--: | :--: |
+| ![era5 2-GPU staged rollout](docs/image/distributed_rollout_utilization_2gpu_staged.png) | ![era5 2-GPU overlap rollout](docs/image/distributed_rollout_utilization_2gpu_overlap.png) |
 
-![era5 2-GPU overlap rollout](docs/image/distributed_rollout_utilization_2gpu_overlap.png)
+| `hres_0.1` staged | `hres_0.1` overlap |
+| :--: | :--: |
+| ![hres_0.1 2-GPU staged rollout](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_staged.png) | ![hres_0.1 2-GPU overlap rollout](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_overlap.png) |
 
-![hres_0.1 2-GPU staged rollout](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_staged.png)
-
-![hres_0.1 2-GPU overlap rollout](docs/image/distributed_rollout_utilization_hres_0.1_2gpu_overlap.png)
-
-`era5_pretrained` ($721 \times 1440$), staged then overlap. `hres_0.1` ($1801 \times 3600$), staged then overlap.
+`era5_pretrained` ($721 \times 1440$), staged left and overlap right. `hres_0.1` ($1801 \times 3600$), staged left and overlap right.
 
 ## Install
 
