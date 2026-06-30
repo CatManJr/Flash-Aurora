@@ -15,7 +15,7 @@ On `bf16_mixed@`* and `tf32@*` precision tiers, Triton AdaLN also **keeps FP32 a
 
 ### CuTe DSL powered Aurora Window Attention
 
-Aurora Swin windows are short ($N{=}144$) because patch size is fixed to $14 \times 14$. The CuTe DSL kernels load the **entire window** $K$ and $V$ into shared memory in a **single stage** (`tile_n \ge N`), run QK and PV MMAs with FP32 online softmax locally, and never materialize an $N \times N$ attention matrix in global memory. Two variants (BF16 and TF32-simulated FP32) target these fixed shapes rather than generic long-sequence attention. **1.07-1.22x** vs BF16 SDPA and **1.59-1.69x** vs FP32 SDPA (mainly tensor core advantage, not the kernel's) on encoder-stage window microbenchmarks. See [Window attention kernels](#window-attention-kernels).
+Aurora Swin windows are short ($N{=}144$) because patch size is fixed to $14 \times 14$. The CuTe DSL kernels load the **entire window** $K$ and $V$ into shared memory in a **single stage** (`tile_n \ge N`), run QK and PV MMAs with FP32 online softmax locally, and never materialize an $N \times N$ attention matrix in global memory. Two variants (BF16 and TF32-simulated FP32) target these fixed shapes rather than generic long-sequence attention. The single-stage $N{=}144$ path JIT-compiles across GPU generations when `CUTE_DSL_ARCH` matches the device (Ada through Blackwell). On Blackwell (sm_120) microbenchmarks show **1.07-1.22x** vs BF16 SDPA and **1.59-1.69x** vs FP32 SDPA. On RTX 4090 (sm_89) CuTe is **1.04-1.05x** vs the fastest SDPA backend and **2.2x** vs FP32 SDPA on the same shapes. See [Window attention kernels](#window-attention-kernels).
 
 ### Mixed precision inference
 
@@ -66,7 +66,7 @@ cd flash-aurora
 uv sync
 ```
 
-Dependencies are declared in `pyproject.toml` and pinned by `uv.lock`. CuTe DSL kernels JIT-compile for the local GPU architecture. Set `CUTE_DSL_ARCH` when needed, for example `sm_120a` on NVIDIA Blackwell GeForce.
+Dependencies are declared in `pyproject.toml` and pinned by `uv.lock`. CuTe DSL kernels JIT-compile for the local GPU architecture. Set `CUTE_DSL_ARCH` when needed, for example `sm_89` on RTX 4090 or `sm_120a` on Blackwell GeForce.
 
 ## Repository layout
 
@@ -568,11 +568,15 @@ When $N$ is too large for the SMEM budget, or on downsampled stages where $N$ is
 
 In both modes, logit scaling, masked softmax normalization, and row sums stay in FP32. Lower precision is confined to the two GEMMs, $QK^\top$ and $PV$. `TF32_ACC_FP32` tracks FP32 SDPA to about three significant figures. `BF16_MIXED` accepts the larger BF16 matmul error but remains within upstream per-variable drift tolerances on full-model rollouts (see Precision drift below).
 
-**Kernel variants.** Tile sizes $(tile_m, tile_n)$ come from `_smem_utils.py` (SMEM budget per GPU architecture). The single-pass vs streaming split above is the main variant selector; QKV-packed entry points avoid separate $Q$, $K$, and $V$ tensors in the fused BF16 chain. Kernels JIT-compile per $(D_h, N, \mathrm{hasbias}, \mathrm{tile})$ and are cached for the process.
+**Kernel variants.** Tile sizes $(tile_m, tile_n)$ come from `_smem_utils.py` (SMEM budget per GPU architecture). The single-pass vs streaming split above is the main variant selector; QKV-packed entry points avoid separate $Q$, $K$, and $V$ tensors in the fused BF16 chain. Kernels JIT-compile per $(D_h, N, \mathrm{hasbias}, \mathrm{tile})$ and are cached for the process. Set `CUTE_DSL_ARCH` to the target SM (for example `sm_89` on RTX 4090, `sm_120a` on Blackwell GeForce). The production $N{=}144$ single-stage kernels run on sm_75 and newer. The optional multi-stage streaming path for very large $N$ needs sm_90 or newer (TMA).
 
 ### Microbenchmarks
 
-Measured with `benchmark/bench_window_attn.py` on an **NVIDIA RTX PRO 6000 Blackwell Server Edition**, PyTorch **2.12.1**, `CUTE_DSL_ARCH=sm_120a` (trimmed mean of 200 runs per shape). $B_{\mathrm{win}}$ is the number of spatial tokens per window; $H$ is the head count.
+Measured with `benchmark/bench_window_attn.py` (trimmed mean of 200 runs per shape). $B_{\mathrm{win}}$ is the number of spatial tokens per window; $H$ is the head count. SDPA baselines use PyTorch `scaled_dot_product_attention` with the same dtype as the CuTe path (BF16 for `BF16_MIXED`, FP32 for `TF32_ACC_FP32`).
+
+#### NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120a)
+
+PyTorch **2.12.1**, `CUTE_DSL_ARCH=sm_120a`. Full report: `benchmark/window_attn_latest.txt`.
 
 **0.25-degree ERA5 encoder stages** (unmasked, $N=144$ tokens per window):
 
@@ -600,6 +604,39 @@ Measured with `benchmark/bench_window_attn.py` on an **NVIDIA RTX PRO 6000 Black
 | BF16 CuTe DSL | 0.829 ms vs 1.014 ms                     | 1.22x           |
 | TF32 CuTe DSL | 1.906 ms vs 3.221 ms                     | 1.69x           |
 
+
+#### NVIDIA GeForce RTX 4090 (sm_89)
+
+PyTorch **2.12.1**, `CUTE_DSL_ARCH=sm_89`.
+
+**0.25-degree ERA5 encoder stages** (unmasked, $N=144$ tokens per window):
+
+
+| Stage | $B_{\mathrm{win}}$ | $H$ | BF16 CuTe DSL (ms) | BF16 SDPA (ms) | Speedup |
+| ----- | ------------------ | --- | ------------------ | -------------- | ------- |
+| 1     | 1800               | 8   | 1.157              | 1.584          | 1.37x   |
+| 2     | 450                | 16  | 0.589              | 0.804          | 1.36x   |
+| 3     | 128                | 32  | 0.345              | 0.470          | 1.36x   |
+
+
+
+| Stage | $B_{\mathrm{win}}$ | $H$ | TF32 CuTe DSL (ms) | FP32 SDPA (ms) | Speedup |
+| ----- | ------------------ | --- | ------------------ | -------------- | ------- |
+| 1     | 1800               | 8   | 2.443              | 5.491          | 2.25x   |
+| 2     | 450                | 16  | 1.239              | 2.727          | 2.20x   |
+| 3     | 128                | 32  | 0.713              | 1.598          | 2.24x   |
+
+
+**Shifted-window mask** (Swin relative position bias $-100$, stage 1):
+
+
+| Mode          | Stage 1 ($B_{\mathrm{win}}=1800$, $H=8$) | Speedup vs SDPA |
+| ------------- | ---------------------------------------- | --------------- |
+| BF16 CuTe DSL | 1.187 ms vs 1.401 ms                     | 1.18x           |
+| TF32 CuTe DSL | 2.642 ms vs 5.997 ms                     | 2.27x           |
+
+
+On RTX 4090, PyTorch SDPA autoselect is slower than the memory-efficient backend on these shapes. Forced `mem_eff` SDPA is within a few percent of CuTe BF16 (for example enc1: 1.157 ms CuTe vs 1.220 ms mem_eff). The larger speedups in the tables above are relative to default SDPA dispatch. CuTe absolute latency is higher on sm_89 than on sm_120 (enc1 BF16: 1.16 ms vs 0.73 ms) because tile sizes and memory bandwidth differ, but the kernel still wins on production $N{=}144$ shapes.
 
 Production inference on the default $0.25^{\circ}$ grid uses $N=144$ windows per stage. BF16 CuTe DSL attention requires at least 32 tokens per window; on coarser downsampled stages with smaller $N$, use `tf32` or PyTorch SDPA.
 
@@ -964,7 +1001,10 @@ Finetuned-only shortcut (delegates to the same harness): `benchmark/bench_aurora
 
 ```bash
 CUTE_DSL_ARCH=sm_120a BENCH_MEASURED=200 uv run python benchmark/bench_window_attn.py
+CUTE_DSL_ARCH=sm_89 BENCH_MEASURED=200 uv run python benchmark/bench_window_attn.py
 ```
+
+On sm_89 the script stops at the optional N=576 streaming micro shape (TMA needs sm_90+). ERA5 and checkpoint shape tables complete normally.
 
 **Precision drift** (seed 42, `lora_merged` on finetuned models):
 
