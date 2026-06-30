@@ -33,9 +33,16 @@ Headline latency: **bf16_mixed@fp32** is **about 3.2x** vs PyTorch FP32 on `era5
 
 One ZMQ worker per GPU, each bound to a preset. The coordinator routes forecast requests to a matching idle worker and streams events back to the client. This is job-level scheduling across heterogeneous models, not tensor parallelism inside one rollout. A single client can run `era5_pretrained`, `hres_t0_finetuned`, `hres_0.1`, and `cams` on four GPUs at the same time. When one preset is slow to prepare (for example `hres_0.1`), the client can queue more work on the other workers instead of leaving those GPUs idle. See [Forecast scheduler (ZMQ)](#forecast-scheduler-zmq).
 
-| Single 1-step task distribution | Refill while `hres_0.1` is pending |
-| :--: | :--: |
-| ![four heterogeneous presets dispatched in parallel](docs/image/4_workers.png) | ![refill faster workers while HRES is pending](docs/image/4_workers_refill.png) |
+<table width="100%">
+  <tr>
+    <th width="50%" align="center">Single 1-step task distribution</th>
+    <th width="50%" align="center">Refill while <code>hres_0.1</code> is pending</th>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/image/4_workers.png" width="100%"/></td>
+    <td width="50%" valign="top"><img src="docs/image/4_workers_refill.png" width="100%"/></td>
+  </tr>
+</table>
 
 Left: one job per worker and preset. Right: faster workers take follow-up jobs while `hres_0.1` is still pending. Traces from `docs/example_scheduler_distributed_workers.ipynb` on 4x RTX PRO 6000 Blackwell Server Edition.
 
@@ -47,13 +54,27 @@ Multi-step rollout uses `rollout_stream()` with pipeline forward on both GPUs. `
 
 See [Distributed pipeline](#distributed-pipeline) and `benchmark/bench_distributed_rollout.py`.
 
-| `era5_pretrained` (5090) | `hres_0.1` (5090) |
-| :--: | :--: |
-| ![era5 2-GPU rollout on 5090](docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu.png) | ![hres_0.1 2-GPU rollout on 5090](docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu.png) |
+<table width="100%">
+  <tr>
+    <th width="50%" align="center"><code>era5_pretrained</code> (5090)</th>
+    <th width="50%" align="center"><code>hres_0.1</code> (5090)</th>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu.png" width="100%"/></td>
+    <td width="50%" valign="top"><img src="docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu.png" width="100%"/></td>
+  </tr>
+</table>
 
-| `era5_pretrained` (4090) | `hres_0.1` (4090) |
-| :--: | :--: |
-| ![era5 2-GPU rollout on 4090](docs/image/distributed_rollout_utilization_4090_era5_pretrained_2gpu.png) | ![hres_0.1 2-GPU rollout on 4090](docs/image/distributed_rollout_utilization_4090_hres_0.1_2gpu.png) |
+<table width="100%">
+  <tr>
+    <th width="50%" align="center"><code>era5_pretrained</code> (4090)</th>
+    <th width="50%" align="center"><code>hres_0.1</code> (4090)</th>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/image/distributed_rollout_utilization_4090_era5_pretrained_2gpu.png" width="100%"/></td>
+    <td width="50%" valign="top"><img src="docs/image/distributed_rollout_utilization_4090_hres_0.1_2gpu.png" width="100%"/></td>
+  </tr>
+</table>
 
 `era5_pretrained` ($721 \times 1440$) and `hres_0.1` ($1801 \times 3600$), 4-step rollout. Filename pattern: `distributed_rollout_utilization_{gpu}_{preset}_2gpu.png`.
 
