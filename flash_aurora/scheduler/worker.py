@@ -40,7 +40,6 @@ class ForecastWorkerConfig:
     distributed_devices: tuple[str, ...] | None = None
     distributed_max_vram_gib: float = 32.0
     distributed_force: bool = False
-    distributed_overlap_rollout: bool = True
     poll_timeout_ms: int = 1000
 
 
@@ -138,7 +137,6 @@ class ForecastWorker:
                 devices=self._config.distributed_devices,
                 max_vram_gib_per_device=self._config.distributed_max_vram_gib,
                 force=self._config.distributed_force,
-                overlap_rollout=self._config.distributed_overlap_rollout,
             )
         engine = AuroraEngine.from_preset(self._config.preset, **kwargs)
         if self._config.device is not None and not self._config.distributed_devices:

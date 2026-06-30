@@ -1,4 +1,4 @@
-"""Staged pipeline forward and rollout overlap for distributed inference."""
+"""Staged pipeline forward for distributed inference."""
 
 from __future__ import annotations
 
@@ -139,55 +139,19 @@ def distributed_rollout(
     batch: Batch,
     steps: int,
     *,
-    overlap_export: bool = True,
     on_step_export: Callable[[int, Batch], None] | None = None,
 ) -> Generator[Batch, None, None]:
-    """Roll out with staged pipeline and optional export overlap during backbone.
-
-    When ``on_step_export`` is set and ``overlap_export`` is True, the GPU→CPU
-    handoff for step ``k-1`` runs on the encoder device while the backbone for
-    step ``k`` executes on the backbone device.
-    """
+    """Roll out through encoder, backbone, and decoder pipeline stages."""
     plan = parallel_plan(model)
     if plan is None:
         raise RuntimeError("distributed_rollout requires a pipeline-parallel model")
 
     enc_dev = torch.device(plan.encoder_device)
-    bb_dev = torch.device(plan.backbone_device)
-
     batch = prepare_rollout_batch(model, batch)
-    pending_export: tuple[int, Batch] | None = None
-    offloader = None
-    if on_step_export is not None and overlap_export and enc_dev.type == "cuda":
-        from flash_aurora.engine.egress.offload import EgressOffloader
-
-        offloader = EgressOffloader(device=enc_dev, use_stream=True)
 
     for step in range(steps):
         step_batch, x_enc, patch_res = run_encoder_stage(model, batch)
-
-        if (
-            pending_export is not None
-            and offloader is not None
-            and offloader.egress_stream is not None
-            and bb_dev.type == "cuda"
-        ):
-            export_index, export_batch = pending_export
-            bb_stream = torch.cuda.Stream(device=bb_dev)
-            export_stream = offloader.egress_stream
-            with torch.cuda.stream(export_stream):
-                offloader.begin_async_d2h(export_batch)
-            with torch.cuda.stream(bb_stream):
-                x_bb = run_backbone_stage(model, x_enc, step_batch, patch_res)
-            export_stream.synchronize()
-            bb_stream.synchronize()
-            cpu_batch = offloader.finish_async_d2h()
-            on_step_export(export_index, cpu_batch)
-            pending_export = None
-            trim_cuda_cache(enc_dev, bb_dev)
-        else:
-            x_bb = run_backbone_stage(model, x_enc, step_batch, patch_res)
-
+        x_bb = run_backbone_stage(model, x_enc, step_batch, patch_res)
         if x_enc.is_cuda:
             release_tensor_storage(x_enc)
 
@@ -197,15 +161,9 @@ def distributed_rollout(
         yield pred
 
         if on_step_export is not None:
-            if overlap_export and offloader is not None and step + 1 < steps:
-                pending_export = (step, pred)
-            else:
-                on_step_export(step, pred)
+            on_step_export(step, pred)
 
         if step + 1 < steps:
             batch = advance_rollout_batch(batch, pred)
 
-    if pending_export is not None and on_step_export is not None:
-        export_index, export_batch = pending_export
-        on_step_export(export_index, export_batch)
-        trim_cuda_cache(enc_dev)
+    trim_cuda_cache(enc_dev)

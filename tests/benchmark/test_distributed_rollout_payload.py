@@ -39,11 +39,11 @@ def test_case_payload_roundtrip_preserves_resource_samples() -> None:
         )
     ]
     case = RolloutCaseResult(
-        mode="2gpu_overlap",
+        mode="2gpu",
         total_ms=4816.0,
         per_step_ms=1204.0,
         peak_allocated_gib={"cuda:0": 13.3, "cuda:1": 18.1},
-        distributed_status={"overlap_rollout": True},
+        distributed_status={"enabled": True, "decoder_spatial_parallel": True},
         resource_samples=samples,
     )
 

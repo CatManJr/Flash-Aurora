@@ -20,7 +20,6 @@ def test_distributed_rollout_matches_rollout_stream(engine_config_offline) -> No
         devices=("cuda:0", "cuda:1"),
         max_vram_gib_per_device=32.0,
         force=True,
-        overlap_rollout=True,
     )
     engine = AuroraEngine(config)
     builder = InitialConditionBuilder(config)
@@ -33,7 +32,7 @@ def test_distributed_rollout_matches_rollout_stream(engine_config_offline) -> No
         engine.load()
         with torch.inference_mode():
             pipelined = list(
-                distributed_rollout(engine.model, batch, 2, overlap_export=False)
+                distributed_rollout(engine.model, batch, 2)
             )
             streamed = list(engine.rollout_stream(batch, 2))
 

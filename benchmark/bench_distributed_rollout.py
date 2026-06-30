@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Benchmark multi-step ``rollout_and_export`` with ``DistributedConfig`` (2-GPU).
 
-Compares staged vs overlap-export rollout on a pipeline-parallel engine. Each mode
-runs in a **fresh subprocess** so JIT/cuDNN/GPU state from one path does not warm
-the other. Defaults benchmark ``era5_pretrained`` and ``hres_0.1`` (largest grid);
-both need at least two 32 GiB GPUs.
+Pipeline-parallel rollout with spatial decoder and async export via ``rollout_stream``.
+Each run uses a **fresh subprocess** so JIT/cuDNN/GPU state does not carry over.
+Defaults benchmark ``era5_pretrained`` and ``hres_0.1``; both need at least two 32 GiB GPUs.
 
 Examples::
 
@@ -15,7 +14,7 @@ Examples::
         --steps 4 --skip-download --force --warmup 1 --repeat 3
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_distributed_rollout.py \\
-        --modes 2gpu_overlap --report-json /tmp/distributed_rollout.json
+        --report-json /tmp/distributed_rollout.json
 
     # CPU / DRAM / GPU utilization curves (HPC-style figure)
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_distributed_rollout.py \\
@@ -63,28 +62,20 @@ from flash_aurora.engine.runtime.resource_monitor import (  # noqa: E402
 )
 
 DEFAULT_PRESETS = ("era5_pretrained", "hres_0.1")
-DEFAULT_MODES = ("2gpu_staged", "2gpu_overlap")
+DEFAULT_MODES = ("2gpu",)
 ALL_MODES = DEFAULT_MODES
 
 
 @dataclass(frozen=True)
 class RolloutModeSpec:
     name: str
-    overlap_rollout: bool
     decoder_spatial_parallel: bool
     async_export: bool
 
 
 MODE_SPECS: dict[str, RolloutModeSpec] = {
-    "2gpu_staged": RolloutModeSpec(
-        name="2gpu_staged",
-        overlap_rollout=False,
-        decoder_spatial_parallel=True,
-        async_export=True,
-    ),
-    "2gpu_overlap": RolloutModeSpec(
-        name="2gpu_overlap",
-        overlap_rollout=True,
+    "2gpu": RolloutModeSpec(
+        name="2gpu",
         decoder_spatial_parallel=True,
         async_export=True,
     ),
@@ -186,7 +177,6 @@ def _run_mode(
                 force=force,
                 rollout_steps=steps,
                 decoder_spatial_parallel=spec.decoder_spatial_parallel,
-                overlap_rollout=spec.overlap_rollout,
             ),
         )
         engine.load()
@@ -377,17 +367,11 @@ def _print_report(report: RolloutBenchmarkReport) -> None:
             for dev in sorted(case.peak_allocated_gib)
         )
         print(f"{case.mode:<16} {case.total_ms:10.1f} {case.per_step_ms:12.1f}  {peak_parts}")
-    if len(report.cases) == 2:
-        staged, overlap = report.cases
-        speedup = staged.total_ms / overlap.total_ms if overlap.total_ms > 0 else 0.0
-        print("-" * 78)
-        print(f"overlap speedup vs staged: {speedup:.2f}x  ({staged.total_ms - overlap.total_ms:.0f} ms saved)")
     print("=" * 78)
-    print("(each mode timed in a fresh subprocess)")
+    print("(each timed run uses a fresh subprocess)")
     print()
-    print("Modes (requires >= 2 GPUs; large presets do not fit one 32 GiB card):")
-    print("  2gpu_staged   — spatial decoder + async export, sequential rollout stages")
-    print("  2gpu_overlap  — export step k-1 on cuda:0 while backbone step k on cuda:1")
+    print("Modes (requires >= 2 GPUs):")
+    print("  2gpu  — spatial decoder + async export via rollout_stream")
     print()
 
 

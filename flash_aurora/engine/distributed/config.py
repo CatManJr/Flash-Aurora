@@ -51,7 +51,6 @@ class DistributedConfig:
     rollout_steps: int = 1
     force: bool = False
     decoder_spatial_parallel: bool = True
-    overlap_rollout: bool = True
 
     def __post_init__(self) -> None:
         if not self.devices:

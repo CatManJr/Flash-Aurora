@@ -44,11 +44,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--distributed-max-vram-gib", type=float, default=32.0)
     parser.add_argument("--distributed-force", action="store_true")
-    parser.add_argument(
-        "--no-distributed-overlap-rollout",
-        action="store_true",
-        help="Disable staged rollout export overlap on pipeline workers",
-    )
     parser.add_argument("--poll-timeout-ms", type=int, default=1000)
     return parser
 
@@ -81,7 +76,6 @@ def main() -> None:
         distributed_devices=distributed_devices,
         distributed_max_vram_gib=args.distributed_max_vram_gib,
         distributed_force=args.distributed_force,
-        distributed_overlap_rollout=not args.no_distributed_overlap_rollout,
         poll_timeout_ms=args.poll_timeout_ms,
     )
     worker = ForecastWorker(config)

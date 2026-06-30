@@ -286,6 +286,14 @@ def forward_decoder_spatial_parallel(
     assert surf_west is not None and surf_east is not None
     assert atmos_west is not None and atmos_east is not None
 
+    rollout_metadata = Metadata(
+        lat=lat,
+        lon=lon,
+        time=tuple(t + lead_time for t in batch.metadata.time),
+        atmos_levels=atmos_levels,
+        rollout_step=batch.metadata.rollout_step + 1,
+    )
+
     merge_device = west_dev
     surf_merged = torch.cat(
         [
@@ -311,11 +319,5 @@ def forward_decoder_spatial_parallel(
         {v: surf_merged[:, i] for i, v in enumerate(surf_vars)},
         batch.static_vars,
         {v: atmos_merged[:, i] for i, v in enumerate(atmos_vars)},
-        Metadata(
-            lat=lat,
-            lon=lon,
-            time=tuple(t + lead_time for t in batch.metadata.time),
-            atmos_levels=atmos_levels,
-            rollout_step=batch.metadata.rollout_step + 1,
-        ),
+        rollout_metadata,
     )
