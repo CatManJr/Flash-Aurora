@@ -1,0 +1,50 @@
+{
+  "california": {
+    "state": "California",
+    "shapefile": "california/california.shp",
+    "geojson": "california.geojson",
+    "raster": "california_mask.tif",
+    "bounds": {
+      "lat_min": 32.5,
+      "lat_max": 42.25,
+      "lon_min": -124.5,
+      "lon_max": -114.0
+    }
+  },
+  "georgia": {
+    "state": "Georgia",
+    "shapefile": "georgia/georgia.shp",
+    "geojson": "georgia.geojson",
+    "raster": "georgia_mask.tif",
+    "bounds": {
+      "lat_min": 30.25,
+      "lat_max": 35.25,
+      "lon_min": -85.75,
+      "lon_max": -80.75
+    }
+  },
+  "michigan": {
+    "state": "Michigan",
+    "shapefile": "michigan/michigan.shp",
+    "geojson": "michigan.geojson",
+    "raster": "michigan_mask.tif",
+    "bounds": {
+      "lat_min": 41.5,
+      "lat_max": 48.25,
+      "lon_min": -90.5,
+      "lon_max": -82.25
+    }
+  },
+  "texas": {
+    "state": "Texas",
+    "shapefile": "texas/texas.shp",
+    "geojson": "texas.geojson",
+    "raster": "texas_mask.tif",
+    "bounds": {
+      "lat_min": 25.75,
+      "lat_max": 36.75,
+      "lon_min": -106.75,
+      "lon_max": -93.5
+    }
+  }
+}
