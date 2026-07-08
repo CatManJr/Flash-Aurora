@@ -10,6 +10,7 @@ import pytest
 import torch
 import zmq
 
+from flash_aurora.engine.runtime.vram_preflight import InsufficientVramError
 from flash_aurora.scheduler.client import ForecastClient, ForecastClientConfig
 from flash_aurora.scheduler.protocol import ForecastRequest, SchedulerError
 from flash_aurora.scheduler.worker import ForecastWorker, ForecastWorkerConfig, wait_for_bind
@@ -248,3 +249,57 @@ def test_client_health(zmq_addresses: tuple[str, str, zmq.Context], tmp_path: Pa
     client.shutdown_worker()
     thread.join(timeout=5.0)
     client.close()
+
+
+def test_worker_exits_on_insufficient_vram(
+    zmq_addresses: tuple[str, str, zmq.Context],
+    tmp_path: Path,
+) -> None:
+    command_addr, event_addr, context = zmq_addresses
+    engine = _build_mock_engine(tmp_path)
+    engine.prepare.side_effect = InsufficientVramError("need more VRAM")
+    downloader = MagicMock()
+    downloader.ingest_request.return_value = MagicMock()
+
+    worker = ForecastWorker(
+        ForecastWorkerConfig(
+            preset="era5_pretrained",
+            asset_root=tmp_path,
+            command_addr=command_addr,
+            event_addr=event_addr,
+            poll_timeout_ms=100,
+        ),
+        engine=engine,
+        downloader=downloader,
+        context=context,
+    )
+    wait_for_bind(command_addr)
+    exit_code: list[int] = []
+
+    def _run() -> None:
+        try:
+            worker.serve_forever()
+        except SystemExit as exc:
+            exit_code.append(int(exc.code))
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    request = ForecastRequest(
+        request_id="req-vram",
+        preset="era5_pretrained",
+        steps=2,
+        valid_time="2024-06-01T06:00:00",
+    )
+    client = ForecastClient(
+        ForecastClientConfig(command_addr=command_addr, event_addr=event_addr, recv_timeout_ms=5000),
+        context=context,
+    )
+    try:
+        with pytest.raises(SchedulerError, match="need more VRAM"):
+            client.forecast(request)
+    finally:
+        client.close()
+
+    thread.join(timeout=5.0)
+    assert exit_code == [1]

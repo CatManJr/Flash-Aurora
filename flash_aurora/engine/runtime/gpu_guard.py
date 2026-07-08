@@ -13,14 +13,19 @@ from typing import Iterator
 
 from flash_aurora.engine.core.asset_root import resolve_asset_root
 from flash_aurora.engine.core.config import ModelVariantSpec
-from flash_aurora.engine.runtime.gpu_budget import estimate_vram_gib, is_exclusive_variant
+from flash_aurora.engine.runtime.gpu_budget import (
+    GPU_GUARD_RESERVED_FRACTION,
+    estimate_vram_gib,
+    is_exclusive_variant,
+)
 from flash_aurora.engine.runtime.gpu_memory import cuda_memory_snapshot, format_cuda_memory_snapshot
+from flash_aurora.engine.runtime.vram_preflight import check_single_device_vram
 
 _HEARTBEAT_SECONDS = 30.0
 _STALE_SECONDS = 120.0
 _POLL_SECONDS = 2.0
 _DEFAULT_TIMEOUT_SECONDS = 3600.0
-_RESERVED_FRACTION = 0.96
+_RESERVED_FRACTION = GPU_GUARD_RESERVED_FRACTION
 
 
 def gpu_guard_enabled() -> bool:
@@ -245,6 +250,13 @@ class GpuGuardRegistry:
             variant,
             rollout_steps=rollout_steps,
             inference_precision=inference_precision,
+        )
+        check_single_device_vram(
+            variant,
+            preset=preset,
+            rollout_steps=rollout_steps,
+            inference_precision=inference_precision,
+            device_index=device_index,
         )
         deadline = time.time() + timeout
         last_message = ""

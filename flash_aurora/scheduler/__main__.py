@@ -42,7 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated CUDA devices for pipeline parallel, e.g. cuda:0,cuda:1",
     )
-    parser.add_argument("--distributed-max-vram-gib", type=float, default=32.0)
+    parser.add_argument(
+        "--distributed-max-vram-gib",
+        type=float,
+        default=None,
+        help="Per-device VRAM budget for pipeline planning (default: probe each CUDA device)",
+    )
     parser.add_argument("--distributed-force", action="store_true")
     parser.add_argument("--poll-timeout-ms", type=int, default=1000)
     return parser

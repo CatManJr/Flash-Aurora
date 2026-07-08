@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 from flash_aurora.engine.core.config import ModelVariantSpec
-from flash_aurora.engine.distributed.config import DistributedConfig, ParallelPlan
+from flash_aurora.engine.distributed.config import DistributedConfig, ParallelPlan, resolve_distributed_config
 from flash_aurora.engine.runtime.gpu_budget import estimate_vram_gib
 
 # Heuristic stage fractions of peak reserved VRAM (weights + activations).
@@ -291,6 +291,7 @@ def plan_parallelism(
     inference_precision: str | None = None,
 ) -> ParallelPlan:
     """Choose a 2-GPU pipeline placement that balances peak VRAM across devices."""
+    config = resolve_distributed_config(config)
     rollout_steps = config.rollout_steps
     peak = estimate_vram_gib(
         variant,

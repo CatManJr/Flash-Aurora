@@ -49,6 +49,30 @@ def _nvidia_smi_used_by_others(device_index: int, current_pid: int) -> float | N
     return _gib(total_mib * 1024 * 1024)
 
 
+def cuda_device_total_gib(device_index: int) -> float:
+    """Return total VRAM (GiB) for a CUDA device index."""
+    return cuda_memory_snapshot(device_index=device_index).total_gib
+
+
+def probe_max_vram_gib_per_device(
+    devices: tuple[str, ...],
+    *,
+    override: float | None = None,
+) -> float:
+    """Return per-device VRAM budget from hardware, or an explicit override."""
+    if override is not None:
+        if override <= 0:
+            raise ValueError("max_vram_gib_per_device must be positive")
+        return override
+    if not devices:
+        raise ValueError("devices must not be empty")
+
+    from flash_aurora.engine.runtime.resource_monitor import device_index_from_name
+
+    totals = [cuda_device_total_gib(device_index_from_name(device)) for device in devices]
+    return min(totals)
+
+
 def cuda_memory_snapshot(*, device_index: int = 0) -> CudaMemorySnapshot:
     """Return current CUDA memory stats for ``device_index``."""
     import os

@@ -12,6 +12,7 @@ import zmq
 
 from flash_aurora.engine.core.engine import AuroraEngine
 from flash_aurora.engine.ingress.download import DataDownloader
+from flash_aurora.engine.runtime.vram_preflight import InsufficientVramError
 from flash_aurora.scheduler.protocol import (
     ForecastCommand,
     ForecastEvent,
@@ -38,7 +39,7 @@ class ForecastWorkerConfig:
     overlap_ic_load: bool | None = None
     async_export: bool | None = None
     distributed_devices: tuple[str, ...] | None = None
-    distributed_max_vram_gib: float = 32.0
+    distributed_max_vram_gib: float | None = None
     distributed_force: bool = False
     poll_timeout_ms: int = 1000
 
@@ -299,6 +300,17 @@ class ForecastWorker:
                 return True
             try:
                 self.run_forecast(command.request)
+            except InsufficientVramError as exc:
+                request_id = command.request.request_id
+                self._emit(
+                    ForecastEvent(
+                        kind="failed",
+                        request_id=request_id,
+                        error=str(exc),
+                    )
+                )
+                self.close()
+                raise SystemExit(1) from exc
             except Exception as exc:
                 request_id = command.request.request_id
                 try:

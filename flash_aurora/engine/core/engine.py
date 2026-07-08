@@ -30,6 +30,10 @@ from flash_aurora.engine.runtime.gpu_guard import (
     resolve_guard_dir,
     try_local_cuda_cleanup,
 )
+from flash_aurora.engine.runtime.vram_preflight import (
+    check_distributed_vram,
+    check_single_device_vram,
+)
 from flash_aurora.engine.distributed import (
     DistributedConfig,
     apply_pipeline_parallel,
@@ -201,14 +205,28 @@ class AuroraEngine:
 
     def acquire_gpu(self, *, rollout_steps: int | None = None) -> GpuGuardTicket | None:
         """Reserve GPU memory across processes (share small jobs, queue large ones)."""
+        steps = self.config.gpu_rollout_steps if rollout_steps is None else rollout_steps
+        preset = self.config.preset_name or self.config.variant.name
         if self.config.distributed is not None:
+            check_distributed_vram(
+                self.config.variant,
+                self.config.distributed,
+                preset=preset,
+                rollout_steps=steps,
+                inference_precision=self.config.inference_precision,
+            )
             return None
         if self._gpu_ticket is not None:
             return self._gpu_ticket
         if not self.config.gpu_guard or not gpu_guard_enabled():
+            check_single_device_vram(
+                self.config.variant,
+                preset=preset,
+                rollout_steps=steps,
+                inference_precision=self.config.inference_precision,
+                device_index=self._device_index(),
+            )
             return None
-        steps = self.config.gpu_rollout_steps if rollout_steps is None else rollout_steps
-        preset = self.config.preset_name or self.config.variant.name
         registry = GpuGuardRegistry(resolve_guard_dir(self.config.asset_root))
         self._gpu_ticket = registry.acquire(
             device_index=self._device_index(),

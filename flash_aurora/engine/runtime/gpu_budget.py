@@ -5,6 +5,9 @@ import math
 from flash_aurora.engine.core.config import ModelVariantSpec
 
 _GIB = 1024**3
+
+# Fraction of total VRAM GpuGuard may reserve (driver headroom).
+GPU_GUARD_RESERVED_FRACTION = 0.96
 _HISTORY_STEPS = 2
 _LATENT_LEVELS = 4
 

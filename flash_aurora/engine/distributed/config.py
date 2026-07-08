@@ -47,7 +47,7 @@ class DistributedConfig:
     """Pipeline-parallel multi-GPU inference settings for :class:`AuroraEngine`."""
 
     devices: tuple[str, ...]
-    max_vram_gib_per_device: float = 40.0
+    max_vram_gib_per_device: float | None = None
     rollout_steps: int = 1
     force: bool = False
     decoder_spatial_parallel: bool = True
@@ -55,7 +55,21 @@ class DistributedConfig:
     def __post_init__(self) -> None:
         if not self.devices:
             raise ValueError("DistributedConfig.devices must not be empty")
-        if self.max_vram_gib_per_device <= 0:
+        if self.max_vram_gib_per_device is not None and self.max_vram_gib_per_device <= 0:
             raise ValueError("max_vram_gib_per_device must be positive")
         if self.rollout_steps < 1:
             raise ValueError("rollout_steps must be >= 1")
+
+
+def resolve_distributed_config(config: DistributedConfig) -> DistributedConfig:
+    """Fill ``max_vram_gib_per_device`` from CUDA hardware when unset."""
+    if config.max_vram_gib_per_device is not None:
+        return config
+    from dataclasses import replace
+
+    from flash_aurora.engine.runtime.gpu_memory import probe_max_vram_gib_per_device
+
+    return replace(
+        config,
+        max_vram_gib_per_device=probe_max_vram_gib_per_device(config.devices),
+    )

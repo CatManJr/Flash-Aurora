@@ -1,4 +1,9 @@
-from flash_aurora.engine.distributed.config import DistributedConfig, ParallelPlan, ParallelStage
+from flash_aurora.engine.distributed.config import (
+    DistributedConfig,
+    ParallelPlan,
+    ParallelStage,
+    resolve_distributed_config,
+)
 from flash_aurora.engine.distributed.plan import (
     estimate_device_busy_fraction,
     estimate_stage_vram_gib,
@@ -24,4 +29,5 @@ __all__ = [
     "is_pipeline_parallel",
     "plan_parallelism",
     "requires_parallelism",
+    "resolve_distributed_config",
 ]

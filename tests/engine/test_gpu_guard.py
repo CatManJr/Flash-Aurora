@@ -45,6 +45,9 @@ def test_gpu_guard_allows_two_small_leases(tmp_path: Path, monkeypatch: pytest.M
     with patch(
         "flash_aurora.engine.runtime.gpu_guard.cuda_memory_snapshot",
         return_value=snapshot,
+    ), patch(
+        "flash_aurora.engine.runtime.vram_preflight.cuda_memory_snapshot",
+        return_value=snapshot,
     ), patch("flash_aurora.engine.runtime.gpu_guard.os.getpid", side_effect=[1001, 1002]):
         first = registry.acquire(
             device_index=0,
@@ -101,6 +104,9 @@ def test_gpu_guard_queues_exclusive_when_memory_tight(tmp_path: Path, monkeypatc
     with patch(
         "flash_aurora.engine.runtime.gpu_guard.cuda_memory_snapshot",
         return_value=roomy,
+    ), patch(
+        "flash_aurora.engine.runtime.vram_preflight.cuda_memory_snapshot",
+        return_value=roomy,
     ), patch("flash_aurora.engine.runtime.gpu_guard.os.getpid", return_value=2001):
         small_ticket = registry.acquire(
             device_index=0,
@@ -112,6 +118,9 @@ def test_gpu_guard_queues_exclusive_when_memory_tight(tmp_path: Path, monkeypatc
 
     with patch(
         "flash_aurora.engine.runtime.gpu_guard.cuda_memory_snapshot",
+        return_value=blocked,
+    ), patch(
+        "flash_aurora.engine.runtime.vram_preflight.cuda_memory_snapshot",
         return_value=blocked,
     ), patch("flash_aurora.engine.runtime.gpu_guard.os.getpid", return_value=2002):
         with pytest.raises(TimeoutError, match="Timed out waiting for GPU"):
@@ -128,6 +137,9 @@ def test_gpu_guard_queues_exclusive_when_memory_tight(tmp_path: Path, monkeypatc
 
     with patch(
         "flash_aurora.engine.runtime.gpu_guard.cuda_memory_snapshot",
+        return_value=roomy,
+    ), patch(
+        "flash_aurora.engine.runtime.vram_preflight.cuda_memory_snapshot",
         return_value=roomy,
     ), patch("flash_aurora.engine.runtime.gpu_guard.os.getpid", return_value=2002):
         large_ticket = registry.acquire(
@@ -163,6 +175,9 @@ def test_engine_acquire_and_release_gpu(tmp_path: Path, monkeypatch: pytest.Monk
 
     with patch(
         "flash_aurora.engine.runtime.gpu_guard.cuda_memory_snapshot",
+        return_value=snapshot,
+    ), patch(
+        "flash_aurora.engine.runtime.vram_preflight.cuda_memory_snapshot",
         return_value=snapshot,
     ):
         ticket = engine.acquire_gpu(rollout_steps=1)
