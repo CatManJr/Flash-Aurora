@@ -18,7 +18,12 @@ from flash_aurora.engine.core.paths import AssetStore, normalize_asset_path, nor
 from flash_aurora.engine.core.prepare import LoadTiming, overlap_ic_and_load, serial_ic_then_load
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS, PresetRegistry
 from flash_aurora.engine.core.rollout_session import RolloutSession
+from flash_aurora.engine.egress.crs import DEFAULT_EXPORT_CRS
 from flash_aurora.engine.egress.export import PipelineRolloutExporter, RolloutExporter
+from flash_aurora.engine.egress.export_options import ExportFormat, ExportOptions, RoiSpec
+from flash_aurora.engine.egress.mask import Mask
+from flash_aurora.engine.egress.roi_batch import RoiBatch
+from flash_aurora.engine.egress.step_writer import RolloutStepWriter
 from flash_aurora.engine.ingress.build_ic import InitialConditionBuilder
 from flash_aurora.engine.ingress.adapters import IngestRequest
 from flash_aurora.engine.ingress.validator import BatchValidator
@@ -482,17 +487,38 @@ class AuroraEngine:
         *,
         export_dir: Path | str | None = None,
         async_export: bool | None = None,
+        export_format: ExportFormat = "netcdf",
+        mask: Mask | None = None,
+        roi: RoiSpec | None = None,
+        roi_batch: RoiBatch | None = None,
+        variables: tuple[str, ...] | None = None,
+        export_crs: str | None = None,
+        export_options: ExportOptions | None = None,
     ) -> Generator[Path, None, None]:
         if export_dir is not None:
             self.set_export_dir(export_dir)
 
         resolved_dir = self._resolved_export_dir()
-        self._exporter = RolloutExporter(resolved_dir)
-        if self._resolve_async_export(async_export):
+        options = export_options or ExportOptions(
+            format=export_format,
+            mask=mask,
+            roi=roi,
+            roi_batch=roi_batch,
+            variables=variables,
+            export_crs=export_crs or DEFAULT_EXPORT_CRS,
+        )
+        writer = RolloutStepWriter(resolved_dir, options)
+        resolved_regions = options.resolved_regions()
+        use_async = (
+            self._resolve_async_export(async_export)
+            and options.format == "netcdf"
+            and resolved_regions is None
+        )
+        if use_async:
             with self._pipeline_exporter(resolved_dir) as exporter:
                 for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):
                     yield exporter.write_step(step_index, prediction)
             return
 
         for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):
-            yield self._exporter.write_step(step_index, prediction)
+            yield from writer.write_step(step_index, prediction)
