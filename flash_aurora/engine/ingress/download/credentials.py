@@ -5,13 +5,28 @@ import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator, TypeVar
 
 from flash_aurora.engine.ingress.download.paths import ecmwfapirc_path, read_cdsapirc_key, read_ecmwfapirc
 
 CDS_DEFAULT_URL = "https://cds.climate.copernicus.eu/api"
 ADS_DEFAULT_URL = "https://ads.atmosphere.copernicus.eu/api"
 ECMWF_DEFAULT_URL = "https://api.ecmwf.int/v1"
+
+
+def normalize_secret(value: str | None) -> str | None:
+    """Strip whitespace and accidental ``key:`` / prompt prefixes from pasted secrets."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    if lowered.startswith("cds api key:"):
+        stripped = stripped.split(":", 1)[1].strip()
+    elif lowered.startswith("key:"):
+        stripped = stripped.split(":", 1)[1].strip()
+    return stripped or None
 
 
 @dataclass(frozen=True)
@@ -97,14 +112,14 @@ class DownloadCredentials:
         )
 
     def cds_settings(self) -> tuple[str, str] | None:
-        key = self.cds_api_key
+        key = normalize_secret(self.cds_api_key)
         if not key:
             return None
         url = self.cds_api_url or CDS_DEFAULT_URL
         return url, key
 
     def ads_settings(self) -> tuple[str, str] | None:
-        key = self.ads_api_key or self.cds_api_key
+        key = normalize_secret(self.ads_api_key) or normalize_secret(self.cds_api_key)
         if not key:
             return None
         url = self.ads_api_url or ADS_DEFAULT_URL
@@ -131,9 +146,27 @@ _active_credentials: ContextVar[DownloadCredentials | None] = ContextVar(
     default=None,
 )
 
+T = TypeVar("T")
+
 
 def active_download_credentials() -> DownloadCredentials | None:
     return _active_credentials.get()
+
+
+def run_with_credentials(credentials: DownloadCredentials | None, fn: Callable[[], T]) -> T:
+    """Run ``fn`` with ``credentials`` installed in the current thread."""
+    if credentials is None:
+        return fn()
+    token = _active_credentials.set(credentials)
+    try:
+        return fn()
+    finally:
+        _active_credentials.reset(token)
+
+
+def run_with_active_credentials(fn: Callable[[], T]) -> T:
+    """Run ``fn`` with download credentials from the current thread."""
+    return run_with_credentials(active_download_credentials(), fn)
 
 
 @contextmanager
@@ -152,6 +185,30 @@ def use_download_credentials(credentials: DownloadCredentials | None) -> Iterato
         _active_credentials.reset(token)
 
 
+def _in_notebook() -> bool:
+    try:
+        from IPython import get_ipython
+
+        ipython = get_ipython()
+        if ipython is None:
+            return False
+        return ipython.__class__.__name__ == "ZMQInteractiveShell"
+    except ImportError:
+        return False
+
+
+def _read_secret(prompt: str) -> str | None:
+    """Read a secret interactively.
+
+    Jupyter kernels do not reliably capture ``getpass`` input; use ``input`` there.
+    """
+    if _in_notebook():
+        value = input(prompt).strip()
+    else:
+        value = getpass.getpass(prompt).strip()
+    return value or None
+
+
 def merge_credentials(*layers: DownloadCredentials | None) -> DownloadCredentials:
     merged = DownloadCredentials.from_env()
     for layer in layers:
@@ -161,9 +218,9 @@ def merge_credentials(*layers: DownloadCredentials | None) -> DownloadCredential
 
 def prompt_cds_credentials(credentials: DownloadCredentials) -> DownloadCredentials:
     """Fill missing CDS fields interactively (terminal or notebook stdin)."""
-    key = credentials.cds_api_key
+    key = normalize_secret(credentials.cds_api_key)
     if key is None:
-        key = getpass.getpass("CDS API key: ").strip() or None
+        key = normalize_secret(_read_secret("CDS API key: "))
     return credentials.merge(DownloadCredentials(cds_api_key=key))
 
 
@@ -171,7 +228,7 @@ def prompt_ads_credentials(credentials: DownloadCredentials) -> DownloadCredenti
     """Fill missing ADS fields interactively (terminal or notebook stdin)."""
     key = credentials.ads_api_key or credentials.cds_api_key
     if key is None:
-        key = getpass.getpass("ADS API key: ").strip() or None
+        key = _read_secret("ADS API key: ")
     return credentials.merge(DownloadCredentials(ads_api_key=key))
 
 
@@ -180,9 +237,9 @@ def prompt_ecmwf_credentials(credentials: DownloadCredentials) -> DownloadCreden
     key = credentials.ecmwf_api_key
     email = credentials.ecmwf_email
     if key is None:
-        key = getpass.getpass("ECMWF API key (MARS): ").strip() or None
+        key = _read_secret("ECMWF API key (MARS): ")
     if email is None:
-        email = getpass.getpass("ECMWF account email: ").strip() or None
+        email = _read_secret("ECMWF account email: ")
     return credentials.merge(
         DownloadCredentials(ecmwf_api_key=key, ecmwf_email=email),
     )

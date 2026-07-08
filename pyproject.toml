@@ -34,7 +34,9 @@ dependencies = [
     "pyzmq>=26.0.0",
     "cfgrib",
     "eccodes",
+    "fiona>=1.10.0",
     "ipykernel>=7.3.0",
+    "rasterio>=1.4.0",
 ]
 
 [project.optional-dependencies]

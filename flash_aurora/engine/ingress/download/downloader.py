@@ -154,6 +154,14 @@ class DataDownloader:
                 creds = prompt_ads_credentials(creds)
             elif source_name == "wb2_wam" and creds.ecmwf_settings() is None:
                 creds = prompt_ecmwf_credentials(creds)
+        if self.config.source.name in {"cds_era5", "wb2_hres"} and creds.cds_settings() is None:
+            from flash_aurora.engine.ingress.download.cds import CdsConfigError
+
+            raise CdsConfigError(
+                "Missing CDS credentials. Pass cds_api_key to DataDownloader.ensure(), "
+                "set CDSAPI_KEY, create ~/.cdsapirc, or call ensure(..., prompt=True). "
+                "If you typed at a notebook prompt, paste only the API key (not the label)."
+            )
         if self.config.source.name == "wb2_wam" and creds.ecmwf_settings() is None:
             from flash_aurora.engine.ingress.download.mars import _mars_config_error
 

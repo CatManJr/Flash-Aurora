@@ -4,6 +4,11 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypeVar
 
+from flash_aurora.engine.ingress.download.credentials import (
+    active_download_credentials,
+    run_with_credentials,
+)
+
 T = TypeVar("T")
 
 
@@ -19,6 +24,8 @@ def run_labeled_tasks(
     When ``workers <= 1`` or only one task is provided, tasks run sequentially in
     declaration order. The first raised exception is propagated after cancelling
     outstanding futures.
+
+    Parallel workers inherit the caller's ``contextvars`` (e.g. download credentials).
     """
     if not tasks:
         return {}
@@ -28,9 +35,13 @@ def run_labeled_tasks(
 
     max_workers = min(workers, len(tasks))
     results: dict[str, T] = {}
+    captured_credentials = active_download_credentials()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(fn): label for label, fn in tasks}
+        futures = {
+            pool.submit(run_with_credentials, captured_credentials, fn): label
+            for label, fn in tasks
+        }
         completed = as_completed(futures)
         if show_progress:
             from tqdm.auto import tqdm

@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -43,6 +43,26 @@ def test_run_labeled_tasks_sequential_preserves_order() -> None:
     )
     assert results == {"a": "a", "b": "b", "c": "c"}
     assert calls == ["a", "b", "c"]
+
+
+def test_run_labeled_tasks_propagates_download_credentials() -> None:
+    from flash_aurora.engine.ingress.download.credentials import (
+        DownloadCredentials,
+        active_download_credentials,
+        use_download_credentials,
+    )
+
+    creds = DownloadCredentials(cds_api_key="parallel-secret")
+
+    def _read_active() -> str:
+        active = active_download_credentials()
+        if active is None or active.cds_settings() is None:
+            raise RuntimeError("missing active creds in worker thread")
+        return active.cds_settings()[1]
+
+    with use_download_credentials(creds):
+        out = run_labeled_tasks(tuple((f"t{i}", _read_active) for i in range(4)), workers=4)
+    assert all(value == "parallel-secret" for value in out.values())
 
 
 def test_run_labeled_tasks_parallel_runs_all() -> None:
@@ -101,6 +121,44 @@ def test_data_downloader_workers_override(tmp_path: Path) -> None:
     assert downloader.with_workers(6).download_workers == 6
 
 
+def test_ensure_cds_api_key_with_parallel_workers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import datetime
+
+    from flash_aurora.engine.ingress.download.cds import cds_client
+    from flash_aurora.engine.ingress.download.credentials import active_download_credentials
+
+    config = DEFAULT_PRESETS.get("era5_pretrained")
+    config.asset_root = tmp_path
+    downloader = DataDownloader(config, workers=8)
+    valid_time = datetime(2023, 1, 1, 6)
+    cache = tmp_path / "era5"
+
+    def fake_download(cache_dir: Path, day: str, *, include_static: bool = True, workers: int = 1):
+        def _touch(path: Path) -> None:
+            active = active_download_credentials()
+            if active is None or active.cds_settings() is None:
+                cds_client()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"nc")
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "static": cache_dir / "static.nc",
+            "surface": cache_dir / f"{day}-surface-level.nc",
+            "atmospheric": cache_dir / f"{day}-atmospheric.nc",
+        }
+
+        tasks = tuple((key, lambda p=path: _touch(p)) for key, path in paths.items())
+        run_labeled_tasks(tasks, workers=workers)
+        return paths
+
+    monkeypatch.delenv("CDSAPI_KEY", raising=False)
+    with patch("flash_aurora.engine.ingress.download.backends.cds.download_era5_day", side_effect=fake_download):
+        with patch("flash_aurora.engine.ingress.download.cds.require_cdsapi") as mocked:
+            mocked.return_value.Client.return_value = MagicMock()
+            downloader.ensure(valid_time, cache_dir=cache, cds_api_key="abc12345")
+
+
 def test_ensure_passes_workers_to_backend(tmp_path: Path) -> None:
     from datetime import datetime
 
@@ -123,4 +181,4 @@ def test_ensure_passes_workers_to_backend(tmp_path: Path) -> None:
         return paths
 
     with patch("flash_aurora.engine.ingress.download.backends.cds.download_era5_day", side_effect=fake_download):
-        downloader.ensure(valid_time, cache_dir=cache, workers=5)
+        downloader.ensure(valid_time, cache_dir=cache, workers=5, cds_api_key="test-key")
