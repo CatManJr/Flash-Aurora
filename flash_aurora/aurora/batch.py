@@ -46,8 +46,11 @@ class Metadata:
     def __post_init__(self):
         if not (torch.all(self.lat <= 90) and torch.all(self.lat >= -90)):
             raise ValueError("Latitudes must be in the range [-90, 90].")
-        if not (torch.all(self.lon >= 0) and torch.all(self.lon < 360)):
-            raise ValueError("Longitudes must be in the range [0, 360).")
+        if not (
+            (torch.all(self.lon >= 0) and torch.all(self.lon < 360))
+            or (torch.all(self.lon >= -180) and torch.all(self.lon < 360))
+        ):
+            raise ValueError("Longitudes must be in the range [0, 360) or [-180, 360).")
 
         # Validate vector-valued latitudes and longitudes:
         if self.lat.dim() == self.lon.dim() == 1:

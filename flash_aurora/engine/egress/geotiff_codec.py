@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from flash_aurora.aurora import Batch
 
-from flash_aurora.engine.egress.crs import BATCH_CRS, normalize_crs
+from flash_aurora.engine.egress.crs import BATCH_CRS, normalize_crs, roi_longitude_plot_bounds
 
 
 def _require_rasterio():
@@ -45,8 +45,7 @@ def _georeference(data: np.ndarray, lat: np.ndarray, lon: np.ndarray) -> tuple[n
         array = np.flipud(array)
     south = float(np.min(lat))
     north = float(np.max(lat))
-    west = float(np.min(lon))
-    east = float(np.max(lon))
+    west, east = roi_longitude_plot_bounds(lon)
     return array, west, south, east, north
 
 

@@ -294,10 +294,22 @@ class Mask:
         )
 
     def wgs84_bounds(self) -> tuple[float, float, float, float]:
-        """Geographic envelope ``(lon_min, lat_min, lon_max, lat_max)`` for clipping."""
+        """Geographic envelope ``(lon_min, lat_min, lon_max, lat_max)`` for clipping.
+
+        When ``lon_min > lon_max`` the longitude window crosses the 0° meridian
+        (Aurora's 0–360° grid). :func:`flash_aurora.engine.egress.roi._lon_mask`
+        interprets that as a wrap-around interval.
+        """
         if self.kind == "bounds":
             assert self.bounds is not None
             west, south, east, north = self.bounds
+            if normalize_crs(self.source_crs) == BATCH_CRS:
+                return (
+                    normalize_longitude(west),
+                    south,
+                    normalize_longitude(east),
+                    north,
+                )
             lon_min, lat_min, lon_max, lat_max = envelope_wgs84(
                 west, south, east, north, self.source_crs
             )

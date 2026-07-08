@@ -4,7 +4,13 @@ import numpy as np
 import torch
 from flash_aurora.aurora import Batch, Metadata
 
-from flash_aurora.engine.egress.crs import BATCH_CRS, normalize_longitude
+from flash_aurora.engine.egress.crs import (
+    BATCH_CRS,
+    batch_longitude_for_wgs84,
+    normalize_longitude,
+    roi_longitude_sort_order,
+    roi_longitude_values,
+)
 from flash_aurora.engine.egress.export_options import RoiBounds, RoiGeoJson, RoiSpec, coerce_mask
 from flash_aurora.engine.egress.mask import Mask
 
@@ -38,6 +44,10 @@ def _crop_batch(batch: Batch, inside: np.ndarray) -> Batch:
     lon = batch.metadata.lon.detach().cpu().numpy()
     lat_idx = np.nonzero(inside.any(axis=1))[0]
     lon_idx = np.nonzero(inside.any(axis=0))[0]
+    lon_selected = lon[lon_idx]
+    lon_order = roi_longitude_sort_order(lon_selected)
+    lon_idx = lon_idx[lon_order]
+    lon_values = roi_longitude_values(lon_selected, lon_order)
     inside_crop = inside[lat_idx][:, lon_idx]
 
     def _mask_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -50,7 +60,7 @@ def _crop_batch(batch: Batch, inside: np.ndarray) -> Batch:
         return torch.where(mask, cropped, torch.full_like(cropped, float("nan")))
 
     lat_c = torch.as_tensor(lat[lat_idx], dtype=batch.metadata.lat.dtype, device=batch.metadata.lat.device)
-    lon_c = torch.as_tensor(lon[lon_idx], dtype=batch.metadata.lon.dtype, device=batch.metadata.lon.device)
+    lon_c = torch.as_tensor(lon_values, dtype=batch.metadata.lon.dtype, device=batch.metadata.lon.device)
     return Batch(
         surf_vars={k: _mask_tensor(v) for k, v in batch.surf_vars.items()},
         static_vars={k: _mask_tensor(v) for k, v in batch.static_vars.items()},
@@ -106,10 +116,11 @@ def _inside_from_raster(batch: Batch, mask: Mask) -> np.ndarray:
         src_crs = mask.source_crs
         if dataset.crs is not None:
             src_crs = mask.source_crs if mask.source_crs != BATCH_CRS else str(dataset.crs)
+        lon_wgs84 = batch_longitude_for_wgs84(lon_grid)
         xs, ys = warp_transform(
             BATCH_CRS,
             src_crs,
-            lon_grid.ravel().tolist(),
+            lon_wgs84.ravel().tolist(),
             lat_grid.ravel().tolist(),
         )
         samples = np.fromiter(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+
 """Coordinate reference helpers for egress masks and GeoTIFF export."""
 
 BATCH_CRS = "EPSG:4326"
@@ -62,3 +64,41 @@ def envelope_wgs84(
 
 def normalize_longitude(lon: float) -> float:
     return float(lon % 360.0)
+
+
+def batch_longitude_for_wgs84(lons: np.ndarray) -> np.ndarray:
+    """Map Aurora's 0-360 degree longitudes to [-180, 180) for EPSG:4326 sampling."""
+    values = np.asarray(lons, dtype=np.float64)
+    return np.where(values > 180.0, values - 360.0, values)
+
+
+def roi_longitude_sort_order(lons: np.ndarray) -> np.ndarray:
+    """Return column permutation that sorts ROI longitudes west-to-east.
+
+    When a 0–360° window crosses the prime meridian (peak-to-peak span > 180°),
+    longitudes east of 180° are treated as negative values only for ordering.
+    """
+    values = np.asarray(lons, dtype=np.float64)
+    if values.size <= 1:
+        return np.arange(values.size)
+    if np.ptp(values) <= 180.0:
+        return np.argsort(values)
+    unwrapped = np.where(values > 180.0, values - 360.0, values)
+    return np.argsort(unwrapped)
+
+
+def roi_longitude_plot_bounds(lons: np.ndarray) -> tuple[float, float]:
+    """Return ``(west, east)`` for plotting or GeoTIFF bounds near the prime meridian."""
+    values = np.asarray(lons, dtype=np.float64)
+    if values.size == 0:
+        raise ValueError("cannot compute plot bounds for empty longitude axis")
+    return float(values.min()), float(values.max())
+
+
+def roi_longitude_values(lons: np.ndarray, order: np.ndarray) -> np.ndarray:
+    """West-to-east ROI longitudes, negative west of the prime meridian when wrapped."""
+    original = np.asarray(lons, dtype=np.float64)
+    values = original[order]
+    if values.size <= 1 or np.ptp(original) <= 180.0:
+        return values
+    return np.where(values > 180.0, values - 360.0, values)

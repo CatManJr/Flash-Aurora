@@ -57,6 +57,42 @@ def test_mask_california_sized_for_quarter_degree_grid() -> None:
         assert len(lon) == 45
 
 
+def test_mask_western_europe_dateline_wrap() -> None:
+    batch = _grid_batch()
+    mask = Mask.western_europe()
+    clipped = apply_mask(batch, mask)
+
+    lat = clipped.metadata.lat.detach().cpu().numpy()
+    lon = clipped.metadata.lon.detach().cpu().numpy()
+    lon_min, lat_min, lon_max, lat_max = mask.wgs84_bounds()
+
+    assert lon_min > lon_max  # 350 -> 15 wrap in mask definition
+    assert lat.min() >= lat_min
+    assert lat.max() <= lat_max
+    assert lon.min() >= -10.5
+    assert lon.max() <= 15.5
+    assert (np.diff(lon) > 0).all()
+
+
+def test_mask_north_africa_dateline_wrap() -> None:
+    batch = _grid_batch()
+    mask = Mask.north_africa()
+    clipped = apply_mask(batch, mask)
+
+    lat = clipped.metadata.lat.detach().cpu().numpy()
+    lon = clipped.metadata.lon.detach().cpu().numpy()
+    lon_min, lat_min, lon_max, lat_max = mask.wgs84_bounds()
+
+    assert lon_min > lon_max  # 343 -> 40 wrap in mask definition
+    assert lat.min() >= lat_min
+    assert lat.max() <= lat_max
+    assert lon.min() >= -18.0
+    assert lon.max() <= 40.5
+    assert (np.diff(lon) > 0).all()
+    assert len(lon) <= 65
+    assert len(lat) <= 25
+
+
 def test_mask_from_bounds_pacific_tc_panel() -> None:
     batch = _grid_batch()
     mask = Mask.pacific_tc_panel()
@@ -96,6 +132,20 @@ def test_mask_from_geojson_masks_outside_polygon(tmp_path: Path) -> None:
     values = clipped.surf_vars["msl"][0, 0].detach().cpu().numpy()
     assert np.isfinite(values).any()
     assert np.isnan(values).any()
+
+
+def test_mask_from_raster_western_hemisphere_on_360_grid() -> None:
+    rasterio = pytest.importorskip("rasterio")
+    from pathlib import Path
+
+    raster_path = Path(__file__).resolve().parents[2] / "docs" / "roi" / "michigan_mask.tif"
+    if not raster_path.is_file():
+        pytest.skip("bundled Michigan ROI raster not present")
+
+    batch = _grid_batch()
+    clipped = apply_mask(batch, Mask.from_raster(raster_path))
+    assert clipped.surf_vars["msl"].shape[-2] > 0
+    assert clipped.surf_vars["msl"].shape[-1] > 0
 
 
 def test_mask_from_raster(tmp_path: Path) -> None:
