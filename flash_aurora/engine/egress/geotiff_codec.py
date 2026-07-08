@@ -41,7 +41,9 @@ def _georeference(data: np.ndarray, lat: np.ndarray, lon: np.ndarray) -> tuple[n
     array = np.asarray(data, dtype=np.float32)
     lat = np.asarray(lat, dtype=np.float64)
     lon = np.asarray(lon, dtype=np.float64)
-    if lat[0] > lat[-1]:
+    # Aurora batches store latitude north-to-south (decreasing). GDAL row 0 is north,
+    # which already matches tensor row 0. Only flip when latitude increases south-to-north.
+    if lat[0] < lat[-1]:
         array = np.flipud(array)
     south = float(np.min(lat))
     north = float(np.max(lat))

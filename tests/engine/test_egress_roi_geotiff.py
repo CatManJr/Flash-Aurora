@@ -229,6 +229,36 @@ def test_rollout_step_writer_geotiff_web_mercator(tmp_path: Path) -> None:
         assert data.shape[0] > 0 and data.shape[1] > 0
 
 
+def test_write_surface_geotiff_preserves_north_south_orientation(tmp_path: Path) -> None:
+    rasterio = pytest.importorskip("rasterio")
+
+    lat = torch.linspace(42.0, 33.0, 37)
+    lon = torch.linspace(235.0, 246.0, 45)
+    height, width = len(lat), len(lon)
+    values = torch.zeros(1, 1, height, width)
+    for row, latitude in enumerate(lat):
+        values[0, 0, row, :] = float(latitude)
+    batch = Batch(
+        surf_vars={"msl": values},
+        static_vars={},
+        atmos_vars={},
+        metadata=Metadata(
+            lat=lat,
+            lon=lon,
+            time=(datetime(2020, 6, 1, 12, 0),),
+            atmos_levels=(),
+            rollout_step=0,
+        ),
+    )
+    path = write_surface_geotiff(batch, tmp_path / "orient.tif", "msl", crs=BATCH_CRS)
+    with rasterio.open(path) as dataset:
+        data = dataset.read(1)
+        assert dataset.bounds.top == pytest.approx(42.0)
+        assert dataset.bounds.bottom == pytest.approx(33.0)
+        assert data[0].mean() == pytest.approx(42.0, abs=0.5)
+        assert data[-1].mean() == pytest.approx(33.0, abs=0.5)
+
+
 def test_write_surface_geotiff_epsg4326(tmp_path: Path) -> None:
     pytest.importorskip("rasterio")
     batch = apply_mask(_grid_batch(), Mask.pacific_tc_panel())
