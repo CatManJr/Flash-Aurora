@@ -24,9 +24,22 @@ def test_require_cfgrib_raises_clear_import_error(monkeypatch: pytest.MonkeyPatc
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(grib_preprocess, "_bootstrap_eccodes_from_ecmwflibs", lambda: False)
 
-    with pytest.raises(ImportError, match="uv pip install cfgrib"):
+    with pytest.raises(ImportError, match="cfgrib plus a discoverable ecCodes"):
         grib_preprocess.require_cfgrib()
+
+
+def test_bootstrap_eccodes_from_ecmwflibs_makes_findlibs_see_library() -> None:
+    findlibs = pytest.importorskip("findlibs")
+    pytest.importorskip("ecmwflibs")
+
+    if findlibs.find("eccodes") is not None:
+        pytest.skip("native ecCodes already discoverable")
+
+    assert grib_preprocess._bootstrap_eccodes_from_ecmwflibs() is True
+    assert findlibs.find("eccodes") is not None
+    grib_preprocess.require_cfgrib()
 
 
 def test_adapter_materializes_netcdf_before_ingest(tmp_path: Path) -> None:

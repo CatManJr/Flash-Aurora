@@ -24,14 +24,75 @@ GRIB_SURF_FIELDS: tuple[tuple[str, str], ...] = (
     ("msl", "msl"),
 )
 
+_CFGRIB_INSTALL_HINT = (
+    "GRIB ingress requires cfgrib plus a discoverable ecCodes native library. "
+    "Install with: uv sync  (or: uv pip install cfgrib eccodes ecmwflibs)"
+)
+
+
+def _bootstrap_eccodes_from_ecmwflibs() -> bool:
+    """Make findlibs see the hashed libeccodes shipped by ecmwflibs.
+
+    On Linux, the PyPI ``eccodes`` wheel is often pure-Python and does not ship
+    ``libeccodes``. ``ecmwflibs`` provides the shared object, but ``findlibs``
+    does not resolve that package by default, so cfgrib fails with
+    "Cannot find the ecCodes library".
+    """
+    try:
+        import findlibs
+    except ImportError:
+        return False
+
+    if findlibs.find("eccodes") is not None:
+        return True
+
+    try:
+        import ecmwflibs
+    except ImportError:
+        return False
+
+    library_path = ecmwflibs.find("eccodes")
+    if not library_path:
+        return False
+
+    import ctypes
+
+    lib_dir = Path(library_path).resolve().parent
+    # Preload sibling libs first so dlopen of libeccodes can resolve deps.
+    for shared_object in sorted(
+        lib_dir.glob("lib*.so*"),
+        key=lambda p: p.name == Path(library_path).name,
+    ):
+        try:
+            ctypes.CDLL(str(shared_object), mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            continue
+
+    original_find = findlibs.find
+
+    def find_with_ecmwflibs(lib_name: str, pkg_name: str | None = None) -> str | None:
+        found = original_find(lib_name, pkg_name)
+        if found is not None:
+            return found
+        bare = lib_name.removeprefix("lib").split(".so", 1)[0].split("-", 1)[0]
+        if bare == "eccodes" or lib_name in {"eccodes", "libeccodes", "libeccodes.so"}:
+            return library_path
+        return None
+
+    findlibs.find = find_with_ecmwflibs  # type: ignore[method-assign]
+    return findlibs.find("eccodes") is not None
+
 
 def require_cfgrib() -> None:
+    _bootstrap_eccodes_from_ecmwflibs()
     try:
         import cfgrib  # noqa: F401
     except ImportError as exc:
+        raise ImportError(_CFGRIB_INSTALL_HINT) from exc
+    except RuntimeError as exc:
+        # gribapi raises RuntimeError when the native library is missing.
         raise ImportError(
-            "GRIB ingress requires cfgrib (and eccodes). "
-            "Install with: uv pip install cfgrib"
+            f"{_CFGRIB_INSTALL_HINT} ({sanitize_exception(exc)})"
         ) from exc
 
     try:
@@ -40,14 +101,14 @@ def require_cfgrib() -> None:
         if CFGRIB_ENGINE not in xr.backends.list_engines():
             raise ImportError(
                 "cfgrib is installed but xarray cannot load the cfgrib engine. "
-                "Reinstall with: uv pip install --force-reinstall cfgrib eccodes"
+                f"{_CFGRIB_INSTALL_HINT}"
             )
     except ImportError:
         raise
     except Exception as exc:
         raise ImportError(
             f"cfgrib engine check failed: {sanitize_exception(exc)}. "
-            "Install with: uv pip install cfgrib"
+            f"{_CFGRIB_INSTALL_HINT}"
         ) from exc
 
 

@@ -618,6 +618,22 @@ wheels = [
 ]
 
 [[package]]
+name = "ecmwflibs"
+version = "0.7.0"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+dependencies = [
+    { name = "findlibs" },
+]
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/ed/46/13b20c4f89ffb11ae9ddf015db6c53ec16df51039531c403b2cf23dc4bd6/ecmwflibs-0.7.0-cp312-cp312-macosx_10_13_x86_64.macosx_15_0_arm64.whl", hash = "sha256:4448f6dcf1fd65752b566478a2e33469fc2bcadae99353546c249f5e1ad1beb8", size = 45803057, upload-time = "2026-04-21T21:24:58.584Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/fe/b2/d9b04e2884693151635c29fca649d8973e7f06c95201493edd3bea442aab/ecmwflibs-0.7.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1cdc12f353b858083fb94f5d6a69d89cd11b77169e1f6affde41a193a5ac118a", size = 89464014, upload-time = "2026-04-21T21:38:39.2Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/dd/b6/94b0ac8ff2db0a51eff4b7e13806bcd6b10bc81e40468c0ba280e127ae64/ecmwflibs-0.7.0-cp312-cp312-win_amd64.whl", hash = "sha256:516ca23d164bb1bb5a313b7e4ea00859ce54dffbb001fd4ae5a39614822f0e5d", size = 47782575, upload-time = "2026-04-21T22:29:57.313Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/9e/d0/766452aa394cd1b253a4cddbeffc67fc6107294594659e7fc3d6051e1ac5/ecmwflibs-0.7.0-cp313-cp313-macosx_10_13_x86_64.macosx_15_0_arm64.whl", hash = "sha256:127c65f8c0d9a0f9113f5540f50c1c03f8511b76c4b1d02fbb17cbf74892d048", size = 45803060, upload-time = "2026-04-21T21:25:17.059Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/44/80/18e706dfcea6ea2c2345d4a08352070c5c3882fc8e11cded0e31b303d802/ecmwflibs-0.7.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6368ae02f92f5a4bf2838c42482a608c476db85aabbbcde92a689e19e5854a18", size = 89464210, upload-time = "2026-04-21T21:38:41.197Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/8f/26/ec9e52dce401a05ea3e52da5afaf5a8307650faa00cd3cf550b1e07895a5/ecmwflibs-0.7.0-cp313-cp313-win_amd64.whl", hash = "sha256:71c71a6ff30bea37a9e41d927d8d49cb241b669b63252ff1dd0b339642fff9bc", size = 47782570, upload-time = "2026-04-21T22:30:00.694Z" },
+]
+
+[[package]]
 name = "einops"
 version = "0.8.2"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -685,6 +701,7 @@ dependencies = [
     { name = "cfgrib" },
     { name = "eccodes" },
     { name = "ecmwf-api-client" },
+    { name = "ecmwflibs" },
     { name = "einops" },
     { name = "fiona" },
     { name = "gcsfs" },
@@ -722,11 +739,12 @@ requires-dist = [
     { name = "cfgrib" },
     { name = "eccodes" },
     { name = "ecmwf-api-client", specifier = ">=1.7.0" },
+    { name = "ecmwflibs" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "fiona", specifier = ">=1.10.0" },
     { name = "gcsfs", specifier = ">=2026.6.0" },
     { name = "huggingface-hub", specifier = ">=1.8.0" },
-    { name = "ipykernel", specifier = ">=7.3.0" },
+    { name = "ipykernel", specifier = ">=6.30.1,<7" },
     { name = "ipywidgets", marker = "extra == 'dev'", specifier = ">=8.1.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "netcdf4" },
@@ -1161,7 +1179,7 @@ wheels = [
 
 [[package]]
 name = "ipykernel"
-version = "7.3.0"
+version = "6.31.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
 dependencies = [
     { name = "appnope", marker = "sys_platform == 'darwin'" },
@@ -1171,16 +1189,16 @@ dependencies = [
     { name = "jupyter-client" },
     { name = "jupyter-core" },
     { name = "matplotlib-inline" },
-    { name = "nest-asyncio2" },
+    { name = "nest-asyncio" },
     { name = "packaging" },
     { name = "psutil" },
     { name = "pyzmq" },
     { name = "tornado" },
     { name = "traitlets" },
 ]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/3d/c4/e4a38f579de4225a561305666f7541cdabb30075def2aa1ac17bd73c1fb5/ipykernel-7.3.0.tar.gz", hash = "sha256:9acaaaf97d16355166e4085afe9d225bfbdf2b7ef520f9df3be8f2b248275e09", size = 184899, upload-time = "2026-06-10T08:41:25.481Z" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/a5/1d/d5ba6edbfe6fae4c3105bca3a9c889563cc752c7f2de45e333164c7f4846/ipykernel-6.31.0.tar.gz", hash = "sha256:2372ce8bc1ff4f34e58cafed3a0feb2194b91fc7cad0fc72e79e47b45ee9e8f6", size = 167493, upload-time = "2025-10-20T11:42:39.948Z" }
 wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/3d/02/77b271f5dc58bfbc0b577c877b2365d1ffea2afe66a80c13f2312820348c/ipykernel-7.3.0-py3-none-any.whl", hash = "sha256:897eb64da762549ef610698fca5e9675195ec6ac8ec7f19d81ce1ca20c876057", size = 120583, upload-time = "2026-06-10T08:41:23.648Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/f6/d8/502954a4ec0efcf264f99b65b41c3c54e65a647d9f0d6f62cd02227d242c/ipykernel-6.31.0-py3-none-any.whl", hash = "sha256:abe5386f6ced727a70e0eb0cf1da801fa7c5fa6ff82147747d5a0406cd8c94af", size = 117003, upload-time = "2025-10-20T11:42:37.502Z" },
 ]
 
 [[package]]
@@ -1554,12 +1572,12 @@ wheels = [
 ]
 
 [[package]]
-name = "nest-asyncio2"
-version = "1.7.2"
+name = "nest-asyncio"
+version = "1.6.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/b4/73/731debf26e27e0a0323d7bda270dc2f634b398e38f040a09da1f4351d0aa/nest_asyncio2-1.7.2.tar.gz", hash = "sha256:1921d70b92cc4612c374928d081552efb59b83d91b2b789d935c665fa01729a8", size = 14743, upload-time = "2026-02-13T00:34:04.386Z" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/83/f8/51569ac65d696c8ecbee95938f89d4abf00f47d58d48f6fbabfe8f0baefe/nest_asyncio-1.6.0.tar.gz", hash = "sha256:6f172d5449aca15afd6c646851f4e31e02c598d553a667e38cafa997cfec55fe", size = 7418, upload-time = "2024-01-21T14:25:19.227Z" }
 wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c5/3c/3179b85b0e1c3659f0369940200cd6d0fa900e6cefcc7ea0bc6dd0e29ffb/nest_asyncio2-1.7.2-py3-none-any.whl", hash = "sha256:f5dfa702f3f81f6a03857e9a19e2ba578c0946a4ad417b4c50a24d7ba641fe01", size = 7843, upload-time = "2026-02-13T00:34:02.691Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/a0/c4/c2971a3ba4c6103a3d10c4b0f24f461ddc027f0f09763220cf35ca1401b3/nest_asyncio-1.6.0-py3-none-any.whl", hash = "sha256:87af6efd6b5e897c81050477ef65c62e2b2f35d51703cae01aff2905b1852e1c", size = 5195, upload-time = "2024-01-21T14:25:17.223Z" },
 ]
 
 [[package]]
