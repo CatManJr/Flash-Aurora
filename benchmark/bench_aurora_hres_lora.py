@@ -65,7 +65,7 @@ def build_hres(
     use_lora_merged_inference: bool,
     device: torch.device,
 ):
-    from flash_aurora.aurora.model.aurora import AuroraHighRes
+    from flash_aurora.models.aurora.model.aurora import AuroraHighRes
 
     model = AuroraHighRes(
         use_lora=use_lora,

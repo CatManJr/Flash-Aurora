@@ -91,7 +91,7 @@ def _run_pipeline_forward_once(
     model: Any,
     batch: Any,
 ) -> tuple[PipelineStageTiming, Any]:
-    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+    from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
     from flash_aurora.engine.distributed.pipeline import parallel_plan
 
     plan = parallel_plan(model)

@@ -66,8 +66,8 @@ def bench_peak_allocated_mb(fn, warmup: int, iters: int, device: torch.device) -
 
 
 def main() -> None:
-    from flash_aurora.aurora.model.perceiver import PerceiverResampler
-    import flash_aurora.aurora.model.perceiver as perceiver_mod
+    from flash_aurora.models.aurora.model.perceiver import PerceiverResampler
+    import flash_aurora.models.aurora.model.perceiver as perceiver_mod
 
     p = argparse.ArgumentParser(
         description="Perceiver Triton LN+residual fusion vs eager (latency + peak CUDA MB)"
@@ -120,8 +120,8 @@ def main() -> None:
     print(f"mode={args.mode}")
 
     def build_encoder_decoder(use_fusion: bool):
-        from flash_aurora.aurora.model.decoder import Perceiver3DDecoder
-        from flash_aurora.aurora.model.encoder import Perceiver3DEncoder
+        from flash_aurora.models.aurora.model.decoder import Perceiver3DDecoder
+        from flash_aurora.models.aurora.model.encoder import Perceiver3DEncoder
 
         enc = Perceiver3DEncoder(
             surf_vars=surf_vars,

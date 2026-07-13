@@ -4,7 +4,7 @@ from datetime import datetime
 
 import torch
 
-from flash_aurora.aurora import AuroraPretrained, Batch, Metadata
+from flash_aurora.models.aurora import AuroraPretrained, Batch, Metadata
 
 
 def loss(pred: Batch) -> torch.Tensor:

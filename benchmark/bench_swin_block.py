@@ -27,9 +27,9 @@ import _bootstrap  # noqa: F401, E402
 
 import torch
 
-from flash_aurora.aurora.model.swin3d import Swin3DTransformerBlock
-from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
-from flash_aurora.aurora.ops.cute.window_attn_fwd import _CUTE_AVAILABLE
+from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBlock
+from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
+from flash_aurora.models.ops.cute.window_attn_fwd import _CUTE_AVAILABLE
 
 WARMUP    = 20
 MEASURED  = 100

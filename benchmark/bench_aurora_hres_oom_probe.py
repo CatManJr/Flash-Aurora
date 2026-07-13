@@ -49,7 +49,7 @@ def make_synthetic_hres_batch(
     batch: int = 1,
     history: int = 2,
 ) -> "Batch":
-    from flash_aurora.aurora import Batch, Metadata
+    from flash_aurora.models.aurora import Batch, Metadata
 
     lat = torch.from_numpy(np.linspace(90, -90, height)).float()
     lon = torch.from_numpy(np.linspace(0, 360, width, endpoint=False)).float()
@@ -89,7 +89,7 @@ def build_hres_model(
     use_lora: bool,
     device: torch.device,
 ):
-    from flash_aurora.aurora.model.aurora import AuroraHighRes
+    from flash_aurora.models.aurora.model.aurora import AuroraHighRes
 
     model = AuroraHighRes(use_lora=use_lora, inference_precision=precision)
     model.load_checkpoint_local(str(checkpoint), strict=False)

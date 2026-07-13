@@ -56,8 +56,8 @@ def load_small_pretrained_batch(asset_root: Path) -> tuple[Any, EngineConfig]:
     import pickle
     import warnings
 
-    from flash_aurora.aurora import Batch, Metadata
-    from flash_aurora.aurora.batch import interpolate_numpy
+    from flash_aurora.models.aurora import Batch, Metadata
+    from flash_aurora.models.aurora.batch import interpolate_numpy
 
     root = asset_root.expanduser().resolve()
     input_path = root / "aurora-0.25-small-pretrained-test-input.pickle"

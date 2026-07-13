@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-from flash_aurora.aurora.model.aurora import (  # noqa: E402
+from flash_aurora.models.aurora.model.aurora import (  # noqa: E402
     Aurora,
     Aurora12hPretrained,
     AuroraAirPollution,

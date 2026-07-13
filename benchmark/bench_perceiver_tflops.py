@@ -81,8 +81,8 @@ def report_ms_tflops(name: str, t_sec: float, flops_attn_approx: float) -> None:
 
 
 def main() -> None:
-    from flash_aurora.aurora.model.decoder import Perceiver3DDecoder
-    from flash_aurora.aurora.model.encoder import Perceiver3DEncoder
+    from flash_aurora.models.aurora.model.decoder import Perceiver3DDecoder
+    from flash_aurora.models.aurora.model.encoder import Perceiver3DEncoder
 
     p = argparse.ArgumentParser(
         description="Aurora multi-Perceiver (encoder + decoder [+ alternate]) SDPA TFLOPS"

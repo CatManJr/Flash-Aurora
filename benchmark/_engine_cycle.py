@@ -11,8 +11,8 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-from flash_aurora.aurora import Batch
-from flash_aurora.aurora.model.aurora import Aurora
+from flash_aurora.models.aurora import Batch
+from flash_aurora.models.aurora.model.aurora import Aurora
 
 from flash_aurora.engine.core.checkpoint import CheckpointLoader
 from flash_aurora.engine.core.config import EngineConfig

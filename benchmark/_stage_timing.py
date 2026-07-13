@@ -32,7 +32,7 @@ def _run_forward_stages_once(
     device: torch.device,
 ) -> tuple[StageTiming, Any]:
     """One forward with CUDA events between encoder, backbone, decoder, post."""
-    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+    from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
     batch, transformed_batch, patch_res = model._prepare_encoder_batch(batch)
     rollout_step = batch.metadata.rollout_step

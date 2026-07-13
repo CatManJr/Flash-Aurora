@@ -18,7 +18,7 @@ import _bootstrap  # noqa: F401, E402
 
 import torch
 
-from flash_aurora.aurora.ops.cute.window_attn_fwd import WinAttnPrecision, window_attn_fwd_cute
+from flash_aurora.models.ops.cute.window_attn_fwd import WinAttnPrecision, window_attn_fwd_cute
 
 NSYS = "/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys"
 NCU = "/usr/local/cuda/bin/ncu"

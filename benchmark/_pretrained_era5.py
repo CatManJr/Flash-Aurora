@@ -81,7 +81,7 @@ def custom_matmul_combo_tiers(
     backbone_levels: tuple[str, ...],
     encoder_decoder_levels: tuple[str, ...],
 ) -> tuple[tuple[str, str, str], ...]:
-    from flash_aurora.aurora.model.inference_precision import (
+    from flash_aurora.models.inference_precision import (
         DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS,
         DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS,
         describe_inference_config,
@@ -102,7 +102,7 @@ def full_default_suite(
     backbone_levels: tuple[str, ...] = (),
     encoder_decoder_levels: tuple[str, ...] = (),
 ) -> tuple[tuple[str, str, str], ...]:
-    from flash_aurora.aurora.model.inference_precision import (
+    from flash_aurora.models.inference_precision import (
         DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS,
         DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS,
     )
@@ -119,7 +119,7 @@ def tier_entry(name: str) -> tuple[str, str, str]:
     for key, precision, label in _LEGACY_NAMED_TIERS:
         if name == key:
             return key, precision, label
-    from flash_aurora.aurora.model.inference_precision import describe_inference_config, resolve_inference_config
+    from flash_aurora.models.inference_precision import describe_inference_config, resolve_inference_config
 
     cfg = resolve_inference_config(name)
     if cfg is None:
@@ -326,7 +326,7 @@ def load_era5_batch(
 
 
 def repeat_batch(batch: Any, n: int) -> Any:
-    from flash_aurora.aurora import Batch
+    from flash_aurora.models.aurora import Batch
 
     if n == 1:
         return batch
@@ -489,7 +489,7 @@ def build_model(
     use_cute_window_attn: bool | None = None,
     cute_window_attn_dtype: torch.dtype | None = None,
 ) -> Any:
-    from flash_aurora.aurora import AuroraPretrained
+    from flash_aurora.models.aurora import AuroraPretrained
 
     model = AuroraPretrained(use_lora=False, inference_precision=precision)
     if use_cute_window_attn is not None:
@@ -708,7 +708,7 @@ def probe_max_batch(
     forward_only: bool = True,
     rollout_steps: int = 2,
 ) -> int:
-    from flash_aurora.aurora import rollout
+    from flash_aurora.models.aurora import rollout
 
     use_cuda = device.type == "cuda"
 

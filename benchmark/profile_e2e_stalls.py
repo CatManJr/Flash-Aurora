@@ -199,7 +199,7 @@ def main() -> None:
     from torch.autograd.profiler import record_function
     from torch.profiler import ProfilerActivity, profile
 
-    from flash_aurora.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora import AuroraSmallPretrained
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
@@ -220,7 +220,7 @@ def main() -> None:
     backbone_x = None
     rollout_step = 0
     if args.backbone_only:
-        from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+        from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
 
         _, transformed, patch_res = model._prepare_encoder_batch(batch)
         with torch.inference_mode():
@@ -248,7 +248,7 @@ def main() -> None:
                     with record_function("aurora::prepare_batch"):
                         enc_batch, transformed, pr = model._prepare_encoder_batch(batch)
                     with record_function("aurora::encoder"):
-                        from flash_aurora.aurora.model.custom_op_paths import (
+                        from flash_aurora.models.aurora.model.custom_op_paths import (
                             run_with_encoder_decoder_autocast,
                         )
 

@@ -130,7 +130,7 @@ def _prepare_backbone_input(
     """Run encoder once; return ``(patch_res, tokens, rollout_step)`` for backbone loops."""
     import torch
 
-    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
+    from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_autocast
 
     _, transformed, patch_res = model._prepare_encoder_batch(batch)
     with torch.inference_mode():
@@ -157,7 +157,7 @@ def _profile_tier(
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from flash_aurora.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora import AuroraSmallPretrained
 
     dev = torch.device(device)
     model = AuroraSmallPretrained(use_lora=False, inference_precision=tier)

@@ -32,7 +32,7 @@ from _aurora_attn_shapes import (
     SHAPES_ERA5_025,
     all_unique_attn_shapes,
 )
-from flash_aurora.aurora.ops.cute.window_attn_fwd import (
+from flash_aurora.models.ops.cute.window_attn_fwd import (
     _best_tile_m,
     _choose_tile_n,
     _CUTE_AVAILABLE,

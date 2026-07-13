@@ -91,7 +91,7 @@ def build_finetuned(
 
 
 def _prepare_backbone_input(model: Any, batch: Any) -> tuple[tuple[int, int, int], Any, int]:
-    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+    from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
     _, transformed, patch_res = model._prepare_encoder_batch(batch)
     with torch.inference_mode():

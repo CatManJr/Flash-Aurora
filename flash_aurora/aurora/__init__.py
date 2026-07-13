@@ -1,4 +1,11 @@
-"""Flash-Aurora: high-performance Aurora inference library."""
+"""Compatibility shim for ``flash_aurora.aurora``.
+
+Prefer ``flash_aurora.models.aurora``. This module re-exports the optimized
+Aurora package surface so existing ``from flash_aurora.aurora import ...``
+imports keep working for one release cycle.
+"""
+
+from __future__ import annotations
 
 from flash_aurora.models.aurora import (
     Aurora,
@@ -15,23 +22,19 @@ from flash_aurora.models.aurora import (
     Tracker,
     rollout,
 )
-from flash_aurora.engine import AuroraEngine, DataDownloader, EngineConfig
 
 __all__ = [
     "Aurora",
-    "Aurora12hPretrained",
-    "AuroraAirPollution",
-    "AuroraEngine",
-    "AuroraHighRes",
-    "AuroraInferencePrecision",
     "AuroraPretrained",
-    "AuroraSmall",
     "AuroraSmallPretrained",
+    "AuroraSmall",
+    "Aurora12hPretrained",
+    "AuroraHighRes",
+    "AuroraAirPollution",
     "AuroraWave",
+    "AuroraInferencePrecision",
     "Batch",
-    "DataDownloader",
-    "EngineConfig",
     "Metadata",
-    "Tracker",
     "rollout",
+    "Tracker",
 ]
