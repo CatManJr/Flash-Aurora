@@ -5,8 +5,8 @@ from typing import Generator
 
 import torch
 
-from flash_aurora.aurora.batch import Batch
-from flash_aurora.aurora.model.aurora import Aurora
+from flash_aurora.models.aurora.batch import Batch
+from flash_aurora.models.aurora.model.aurora import Aurora
 
 __all__ = ["advance_rollout_batch", "prepare_rollout_batch", "rollout"]
 

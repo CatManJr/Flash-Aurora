@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from timm.layers import to_2tuple
 
-from flash_aurora.aurora.model.fourier import FourierExpansion
+from flash_aurora.models.aurora.model.fourier import FourierExpansion
 
 __all__ = ["pos_scale_enc"]
 

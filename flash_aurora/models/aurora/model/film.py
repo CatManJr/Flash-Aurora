@@ -51,17 +51,17 @@ class AdaptiveLayerNorm(nn.Module):
         """AdaLN must run on FP32 activations; BF16 branch inputs explode numerically."""
         if x.dtype == torch.float32:
             return x
-        from flash_aurora.aurora.model.custom_op_paths import cast_activation_dtype
+        from flash_aurora.models.aurora.model.custom_op_paths import cast_activation_dtype
 
         return cast_activation_dtype(x, torch.float32)
 
     def _finalize_adaln_output(self, x: torch.Tensor) -> torch.Tensor:
-        from flash_aurora.aurora.model.custom_op_paths import downcast_bf16_speed_activation
+        from flash_aurora.models.aurora.model.custom_op_paths import downcast_bf16_speed_activation
 
         return downcast_bf16_speed_activation(x)
 
     def _use_triton_film(self, x: torch.Tensor) -> bool:
-        from flash_aurora.aurora.model.custom_op_paths import triton_elemwise_dtype_ok
+        from flash_aurora.models.aurora.model.custom_op_paths import triton_elemwise_dtype_ok
 
         return self.use_triton and x.is_cuda and triton_elemwise_dtype_ok(x.dtype)
 
@@ -82,7 +82,7 @@ class AdaptiveLayerNorm(nn.Module):
         shift, scale = self.ln_modulation(c).unsqueeze(1).chunk(2, dim=-1)
         x = self._adaln_branch_input(x)
         if self._use_triton_film_fp32_out(x):
-            from flash_aurora.aurora.ops.triton_adaln import adaptive_layernorm_film_forward
+            from flash_aurora.models.ops.triton_adaln import adaptive_layernorm_film_forward
 
             return self._finalize_adaln_output(
                 adaptive_layernorm_film_forward(
@@ -122,7 +122,7 @@ class AdaptiveLayerNorm(nn.Module):
             and residual.dtype == torch.float32
             and self._use_triton_film(x)
         ):
-            from flash_aurora.aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
+            from flash_aurora.models.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
             return self._finalize_adaln_output(
                 adaptive_layernorm_film_add_residual_forward(

@@ -85,8 +85,8 @@ def _load_batch_from_hf() -> Any:
     import numpy as np
     import torch
 
-    from flash_aurora.aurora import Batch, Metadata
-    from flash_aurora.aurora.batch import interpolate_numpy
+    from flash_aurora.models.aurora import Batch, Metadata
+    from flash_aurora.models.aurora.batch import interpolate_numpy
 
     path = _hf_data_path("aurora-0.25-small-pretrained-test-input.pickle")
     # Pickled NumPy arrays may trigger numpy.core deprecation noise on NumPy 2.x.
@@ -143,7 +143,7 @@ def _load_batch_synthetic(
 ) -> Any:
     import torch
 
-    from flash_aurora.aurora import Batch, Metadata
+    from flash_aurora.models.aurora import Batch, Metadata
 
     return Batch(
         surf_vars={k: torch.randn(batch_size, history, h, w) for k in ("2t", "10u", "10v", "msl")},
@@ -422,7 +422,7 @@ def _probe_max_batch(
 
     import torch
 
-    from flash_aurora.aurora import rollout
+    from flash_aurora.models.aurora import rollout
 
     def attempt(n: int) -> bool:
         try:
@@ -461,8 +461,8 @@ def _probe_max_batch(
 
 
 def _aurora_model_kwargs(args: argparse.Namespace) -> dict[str, Any]:
-    from flash_aurora.aurora.model.inference_precision import resolve_inference_config
-    from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
+    from flash_aurora.models.inference_precision import resolve_inference_config
+    from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 
     pool_kw = {"workspace_pool": InferenceWorkspacePool()} if args.use_workspace_pool else {}
     base = {
@@ -511,8 +511,8 @@ def _timed_e2e_config(
 
     import torch
 
-    from flash_aurora.aurora import AuroraSmallPretrained, rollout
-    from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
+    from flash_aurora.models.aurora import AuroraSmallPretrained, rollout
+    from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 
     dev = torch.device(args.device)
     if dev.type == "cuda":
@@ -641,7 +641,7 @@ def _repeat_batch_along_batch_dim(batch: Any, n: int) -> Any:
     """Repeat batch along batch dimension (same as test_model)."""
     import torch
 
-    from flash_aurora.aurora import Batch
+    from flash_aurora.models.aurora import Batch
 
     if n == 1:
         return batch
@@ -938,7 +938,7 @@ def main() -> None:
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from flash_aurora.aurora import AuroraSmallPretrained, rollout
+    from flash_aurora.models.aurora import AuroraSmallPretrained, rollout
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("CUDA is not available. Use --device cpu (slow) or run on a GPU machine.")
@@ -1065,7 +1065,7 @@ def main() -> None:
 
         return
 
-    from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
+    from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 
     pool = InferenceWorkspacePool() if args.use_workspace_pool else None
     model_kwargs = _aurora_model_kwargs(args)

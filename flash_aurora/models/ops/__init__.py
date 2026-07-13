@@ -6,16 +6,16 @@ those portions are licensed under the MIT License (see LICENSE).
 Custom Triton and CuTeDSL ops for Aurora inference (see subpackages for third-party references).
 """
 
-from flash_aurora.aurora.ops.triton_adaln import (
+from flash_aurora.models.ops.triton_adaln import (
     adaptive_layernorm_film_add_residual_forward,
     adaptive_layernorm_film_forward,
 )
-from flash_aurora.aurora.ops.triton_perceiver_ln import (
+from flash_aurora.models.ops.triton_perceiver_ln import (
     layernorm_affine_add_residual_forward,
     layernorm_affine_forward,
 )
-from flash_aurora.aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
-from flash_aurora.aurora.ops.triton_swin3d_layout import (
+from flash_aurora.models.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+from flash_aurora.models.ops.triton_swin3d_layout import (
     crop_roll_unmerge_windows_triton,
     roll_pad_partition_windows_triton,
 )

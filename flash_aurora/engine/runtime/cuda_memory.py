@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import torch
-from flash_aurora.aurora import Batch
+from flash_aurora.models.aurora import Batch
 
 
 def configure_pytorch_cuda_allocator(*, expandable_segments: bool = True) -> None:

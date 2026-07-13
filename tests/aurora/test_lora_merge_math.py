@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from flash_aurora.aurora.model.lora import LoRA, LoRARollout
+from flash_aurora.models.aurora.model.lora import LoRA, LoRARollout
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),

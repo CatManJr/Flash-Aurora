@@ -9,7 +9,7 @@ import pytest
 
 import torch
 
-from flash_aurora.aurora.model.inference_precision import (
+from flash_aurora.models.inference_precision import (
     AuroraInferenceConfig,
     AuroraInferencePrecision,
     BackboneMatmulLevel,
@@ -251,7 +251,7 @@ def test_expand_precision_combos_cartesian_product() -> None:
 
 
 def test_aurora_constructor_combo_string() -> None:
-    from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(use_lora=False, inference_precision="bf16@fp32")
     assert model.inference_config is not None
@@ -262,7 +262,7 @@ def test_aurora_constructor_combo_string() -> None:
 
 
 def test_aurora_constructor_independent_level_kwargs() -> None:
-    from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(
         use_lora=False,
@@ -282,8 +282,8 @@ def test_fp32_rejects_cuda_graph_enable() -> None:
 
 
 def test_aurora_prepare_encoder_batch_keeps_lat_lon_fp32() -> None:
-    from flash_aurora.aurora import Batch, Metadata
-    from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora import Batch, Metadata
+    from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(use_lora=False, autocast=True).cuda().to(dtype=torch.bfloat16)
     batch = Batch(
@@ -303,7 +303,7 @@ def test_aurora_prepare_encoder_batch_keeps_lat_lon_fp32() -> None:
 
 
 def test_aurora_constructor_applies_tf32_preset() -> None:
-    from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(use_lora=False, inference_precision="tf32")
     assert model.inference_config is not None
@@ -317,7 +317,7 @@ def test_aurora_constructor_applies_tf32_preset() -> None:
 
 
 def test_aurora_constructor_applies_bf16_mixed_preset() -> None:
-    from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(use_lora=False, inference_precision="bf16_mixed")
     assert model.inference_config is not None
@@ -331,7 +331,7 @@ def test_aurora_constructor_applies_bf16_mixed_preset() -> None:
 
 
 def test_aurora_constructor_applies_bf16_preset() -> None:
-    from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
 
     model = AuroraSmallPretrained(use_lora=False, inference_precision="bf16")
     assert model.inference_config is not None
@@ -345,7 +345,7 @@ def test_aurora_constructor_applies_bf16_preset() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_encoder_decoder_routing_enables_tf32_flags() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+    from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
     def _noop() -> None:
         assert torch.get_float32_matmul_precision() == "high"
@@ -360,7 +360,7 @@ def test_fast_fp32_backbone_matches_fp32_pytorch_path() -> None:
     """Triton layout+AdaLN with PyTorch GELU should match pure PyTorch backbone."""
     from datetime import timedelta
 
-    from flash_aurora.aurora.model.swin3d import Swin3DTransformerBackbone
+    from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBackbone
 
     torch.manual_seed(0)
     kwargs = dict(
@@ -393,8 +393,8 @@ def test_fast_fp32_backbone_matches_fp32_pytorch_path() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_backbone_bf16_matmul_context_mlp_chain_and_norm_break() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import backbone_matmul_context
-    from flash_aurora.aurora.model.swin3d import MLP
+    from flash_aurora.models.aurora.model.custom_op_paths import backbone_matmul_context
+    from flash_aurora.models.aurora.model.swin3d import MLP
 
     mlp = MLP(32, hidden_features=64, out_features=16).cuda().float()
     norm = torch.nn.LayerNorm(16).cuda().float()
@@ -410,7 +410,7 @@ def test_backbone_bf16_matmul_context_mlp_chain_and_norm_break() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_backbone_bf16_hybrid_hooks_qkv_linear_fp32() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import backbone_matmul_context
+    from flash_aurora.models.aurora.model.custom_op_paths import backbone_matmul_context
 
     linear = torch.nn.Linear(128, 128 * 3, bias=True).cuda().float()
     x = torch.randn(8, 144, 128, device="cuda", dtype=torch.float32)
@@ -423,7 +423,7 @@ def test_backbone_bf16_hybrid_hooks_qkv_linear_fp32() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_backbone_bf16_hooks_qkv_linear_bf16() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import backbone_bf16_matmul_context
+    from flash_aurora.models.aurora.model.custom_op_paths import backbone_bf16_matmul_context
 
     linear = torch.nn.Linear(128, 128 * 3, bias=True).cuda().float()
     x = torch.randn(8, 144, 128, device="cuda", dtype=torch.float32)
@@ -436,7 +436,7 @@ def test_backbone_bf16_hooks_qkv_linear_bf16() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_bf16_fused_attention_chain_on_full_bf16_context() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import (
+    from flash_aurora.models.aurora.model.custom_op_paths import (
         backbone_bf16_matmul_context,
         use_bf16_fused_attention_chain,
     )
@@ -452,7 +452,7 @@ def test_bf16_fused_attention_chain_on_full_bf16_context() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_backbone_tf32_matmul_context_enables_tf32_flags() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import backbone_tf32_matmul_context
+    from flash_aurora.models.aurora.model.custom_op_paths import backbone_tf32_matmul_context
 
     with torch.inference_mode():
         with backbone_tf32_matmul_context(enabled=True):

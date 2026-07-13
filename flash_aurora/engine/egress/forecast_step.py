@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from flash_aurora.aurora import Batch
+from flash_aurora.models.aurora import Batch
 
 
 @dataclass(frozen=True)
@@ -20,5 +20,9 @@ class ForecastStep:
         base_time: datetime,
         timestep_hours: int,
     ) -> ForecastStep:
-        valid_time = base_time + timedelta(hours=timestep_hours * (step_index + 1))
+        times = getattr(batch.metadata, "time", None) or ()
+        if times:
+            valid_time = times[-1]
+        else:
+            valid_time = base_time + timedelta(hours=timestep_hours * (step_index + 1))
         return cls(step_index=step_index, valid_time=valid_time, batch=batch)

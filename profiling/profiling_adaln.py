@@ -54,7 +54,7 @@ def _bench_cuda(
 def main() -> None:
     import torch
 
-    from flash_aurora.aurora.ops.triton_adaln import (
+    from flash_aurora.models.ops.triton_adaln import (
         adaptive_layernorm_film_add_residual_forward,
         adaptive_layernorm_film_forward,
     )

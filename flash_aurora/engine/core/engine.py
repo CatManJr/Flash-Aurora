@@ -3,17 +3,22 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Generator, Iterable
+from typing import Generator, Iterable, Sequence
 
 import torch
-from flash_aurora.aurora import Batch
-from flash_aurora.aurora.model.aurora import Aurora
+from flash_aurora.models.aurora import Batch
+from flash_aurora.models.aurora_v1p5.rollout import rollout as v1p5_rollout
 
 from flash_aurora.engine.core.checkpoint import CheckpointLoader
 from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.core.hooks import RolloutObserver
 from flash_aurora.engine.core.hub import HF_MIRROR_ENDPOINT
 from flash_aurora.engine.core.asset_root import normalize_asset_root
+from flash_aurora.engine.core.model_protocol import (
+    AuroraModel,
+    is_v1p5_model_class,
+    model_uses_v1p5_rollout,
+)
 from flash_aurora.engine.core.paths import AssetStore, normalize_asset_path, normalize_user_path
 from flash_aurora.engine.core.prepare import LoadTiming, overlap_ic_and_load, serial_ic_then_load
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS, PresetRegistry
@@ -58,7 +63,7 @@ class AuroraEngine:
         if self.config.user_cwd is None:
             self.config.user_cwd = Path.cwd()
         self._presets = presets or DEFAULT_PRESETS
-        self._model: Aurora | None = None
+        self._model: AuroraModel | None = None
         self._loader = CheckpointLoader(config)
         self._validator = BatchValidator(config.variant)
         self._graph_pool = GraphPool()
@@ -154,7 +159,15 @@ class AuroraEngine:
         if hf_token is not None:
             config.hf_token = hf_token
         if inference_precision is not None:
+            if is_v1p5_model_class(config.variant.model_class):
+                raise ValueError(
+                    "inference_precision is only supported for the optimized Aurora family; "
+                    "Aurora 1.5 uses upstream fp16 autocast."
+                )
             config.inference_precision = inference_precision
+        if is_v1p5_model_class(config.variant.model_class):
+            config.cuda_graph = False
+            config.inference_precision = None
         if overlap_ic_load is not None:
             config.overlap_ic_load = overlap_ic_load
         if async_export is not None:
@@ -170,6 +183,10 @@ class AuroraEngine:
         if forward_warmup_iters is not None:
             config.forward_warmup_iters = forward_warmup_iters
         if distributed is not None:
+            if is_v1p5_model_class(config.variant.model_class):
+                raise ValueError(
+                    "Pipeline-parallel distributed rollout is not supported for Aurora 1.5 yet."
+                )
             config.distributed = distributed
             config.cuda_graph = False
             config.gpu_guard = False
@@ -197,7 +214,7 @@ class AuroraEngine:
         return InitialConditionBuilder(self.config)
 
     @property
-    def model(self) -> Aurora:
+    def model(self) -> AuroraModel:
         if self._model is None:
             raise RuntimeError("Call load() before using the model.")
         return self._model
@@ -290,7 +307,7 @@ class AuroraEngine:
         registry = GpuGuardRegistry(resolve_guard_dir(self.config.asset_root))
         return registry.status(device_index=self._device_index())
 
-    def load(self, *, rollout_steps: int | None = None) -> Aurora:
+    def load(self, *, rollout_steps: int | None = None) -> AuroraModel:
         try:
             self.acquire_gpu(rollout_steps=rollout_steps)
             self._model = self._load_model_to_device(rollout_steps=rollout_steps)[0]
@@ -303,7 +320,7 @@ class AuroraEngine:
         self,
         *,
         rollout_steps: int | None = None,
-    ) -> tuple[Aurora, LoadTiming]:
+    ) -> tuple[AuroraModel, LoadTiming]:
         t0 = time.perf_counter()
         model = self._loader.build_model()
         build_model_ms = (time.perf_counter() - t0) * 1000.0
@@ -445,6 +462,9 @@ class AuroraEngine:
         self.validate(batch)
         self._maybe_warmup(batch)
         with torch.inference_mode():
+            if model_uses_v1p5_rollout(self.model):
+                # Variable lead-time models require lead_times; use one AR step of v1p5 rollout.
+                return next(v1p5_rollout(self.model, batch, steps=1))
             return self.model.forward(batch)
 
     def run_from_netcdf(self, path: Path | str, steps: int = 1) -> list[Batch]:
@@ -467,6 +487,10 @@ class AuroraEngine:
         batch: Batch,
         steps: int,
         observers: Iterable[RolloutObserver] | None = None,
+        *,
+        fine_lead_times: Sequence[float] | None = None,
+        use_noise_accumulation: bool = True,
+        apply_rollout_input_clipping: bool = True,
     ) -> Generator[Batch, None, None]:
         self.acquire_gpu(rollout_steps=steps)
         if self._gpu_ticket is not None:
@@ -475,7 +499,13 @@ class AuroraEngine:
         self._maybe_warmup(batch)
         try:
             session = RolloutSession(self.model, observers)
-            yield from session.run(batch, steps)
+            yield from session.run(
+                batch,
+                steps,
+                fine_lead_times=fine_lead_times,
+                use_noise_accumulation=use_noise_accumulation,
+                apply_rollout_input_clipping=apply_rollout_input_clipping,
+            )
         except Exception:
             self.release_gpu()
             raise
@@ -494,6 +524,9 @@ class AuroraEngine:
         variables: tuple[str, ...] | None = None,
         export_crs: str | None = None,
         export_options: ExportOptions | None = None,
+        fine_lead_times: Sequence[float] | None = None,
+        use_noise_accumulation: bool = True,
+        apply_rollout_input_clipping: bool = True,
     ) -> Generator[Path, None, None]:
         if export_dir is not None:
             self.set_export_dir(export_dir)
@@ -514,11 +547,18 @@ class AuroraEngine:
             and options.format == "netcdf"
             and resolved_regions is None
         )
+        stream = self.rollout_stream(
+            batch,
+            steps,
+            fine_lead_times=fine_lead_times,
+            use_noise_accumulation=use_noise_accumulation,
+            apply_rollout_input_clipping=apply_rollout_input_clipping,
+        )
         if use_async:
             with self._pipeline_exporter(resolved_dir) as exporter:
-                for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):
+                for step_index, prediction in enumerate(stream):
                     yield exporter.write_step(step_index, prediction)
             return
 
-        for step_index, prediction in enumerate(self.rollout_stream(batch, steps)):
+        for step_index, prediction in enumerate(stream):
             yield from writer.write_step(step_index, prediction)

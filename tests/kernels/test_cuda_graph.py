@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 def _smoke_batch(*, batch_size: int = 1, h: int = 32, w: int = 64) -> "Batch":
-    from flash_aurora.aurora import Batch, Metadata
+    from flash_aurora.models.aurora import Batch, Metadata
 
     levels = (100, 250, 500, 850)
     return Batch(
@@ -39,9 +39,9 @@ def _smoke_batch(*, batch_size: int = 1, h: int = 32, w: int = 64) -> "Batch":
 def test_backbone_cuda_graph_capture_tf32() -> None:
     import os
 
-    from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
-    from flash_aurora.aurora.model.checkpoint_local import resolve_checkpoint_path
-    from flash_aurora.aurora.model.inference_tensors import clear_constant_tensor_cache
+    from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora.model.checkpoint_local import resolve_checkpoint_path
+    from flash_aurora.models.aurora.model.inference_tensors import clear_constant_tensor_cache
 
     asset_root = os.environ.get("AURORA_ASSET_ROOT") or os.environ.get("AURORA_HF_LOCAL_DIR")
     if not asset_root:

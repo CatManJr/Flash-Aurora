@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 
 
 def _own_tensor(tensor: torch.Tensor) -> torch.Tensor:

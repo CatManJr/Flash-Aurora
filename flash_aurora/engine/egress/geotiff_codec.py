@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from flash_aurora.aurora import Batch
+from flash_aurora.models.aurora import Batch
 
 from flash_aurora.engine.egress.crs import BATCH_CRS, normalize_crs, roi_longitude_plot_bounds
 

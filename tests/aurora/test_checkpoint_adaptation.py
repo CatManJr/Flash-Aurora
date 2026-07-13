@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from flash_aurora.aurora.model.aurora import AuroraSmallPretrained
+from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
 
 
 @pytest.fixture

@@ -6,7 +6,7 @@ import numpy as np
 
 from tests.aurora.conftest import SavedBatch
 
-from flash_aurora.aurora import Batch
+from flash_aurora.models.aurora import Batch
 
 
 def test_interpolation(test_input_output: tuple[Batch, SavedBatch]) -> None:

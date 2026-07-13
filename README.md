@@ -93,9 +93,10 @@ Dependencies are declared in `pyproject.toml` and pinned by `uv.lock`. CuTe DSL 
 
 | Path                                         | Role                                                                                                                                                                                    |
 | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `flash_aurora/aurora/`                       | Aurora model (upstream README preserved in place). See `NOTICE.md` and `LICENSE.txt`.                                                                                                   |
-| `flash_aurora/aurora/ops/triton/`            | Fused Swin3D layout, AdaLN, and GELU kernels.                                                                                                                                           |
-| `flash_aurora/aurora/ops/cute/`              | CuTe DSL window self-attention and dense GEMM kernels.                                                                                                                                  |
+| `flash_aurora/models/aurora/`                       | Legacy optimized Aurora family (upstream freeze **v1.8.0**, pre-Aurora 2.0.0). See `NOTICE.md` and `LICENSE.txt`.                                                                          |
+| `flash_aurora/models/aurora_v1p5/`                  | Aurora 1.5 side path (upstream v2.0.0 semantics; no CuTe). Preset `aurora_v1p5`.                                                                                                          |
+| `flash_aurora/models/ops/`                         | Shared Triton / CuTe kernels (`triton_*.py`, `cute/`) used by the legacy family (and future accel consumers).                                                                              |
+| `flash_aurora/models/inference_precision.py`       | Shared precision presets (`AuroraInferencePrecision`).                                                                                                                                  |
 | `flash_aurora/engine/core/`                  | `EngineConfig`, `PresetRegistry`, `AuroraEngine`, checkpoint load, `RolloutSession`, `prepare()`, lifecycle.                                                                            |
 | `flash_aurora/engine/ingress/`               | `DataDownloader`, source adapters, `InitialConditionBuilder`, `BatchValidator`, optional IC disk cache.                                                                                 |
 | `flash_aurora/engine/egress/`                | `RolloutExporter`, CPU offload, step-wise NetCDF naming, optional async export.                                                                                                         |
@@ -569,7 +570,7 @@ All custom precision tiers (`fp32@`*,* `tf32@`, `bf16_mixed@`*, `bf16@`*) enable
 
 ## Window attention kernels
 
-Swin window self-attention is the dominant cost in the Aurora backbone. Flash-Aurora replaces PyTorch `scaled_dot_product_attention` on this path with CuTe DSL kernels in `flash_aurora/aurora/ops/cute/`. The kernel follows a fused multi-head attention structure: load $Q$, $K$, and $V$ into shared memory, form logits $S = \mathrm{scale} QK^\top$, apply the Swin mask, compute row-wise online softmax in FP32, then accumulate $O \leftarrow \mathrm{softmax}(S)V$ without materializing the full $N \times N$ attention matrix in global memory.
+Swin window self-attention is the dominant cost in the Aurora backbone. Flash-Aurora replaces PyTorch `scaled_dot_product_attention` on this path with CuTe DSL kernels in `flash_aurora/models/ops/cute/`. The kernel follows a fused multi-head attention structure: load $Q$, $K$, and $V$ into shared memory, form logits $S = \mathrm{scale} QK^\top$, apply the Swin mask, compute row-wise online softmax in FP32, then accumulate $O \leftarrow \mathrm{softmax}(S)V$ without materializing the full $N \times N$ attention matrix in global memory.
 
 **Why short windows matter.** Aurora uses fixed small windows ($N = 144$ on the default $0.25^{\circ}$ encoder stage; $36$ and $9$ on deeper Swin stages). That sequence length is short enough that the full $K$ and $V$ rows for one query tile can live in a **single shared-memory tile** on production GPUs. `_smem_utils.py` picks `tile_n` from the per-block SMEM budget: when $tile_n \ge N$, the kernel takes the **single-stage** path (`single_kv_tile=True`, `num_stages=1` in `_kernel_bf16.py` / `_kernel_fp32.py`). One cp.async (BF16) or gmem load (TF32 hybrid) brings the entire window into SMEM; QK and PV MMAs then run locally with FP32 online softmax. There is no multi-stage streaming over $K/V$, no $N \times N$ softmax buffer, and no second global round-trip for the full attention map. This is the main reason the CuTe path targets Aurora window shapes rather than generic long-sequence attention.
 
@@ -1192,13 +1193,14 @@ This repository is licensed under the [MIT License](LICENSE).
 
 Third-party components bundled in the library:
 
-- `flash_aurora.aurora` is derived from [Microsoft Aurora](https://github.com/microsoft/aurora) (MIT). See [flash_aurora/aurora/LICENSE.txt](flash_aurora/aurora/LICENSE.txt) and [flash_aurora/aurora/NOTICE.md](flash_aurora/aurora/NOTICE.md).
-- Some source files include additional notices (for example NVIDIA BSD-3-Clause in `flash_aurora/aurora/ops/cute/_dense_gemm_sm120.py`). See per-file headers.
+- `flash_aurora.models.aurora` is derived from [Microsoft Aurora](https://github.com/microsoft/aurora) (MIT), frozen at upstream **v1.8.0**. See [flash_aurora/models/aurora/LICENSE.txt](flash_aurora/models/aurora/LICENSE.txt) and [flash_aurora/models/aurora/NOTICE.md](flash_aurora/models/aurora/NOTICE.md).
+- `flash_aurora.models.aurora_v1p5` is the Aurora 1.5 side path derived from Microsoft Aurora tag `v2.0.0` (MIT). See [flash_aurora/models/aurora_v1p5/LICENSE.txt](flash_aurora/models/aurora_v1p5/LICENSE.txt) and [flash_aurora/models/aurora_v1p5/NOTICE.md](flash_aurora/models/aurora_v1p5/NOTICE.md).
+- Shared kernels live under `flash_aurora.models.ops`. Some files include additional notices (for example NVIDIA BSD-3-Clause in `flash_aurora/models/ops/cute/_dense_gemm_sm120.py`). See per-file headers.
 
 ## Reference
 
 **Aurora model.** Bodnar et al., *A Foundation Model for the Earth System*, Nature (2025). [doi:10.1038/s41586-025-09005-y](https://doi.org/10.1038/s41586-025-09005-y). Upstream documentation: [microsoft.github.io/aurora](https://microsoft.github.io/aurora).
 
-**CUTLASS / CuTe DSL.** CuTe DSL window-attention and dense GEMM kernels under `flash_aurora/aurora/ops/cute/` adapt layout, TMA, and GEMM patterns from [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) examples (BSD-3-Clause; see file headers such as `ops/cute/_dense_gemm_sm120.py`). Runtime package: `nvidia-cutlass-dsl`.
+**CUTLASS / CuTe DSL.** CuTe DSL window-attention and dense GEMM kernels under `flash_aurora/models/ops/cute/` adapt layout, TMA, and GEMM patterns from [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) examples (BSD-3-Clause; see file headers such as `ops/cute/_dense_gemm_sm120.py`). Runtime package: `nvidia-cutlass-dsl`.
 
 **Flash Attention.** FMHA mainloop, online softmax, and dispatch structure follow [flash-attn](https://github.com/Dao-AILab/flash-attention) (`flash_attn/cute/`; Tri Dao).

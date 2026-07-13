@@ -67,6 +67,78 @@ WAVE_SURF_WAM: tuple[str, ...] = (
 )
 WAVE_STATIC: tuple[str, ...] = STANDARD_STATIC + ("wmb", "lat_mask")
 
+V1P5_SURF_INPUT: tuple[str, ...] = (
+    "2t",
+    "10u",
+    "10v",
+    "msl",
+    "2d",
+    "tcwv",
+    "tcc",
+    "100u",
+    "100v",
+    "sp",
+    "lcc",
+    "mcc",
+    "hcc",
+    "skt",
+    "stl1",
+    "swvl1",
+    "ci",
+    "scaled_sd",
+    "insolation",
+)
+V1P5_SURF_OUTPUT_ONLY: tuple[str, ...] = (
+    "i10fg",
+    "blh",
+    "uvb_1h",
+    "ssrd_1h",
+    "ttr_1h",
+    "scaled_tp_1h",
+    "scaled_sf_1h",
+)
+V1P5_SURF: tuple[str, ...] = V1P5_SURF_INPUT + V1P5_SURF_OUTPUT_ONLY
+V1P5_STATIC: tuple[str, ...] = (
+    "lsm",
+    "z",
+    "anor",
+    "isor",
+    "cvh",
+    "cl",
+    "dl",
+    "cvl",
+    "slor",
+    "slt_0",
+    "slt_1",
+    "slt_2",
+    "slt_3",
+    "slt_4",
+    "slt_5",
+    "slt_6",
+    "slt_7",
+    "sdfor",
+    "sdor",
+    "tvh_0",
+    "tvh_18",
+    "tvh_19",
+    "tvh_3",
+    "tvh_4",
+    "tvh_5",
+    "tvh_6",
+    "tvl_0",
+    "tvl_1",
+    "tvl_10",
+    "tvl_11",
+    "tvl_13",
+    "tvl_16",
+    "tvl_17",
+    "tvl_2",
+    "tvl_7",
+    "tvl_9",
+)
+V1P5_ATMOS: tuple[str, ...] = ("z", "u", "v", "t", "q")
+V1P5_CHECKPOINT_REVISION: str = "9751bb56e8e4a0f0a780e3cbe978f4c721e12bc7"
+
 
 @dataclass(frozen=True)
 class ModelVariantSpec:
@@ -80,6 +152,7 @@ class ModelVariantSpec:
     surf_vars: tuple[str, ...] = STANDARD_SURF
     static_vars: tuple[str, ...] = STANDARD_STATIC
     atmos_vars: tuple[str, ...] = STANDARD_ATMOS
+    output_only_surf_vars: tuple[str, ...] = ()
     levels: tuple[int | float, ...] = STANDARD_LEVELS
     resolution: tuple[int, int] = (721, 1440)
     static_pickle: str = "aurora-0.25-static.pickle"

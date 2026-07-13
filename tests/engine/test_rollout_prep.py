@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 from flash_aurora.engine.runtime.rollout_prep import (
     advance_rollout_batch,
     prepare_rollout_batch,

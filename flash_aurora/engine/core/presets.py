@@ -11,6 +11,11 @@ from flash_aurora.engine.core.config import (
     CAMS_ATMOS_POLLUTION,
     CAMS_STATIC,
     CAMS_SURF_POLLUTION,
+    V1P5_ATMOS,
+    V1P5_CHECKPOINT_REVISION,
+    V1P5_STATIC,
+    V1P5_SURF,
+    V1P5_SURF_OUTPUT_ONLY,
     WAVE_STATIC,
     WAVE_SURF_WAM,
 )
@@ -77,6 +82,36 @@ VARIANTS: dict[str, ModelVariantSpec] = {
         static_pickle="aurora-0.25-wave-static.pickle",
         strict_checkpoint=False,
     ),
+    "aurora-0.25-v1.5": ModelVariantSpec(
+        name="aurora-0.25-v1.5",
+        model_class="AuroraV1p5",
+        checkpoint_filename="aurora-0.25-v1.5.ckpt",
+        hf_repo="ikwessel/aurora-1.5",
+        use_lora=False,
+        strict_checkpoint=False,
+        surf_vars=V1P5_SURF,
+        static_vars=V1P5_STATIC,
+        atmos_vars=V1P5_ATMOS,
+        output_only_surf_vars=V1P5_SURF_OUTPUT_ONLY,
+        static_pickle="aurora-0.25-v1.5-static.pickle",
+        resolution=(721, 1440),
+        timestep_hours=6,
+    ),
+    "aurora-0.25-v1.5-ensemble": ModelVariantSpec(
+        name="aurora-0.25-v1.5-ensemble",
+        model_class="AuroraV1p5Ensemble",
+        checkpoint_filename="aurora-0.25-v1.5-ensemble.ckpt",
+        hf_repo="ikwessel/aurora-1.5",
+        use_lora=False,
+        strict_checkpoint=False,
+        surf_vars=V1P5_SURF,
+        static_vars=V1P5_STATIC,
+        atmos_vars=V1P5_ATMOS,
+        output_only_surf_vars=V1P5_SURF_OUTPUT_ONLY,
+        static_pickle="aurora-0.25-v1.5-static.pickle",
+        resolution=(721, 1440),
+        timestep_hours=6,
+    ),
 }
 
 SOURCES: dict[str, SourceProfile] = {
@@ -112,6 +147,14 @@ SOURCES: dict[str, SourceProfile] = {
         flip_lat=True,
         flip_lat_wave=False,
         raw_layout="mixed",
+    ),
+    "cds_era5_v1p5": SourceProfile(
+        name="cds_era5_v1p5",
+        schema="cds_era5_v1p5",
+        time_policy="first_two",
+        flip_lat=False,
+        static_source="hf_pickle",
+        raw_layout="netcdf",
     ),
 }
 
@@ -152,6 +195,25 @@ class PresetRegistry:
         self.register(
             "tc_tracking",
             EngineConfig(variant=VARIANTS["aurora-0.25-finetuned"], source=SOURCES["wb2_hres"]),
+        )
+        self.register(
+            "aurora_v1p5",
+            EngineConfig(
+                variant=VARIANTS["aurora-0.25-v1.5"],
+                source=SOURCES["cds_era5_v1p5"],
+                cuda_graph=False,
+                inference_precision=None,
+            ),
+        )
+        self.register(
+            "aurora_v1p5_ensemble",
+            EngineConfig(
+                variant=VARIANTS["aurora-0.25-v1.5-ensemble"],
+                source=SOURCES["cds_era5_v1p5"],
+                cuda_graph=False,
+                inference_precision=None,
+                hf_revision=V1P5_CHECKPOINT_REVISION,
+            ),
         )
 
     def register(self, name: str, config: EngineConfig) -> None:

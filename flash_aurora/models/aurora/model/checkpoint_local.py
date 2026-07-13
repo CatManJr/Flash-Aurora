@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from flash_aurora.aurora.model.aurora import Aurora
+    from flash_aurora.models.aurora.model.aurora import Aurora
 
 DEFAULT_CHECKPOINT_DIR = Path(
     os.environ.get("AURORA_ASSET_ROOT", os.environ.get("AURORA_HF_LOCAL_DIR", ""))

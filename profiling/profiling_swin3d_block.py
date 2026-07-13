@@ -36,8 +36,8 @@ from profiling_swin3d import (
     _shorten,
     _top_ops_ms,
 )
-from flash_aurora.aurora.model.cuda_graph import CudaGraphSwin3DBlockRunner
-from flash_aurora.aurora.model.inference_precision import apply_inference_config
+from flash_aurora.models.aurora.model.cuda_graph import CudaGraphSwin3DBlockRunner
+from flash_aurora.models.inference_precision import apply_inference_config
 
 
 _MATRIX_CONFIGS = [
@@ -96,7 +96,7 @@ def _measure_block_stages(
     import torch
     import torch.nn.functional as F
 
-    from flash_aurora.aurora.model.swin3d import (
+    from flash_aurora.models.aurora.model.swin3d import (
         compute_3d_shifted_window_mask,
         crop_3d,
         maybe_adjust_windows,
@@ -136,7 +136,7 @@ def _measure_block_stages(
                 attn_mask = None
 
             if block.use_triton_layout:
-                from flash_aurora.aurora.ops.triton_swin3d_layout import (
+                from flash_aurora.models.ops.triton_swin3d_layout import (
                     crop_roll_unmerge_windows_triton,
                     roll_pad_partition_windows_triton,
                 )
@@ -208,7 +208,7 @@ def _measure_block_stages(
 
             def _attention():
                 if use_cute_qkvpacked:
-                    from flash_aurora.aurora.ops.cute import window_attn_fwd_cute_qkvpacked
+                    from flash_aurora.models.ops.cute import window_attn_fwd_cute_qkvpacked
 
                     bias = None if attn_mask is None else attn_mask.to(dtype=torch.float32, device=qkv.device)
                     if bias is not None and not bias.is_contiguous():
@@ -217,7 +217,7 @@ def _measure_block_stages(
                         qkv, attn.num_heads, bias=bias, output_layout="bnc"
                     )
                 if use_cute:
-                    from flash_aurora.aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+                    from flash_aurora.models.ops.cute import WinAttnPrecision, window_attn_fwd_cute
 
                     precision = (
                         WinAttnPrecision.BF16_MIXED
@@ -502,7 +502,7 @@ def main() -> None:
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from flash_aurora.aurora.model.swin3d import Swin3DTransformerBlock
+    from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBlock
 
     p = argparse.ArgumentParser(
         description="Profile one Swin3DTransformerBlock (isolate block-level bottlenecks).",

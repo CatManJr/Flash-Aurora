@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 
 from flash_aurora.engine.core.trusted_pickle import load_trusted_pickle, resolve_trusted_path
 from flash_aurora.engine.core.netcdf_codec import read_batch_netcdf

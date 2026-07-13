@@ -148,13 +148,13 @@ class DataDownloader:
         )
         if prompt:
             source_name = self.config.source.name
-            if source_name in {"cds_era5", "wb2_hres"} and creds.cds_settings() is None:
+            if source_name in {"cds_era5", "cds_era5_v1p5", "wb2_hres"} and creds.cds_settings() is None:
                 creds = prompt_cds_credentials(creds)
             elif source_name == "cams" and creds.ads_settings() is None:
                 creds = prompt_ads_credentials(creds)
             elif source_name == "wb2_wam" and creds.ecmwf_settings() is None:
                 creds = prompt_ecmwf_credentials(creds)
-        if self.config.source.name in {"cds_era5", "wb2_hres"} and creds.cds_settings() is None:
+        if self.config.source.name in {"cds_era5", "cds_era5_v1p5", "wb2_hres"} and creds.cds_settings() is None:
             from flash_aurora.engine.ingress.download.cds import CdsConfigError
 
             raise CdsConfigError(

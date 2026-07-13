@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flash_aurora.aurora.model.custom_op_paths import (
+from flash_aurora.models.aurora.model.custom_op_paths import (
     align_binary_activations,
     can_use_cute_qkvpacked,
     can_use_triton_adaln,
@@ -37,7 +37,7 @@ def test_can_use_cute_qkvpacked_under_autocast() -> None:
 
 
 def test_prepare_backbone_input_casts_to_bf16() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import prepare_backbone_input
+    from flash_aurora.models.aurora.model.custom_op_paths import prepare_backbone_input
 
     x = torch.randn(2, 8, 16, device="cuda", dtype=torch.float32)
     y = prepare_backbone_input(x, torch.bfloat16)
@@ -56,8 +56,8 @@ def test_can_use_triton_adaln_requires_fp32() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_backbone_bf16_hybrid_routing() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import backbone_matmul_context
-    from flash_aurora.aurora.model.swin3d import MLP
+    from flash_aurora.models.aurora.model.custom_op_paths import backbone_matmul_context
+    from flash_aurora.models.aurora.model.swin3d import MLP
 
     with torch.inference_mode():
         with backbone_matmul_context(tf32=True, bf16=True):
@@ -70,8 +70,8 @@ def test_backbone_bf16_hybrid_routing() -> None:
 
 
 def test_backbone_bf16_routing() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import backbone_matmul_context
-    from flash_aurora.aurora.model.swin3d import MLP
+    from flash_aurora.models.aurora.model.custom_op_paths import backbone_matmul_context
+    from flash_aurora.models.aurora.model.swin3d import MLP
 
     with torch.inference_mode():
         with backbone_matmul_context(tf32=False, bf16=True):
@@ -85,7 +85,7 @@ def test_backbone_bf16_routing() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cast_activation_dtype_is_noop_when_matched() -> None:
-    from flash_aurora.aurora.model.custom_op_paths import cast_activation_dtype
+    from flash_aurora.models.aurora.model.custom_op_paths import cast_activation_dtype
 
     x = torch.randn(2, 8, device="cuda", dtype=torch.bfloat16)
     y = cast_activation_dtype(x, torch.bfloat16)

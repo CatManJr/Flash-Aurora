@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 from flash_aurora.engine.egress.export_options import ExportOptions
 from flash_aurora.engine.egress.mask import Mask
 from flash_aurora.engine.egress.roi_batch import RoiBatch

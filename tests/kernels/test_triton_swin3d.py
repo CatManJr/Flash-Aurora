@@ -7,21 +7,21 @@ from datetime import timedelta
 import pytest
 import torch
 
-from flash_aurora.aurora.model.film import AdaptiveLayerNorm
-from flash_aurora.aurora.model.swin3d import (
+from flash_aurora.models.aurora.model.film import AdaptiveLayerNorm
+from flash_aurora.models.aurora.model.swin3d import (
     Swin3DTransformerBackbone,
     crop_3d,
     pad_3d,
     window_partition_3d,
     window_reverse_3d,
 )
-from flash_aurora.aurora.model.util import maybe_adjust_windows
-from flash_aurora.aurora.ops.triton_adaln import (
+from flash_aurora.models.aurora.model.util import maybe_adjust_windows
+from flash_aurora.models.ops.triton_adaln import (
     adaptive_layernorm_film_add_residual_forward,
     adaptive_layernorm_film_forward,
 )
-from flash_aurora.aurora.ops.triton_gelu import gelu_forward_triton
-from flash_aurora.aurora.ops.triton_swin3d_layout import (
+from flash_aurora.models.ops.triton_gelu import gelu_forward_triton
+from flash_aurora.models.ops.triton_swin3d_layout import (
     crop_roll_unmerge_windows_triton,
     roll_pad_partition_windows_triton,
 )
@@ -197,7 +197,7 @@ def test_adaln_forward_add_residual_bf16_activation_output_fp32() -> None:
 
 @requires_cuda
 def test_adaln_fp32_out_op_matches_explicit_cast() -> None:
-    from flash_aurora.aurora.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
+    from flash_aurora.models.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
     torch.manual_seed(45)
     dim = 256
@@ -275,7 +275,7 @@ def test_adaln_forward_add_residual_large_d() -> None:
 @requires_cuda
 def test_swin3d_block_d2_matches_pytorch_adaln() -> None:
     """Block with Triton AdaLN + D2 residual fuse vs PyTorch AdaLN."""
-    from flash_aurora.aurora.model.swin3d import Swin3DTransformerBlock
+    from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBlock
 
     torch.manual_seed(43)
     dim, heads = 128, 4

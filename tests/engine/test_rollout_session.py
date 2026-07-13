@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from flash_aurora.aurora import AuroraSmallPretrained, rollout
+from flash_aurora.models.aurora import AuroraSmallPretrained, rollout
 
 from flash_aurora.engine.core.rollout_session import RolloutSession
 from tests.engine.helpers import assert_batches_close, smoke_batch

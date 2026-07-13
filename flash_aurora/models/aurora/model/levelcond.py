@@ -5,7 +5,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-from flash_aurora.aurora.normalisation import level_to_str
+from flash_aurora.models.aurora.normalisation import level_to_str
 
 __all__ = ["LevelConditioned"]
 

@@ -18,16 +18,16 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
 )
 
-from flash_aurora.aurora.batch import Batch, Metadata
-from flash_aurora.aurora.model.compat import (
+from flash_aurora.models.aurora.batch import Batch, Metadata
+from flash_aurora.models.aurora.model.compat import (
     _adapt_checkpoint_air_pollution,
     _adapt_checkpoint_pretrained,
     _adapt_checkpoint_wave,
 )
-from flash_aurora.aurora.model.checkpoint_local import load_aurora_checkpoint_prefer_local
-from flash_aurora.aurora.model.decoder import Perceiver3DDecoder
-from flash_aurora.aurora.model.encoder import Perceiver3DEncoder
-from flash_aurora.aurora.model.inference_precision import (
+from flash_aurora.models.aurora.model.checkpoint_local import load_aurora_checkpoint_prefer_local
+from flash_aurora.models.aurora.model.decoder import Perceiver3DDecoder
+from flash_aurora.models.aurora.model.encoder import Perceiver3DEncoder
+from flash_aurora.models.inference_precision import (
     AuroraInferenceConfig,
     AuroraInferencePrecision,
     BackboneMatmulLevel,
@@ -35,10 +35,10 @@ from flash_aurora.aurora.model.inference_precision import (
     apply_inference_config,
     resolve_inference_config,
 )
-from flash_aurora.aurora.model.nvtx import nvtx_range
-from flash_aurora.aurora.model.lora import LoRAMode
-from flash_aurora.aurora.model.swin3d import Swin3DTransformerBackbone
-from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
+from flash_aurora.models.aurora.model.nvtx import nvtx_range
+from flash_aurora.models.aurora.model.lora import LoRAMode
+from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBackbone
+from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 
 __all__ = [
     "Aurora",
@@ -268,11 +268,11 @@ class Aurora(torch.nn.Module):
             encoder_decoder_use_tensor_core = False
 
         if use_cute_window_attn:
-            from flash_aurora.aurora.ops.cute._arch_env import ensure_cute_dsl_arch
+            from flash_aurora.models.ops.cute._arch_env import ensure_cute_dsl_arch
 
             ensure_cute_dsl_arch()
 
-        from flash_aurora.aurora.model.custom_op_paths import backbone_dtype_from_name
+        from flash_aurora.models.aurora.model.custom_op_paths import backbone_dtype_from_name
 
         self.cute_window_attn_dtype = backbone_dtype_from_name(window_attn_compute_dtype_name)
 
@@ -455,7 +455,7 @@ class Aurora(torch.nn.Module):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA graph capture requires CUDA.")
 
-        from flash_aurora.aurora.model.cuda_graph import build_aurora_cuda_graph_runner
+        from flash_aurora.models.aurora.model.cuda_graph import build_aurora_cuda_graph_runner
 
         if scope is None:
             if self.inference_config is None:
@@ -470,7 +470,7 @@ class Aurora(torch.nn.Module):
 
         backbone_input = None
         if scope == "backbone":
-            from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+            from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
             with torch.inference_mode():
                 backbone_input = run_with_encoder_decoder_routing(
@@ -546,7 +546,7 @@ class Aurora(torch.nn.Module):
         rollout_step: int,
     ) -> torch.Tensor:
         """Run Swin3D backbone with preset-specific dtype routing (autocast or explicit BF16)."""
-        from flash_aurora.aurora.model.custom_op_paths import run_backbone_with_dtype_routing
+        from flash_aurora.models.aurora.model.custom_op_paths import run_backbone_with_dtype_routing
 
         backbone_compute_dtype = None
         backbone_matmul_bf16 = False
@@ -593,7 +593,7 @@ class Aurora(torch.nn.Module):
                     pred = runner(transformed_batch, rollout_step=rollout_step)
                     return self._finish_prediction(batch, pred)
             elif self._cuda_graph_scope == "backbone":
-                from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+                from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
                 with nvtx_range("aurora::encoder"):
                     with torch.inference_mode():
@@ -627,7 +627,7 @@ class Aurora(torch.nn.Module):
                         )
                 return self._finish_prediction(batch, pred)
 
-        from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+        from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
         with nvtx_range("aurora::encoder"):
             x = run_with_encoder_decoder_routing(
@@ -733,7 +733,7 @@ class Aurora(torch.nn.Module):
     ) -> str:
         """Load checkpoint from a local directory, falling back to Hub download.
 
-        Defaults to :data:`~flash_aurora.aurora.model.checkpoint_local.DEFAULT_CHECKPOINT_DIR`
+        Defaults to :data:`~flash_aurora.models.aurora.model.checkpoint_local.DEFAULT_CHECKPOINT_DIR`
         (from ``AURORA_ASSET_ROOT`` / ``AURORA_HF_LOCAL_DIR`` when set).
         """
         ckpt_path = load_aurora_checkpoint_prefer_local(

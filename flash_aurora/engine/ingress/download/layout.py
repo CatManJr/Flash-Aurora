@@ -11,6 +11,7 @@ GRIB_IFS_ATMOS_HOURS: tuple[int, ...] = (0, 6, 12, 18)
 
 SOURCE_CACHE_SUBDIRS: dict[str, str] = {
     "cds_era5": "era5",
+    "cds_era5_v1p5": "era5_v1p5",
     "wb2_hres": "hres_t0",
     "grib_ifs_0.1": "hres_0.1",
     "cams": "cams",
@@ -60,6 +61,13 @@ def expected_paths(source: SourceProfile, valid_time: datetime, cache_dir: Path)
     if source.name in {"cds_era5", "wb2_hres"}:
         return {
             "static": cache_dir / "static.nc",
+            "surface": cache_dir / f"{day}-surface-level.nc",
+            "atmospheric": cache_dir / f"{day}-atmospheric.nc",
+        }
+
+    if source.name == "cds_era5_v1p5":
+        # Extended Aurora 1.5 statics come from HF pickle via StaticFieldLoader.
+        return {
             "surface": cache_dir / f"{day}-surface-level.nc",
             "atmospheric": cache_dir / f"{day}-atmospheric.nc",
         }

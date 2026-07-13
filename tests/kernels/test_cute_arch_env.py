@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from flash_aurora.aurora.ops.cute._arch_env import (
+from flash_aurora.models.ops.cute._arch_env import (
     cute_dsl_arch_for_capability,
     detect_cute_dsl_arch,
     ensure_cute_dsl_arch,

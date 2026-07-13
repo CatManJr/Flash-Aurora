@@ -12,8 +12,8 @@ from datetime import timedelta
 import pytest
 import torch
 
-from flash_aurora.aurora.model.swin3d import Swin3DTransformerBackbone
-from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
+from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBackbone
+from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),

@@ -4,6 +4,7 @@ from flash_aurora.engine.core.config import SourceProfile
 from flash_aurora.engine.ingress.adapters.base import DataSourceAdapter, StubAdapter
 from flash_aurora.engine.ingress.adapters.cams import CamsAdapter
 from flash_aurora.engine.ingress.adapters.era5 import CdsEra5Adapter
+from flash_aurora.engine.ingress.adapters.era5_v1p5 import CdsEra5V1p5Adapter
 from flash_aurora.engine.ingress.adapters.hres_analysis import GribHresAnalysisAdapter
 from flash_aurora.engine.ingress.adapters.hres_t0 import Wb2HresT0Adapter
 from flash_aurora.engine.ingress.adapters.wave import Wb2WamWaveAdapter
@@ -13,6 +14,7 @@ class AdapterRegistry:
     def __init__(self) -> None:
         self._adapters: dict[str, DataSourceAdapter] = {
             "cds_era5": CdsEra5Adapter(),
+            "cds_era5_v1p5": CdsEra5V1p5Adapter(),
             "wb2_hres": Wb2HresT0Adapter(),
             "grib_ifs_0.1": GribHresAnalysisAdapter(),
             "cams": CamsAdapter(),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 
 from flash_aurora.engine.egress.crs import (
     BATCH_CRS,

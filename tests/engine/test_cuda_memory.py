@@ -37,7 +37,7 @@ def test_release_batch_gpu_storage() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    from flash_aurora.aurora.batch import Batch, Metadata
+    from flash_aurora.models.aurora.batch import Batch, Metadata
 
     batch = Batch(
         surf_vars={"2t": torch.zeros(1, 1, 32, 32, device="cuda")},

@@ -21,18 +21,18 @@ import torch.nn.functional as F
 from einops import rearrange
 from timm.layers import DropPath, to_3tuple
 
-from flash_aurora.aurora.model.custom_op_paths import (
+from flash_aurora.models.aurora.model.custom_op_paths import (
     can_use_cute_qkvpacked,
     can_use_cute_window_attention,
     can_use_triton_adaln,
     can_use_triton_gelu,
     can_use_triton_layout,
 )
-from flash_aurora.aurora.model.film import AdaptiveLayerNorm
-from flash_aurora.aurora.model.fourier import lead_time_expansion
-from flash_aurora.aurora.model.lora import LoRAMode, LoRARollout
-from flash_aurora.aurora.model.util import init_weights, maybe_adjust_windows
-from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
+from flash_aurora.models.aurora.model.film import AdaptiveLayerNorm
+from flash_aurora.models.aurora.model.fourier import lead_time_expansion
+from flash_aurora.models.aurora.model.lora import LoRAMode, LoRARollout
+from flash_aurora.models.aurora.model.util import init_weights, maybe_adjust_windows
+from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 
 __all__ = ["Swin3DTransformerBackbone", "InferenceWorkspacePool"]
 
@@ -72,7 +72,7 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
-        from flash_aurora.aurora.model.custom_op_paths import (
+        from flash_aurora.models.aurora.model.custom_op_paths import (
             backbone_bf16_hybrid_matmul_active,
             backbone_bf16_mlp_matmul_scope,
         )
@@ -94,7 +94,7 @@ class MLP(nn.Module):
             training=self.training,
             drop_p=self.drop.p,
         ):
-            from flash_aurora.aurora.ops.triton_gelu import gelu_forward_triton
+            from flash_aurora.models.ops.triton_gelu import gelu_forward_triton
 
             x = gelu_forward_triton(x)
         else:
@@ -268,7 +268,7 @@ class WindowAttention(nn.Module):
         Returns:
             torch.Tensor: Output of shape `(nW*B, N, C)`.
         """
-        from flash_aurora.aurora.model.custom_op_paths import (
+        from flash_aurora.models.aurora.model.custom_op_paths import (
             backbone_bf16_attention_matmul_scope,
             backbone_bf16_matmul_active,
             backbone_bf16_speed_stream_active,
@@ -324,7 +324,7 @@ class WindowAttention(nn.Module):
             attn_dropout=attn_dropout,
         )
         if use_cute_qkvpacked:
-            from flash_aurora.aurora.ops.cute import window_attn_fwd_cute_qkvpacked
+            from flash_aurora.models.ops.cute import window_attn_fwd_cute_qkvpacked
 
             if qkv.dtype != self.cute_window_attn_dtype:
                 qkv = qkv.to(dtype=self.cute_window_attn_dtype, non_blocking=True)
@@ -347,7 +347,7 @@ class WindowAttention(nn.Module):
             qkv = rearrange(qkv, "B N (qkv H D) -> qkv B H N D", H=self.num_heads, qkv=3)
             q, k, v = qkv[0], qkv[1], qkv[2]
             if use_cute:
-                from flash_aurora.aurora.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+                from flash_aurora.models.ops.cute import WinAttnPrecision, window_attn_fwd_cute
 
                 if self.cute_window_attn_dtype == torch.bfloat16 and q.dtype != torch.bfloat16:
                     q, k, v = (
@@ -741,7 +741,7 @@ class Swin3DTransformerBlock(nn.Module):
 
         use_triton = can_use_triton_layout(x_5d, enabled=self.use_triton_layout)
         if use_triton:
-            from flash_aurora.aurora.ops.triton_swin3d_layout import (
+            from flash_aurora.models.ops.triton_swin3d_layout import (
                 crop_roll_unmerge_windows_triton,
                 roll_pad_partition_windows_triton,
             )

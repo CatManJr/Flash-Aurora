@@ -2,7 +2,7 @@
 
 import os
 
-from flash_aurora.aurora._openmp_env import sanitize_openmp_env
+from flash_aurora.models.aurora._openmp_env import sanitize_openmp_env
 
 sanitize_openmp_env()
 
@@ -15,8 +15,8 @@ import pytest
 import torch
 from flash_aurora.hub import hf_hub_download
 
-from flash_aurora.aurora import Batch, Metadata
-from flash_aurora.aurora.batch import interpolate_numpy
+from flash_aurora.models.aurora import Batch, Metadata
+from flash_aurora.models.aurora.batch import interpolate_numpy
 
 
 class SavedMetadata(TypedDict):

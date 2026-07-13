@@ -4,7 +4,7 @@ from datetime import datetime
 
 import torch
 
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 
 
 def smoke_batch() -> Batch:

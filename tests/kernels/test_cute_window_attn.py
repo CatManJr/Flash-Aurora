@@ -26,7 +26,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flash_aurora.aurora.ops.cute.window_attn_fwd import (
+from flash_aurora.models.ops.cute.window_attn_fwd import (
     _CUTE_AVAILABLE,
     _expand_bias_for_sdpa,
     _choose_tile_n,

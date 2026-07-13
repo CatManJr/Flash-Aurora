@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import xarray as xr
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 
 from flash_aurora.engine.core.config import EngineConfig, STANDARD_STATIC
 from flash_aurora.engine.ingress.adapters.base import resolve_cache_dir

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import torch
-from flash_aurora.aurora import Batch
-from flash_aurora.aurora.model.aurora import Aurora
+from flash_aurora.models.aurora import Batch
+from flash_aurora.models.aurora.model.aurora import Aurora
 
 from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.runtime.cute_jit import (

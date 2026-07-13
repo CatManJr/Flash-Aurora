@@ -5,8 +5,8 @@ from __future__ import annotations
 import dataclasses
 
 import torch
-from flash_aurora.aurora import Batch
-from flash_aurora.aurora.model.aurora import Aurora
+from flash_aurora.models.aurora import Batch
+from flash_aurora.models.aurora.model.aurora import Aurora
 
 
 def prepare_rollout_batch(model: Aurora, batch: Batch) -> Batch:

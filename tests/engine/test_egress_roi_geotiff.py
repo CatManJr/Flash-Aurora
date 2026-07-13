@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 from flash_aurora.engine.egress.crs import BATCH_CRS, DEFAULT_EXPORT_CRS
 from flash_aurora.engine.egress.export_options import ExportOptions, RoiBounds, RoiGeoJson
 from flash_aurora.engine.egress.geotiff_codec import write_surface_geotiff

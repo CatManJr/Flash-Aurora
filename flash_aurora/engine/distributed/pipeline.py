@@ -5,8 +5,8 @@ import types
 from typing import Any
 
 import torch
-from flash_aurora.aurora import Batch
-from flash_aurora.aurora.model.aurora import Aurora
+from flash_aurora.models.aurora import Batch
+from flash_aurora.models.aurora.model.aurora import Aurora
 
 from flash_aurora.engine.distributed.config import ParallelPlan
 

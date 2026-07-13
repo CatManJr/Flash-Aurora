@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from flash_aurora.aurora import Batch
+from flash_aurora.models.aurora import Batch
 
 from flash_aurora.engine.core.config import ModelVariantSpec
 
@@ -40,7 +40,10 @@ class BatchValidator:
     ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
 
-        for name in variant.surf_vars:
+        required_surf = tuple(
+            name for name in variant.surf_vars if name not in variant.output_only_surf_vars
+        )
+        for name in required_surf:
             if name not in batch.surf_vars:
                 issues.append(ValidationIssue("surf_vars", f"missing {name}"))
         for name in variant.static_vars:

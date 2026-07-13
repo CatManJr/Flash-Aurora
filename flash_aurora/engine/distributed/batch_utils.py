@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 
 import torch
-from flash_aurora.aurora import Batch
+from flash_aurora.models.aurora import Batch
 
 
 def batch_to_device(batch: Batch, device: torch.device | str) -> Batch:

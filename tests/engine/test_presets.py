@@ -16,7 +16,17 @@ def test_presets_use_relative_asset_names() -> None:
         variant = config.variant
         assert not variant.checkpoint_filename.startswith("/")
         assert not variant.static_pickle.startswith("/")
-        assert variant.hf_repo == "microsoft/aurora"
+        if name == "aurora_v1p5":
+            assert variant.hf_repo == "ikwessel/aurora-1.5"
+        elif name == "aurora_v1p5_ensemble":
+            assert variant.hf_repo == "ikwessel/aurora-1.5"
+        else:
+            assert variant.hf_repo == "microsoft/aurora"
+
+
+def test_aurora_v1p5_preset_present() -> None:
+    assert "aurora_v1p5" in DEFAULT_PRESETS.names()
+    assert "aurora_v1p5_ensemble" in DEFAULT_PRESETS.names()
 
 
 def test_get_returns_copy() -> None:

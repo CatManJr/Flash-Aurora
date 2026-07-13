@@ -11,11 +11,11 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from flash_aurora.aurora.batch import Batch, Metadata
-from flash_aurora.aurora.model.fourier import levels_expansion
-from flash_aurora.aurora.model.levelcond import LevelConditioned
-from flash_aurora.aurora.model.perceiver import PerceiverResampler
-from flash_aurora.aurora.model.util import (
+from flash_aurora.models.aurora.batch import Batch, Metadata
+from flash_aurora.models.aurora.model.fourier import levels_expansion
+from flash_aurora.models.aurora.model.levelcond import LevelConditioned
+from flash_aurora.models.aurora.model.perceiver import PerceiverResampler
+from flash_aurora.models.aurora.model.util import (
     check_lat_lon_dtype,
     init_weights,
     unpatchify,
@@ -167,7 +167,7 @@ class Perceiver3DDecoder(nn.Module):
         ):
             return self._cached_levels_embed
 
-        from flash_aurora.aurora.model.inference_tensors import cached_constant_tensor
+        from flash_aurora.models.aurora.model.inference_tensors import cached_constant_tensor
 
         atmos_levels_encode = levels_expansion(
             cached_constant_tensor(atmos_levels, device=device, dtype=torch.float32),

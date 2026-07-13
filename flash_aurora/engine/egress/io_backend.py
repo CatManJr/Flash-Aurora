@@ -12,7 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from flash_aurora.aurora import Batch
+from flash_aurora.models.aurora import Batch
 
 from flash_aurora.engine.egress.naming import PredictionNaming
 from flash_aurora.engine.egress.offload import owned_cpu_copy

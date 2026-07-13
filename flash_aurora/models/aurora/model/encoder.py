@@ -12,19 +12,19 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from flash_aurora.aurora.batch import Batch
-from flash_aurora.aurora.model.fourier import (
+from flash_aurora.models.aurora.batch import Batch
+from flash_aurora.models.aurora.model.fourier import (
     absolute_time_expansion,
     lead_time_expansion,
     levels_expansion,
     pos_expansion,
     scale_expansion,
 )
-from flash_aurora.aurora.model.levelcond import LevelConditioned
-from flash_aurora.aurora.model.patchembed import LevelPatchEmbed
-from flash_aurora.aurora.model.perceiver import MLP, PerceiverResampler
-from flash_aurora.aurora.model.posencoding import pos_scale_enc
-from flash_aurora.aurora.model.util import (
+from flash_aurora.models.aurora.model.levelcond import LevelConditioned
+from flash_aurora.models.aurora.model.patchembed import LevelPatchEmbed
+from flash_aurora.models.aurora.model.perceiver import MLP, PerceiverResampler
+from flash_aurora.models.aurora.model.posencoding import pos_scale_enc
+from flash_aurora.models.aurora.model.util import (
     check_lat_lon_dtype,
     init_weights,
 )
@@ -328,7 +328,7 @@ class Perceiver3DEncoder(nn.Module):
         x_surf = x_surf + self.surf_norm(self.surf_mlp(x_surf))
 
         # Add atmospheric pressure encoding of shape (C_A, D) and subsequent embedding.
-        from flash_aurora.aurora.model.inference_tensors import cached_constant_tensor
+        from flash_aurora.models.aurora.model.inference_tensors import cached_constant_tensor
 
         atmos_levels_tensor = cached_constant_tensor(
             atmos_levels,
@@ -370,7 +370,7 @@ class Perceiver3DEncoder(nn.Module):
         x = x + lead_time_emb.unsqueeze(1)  # (B, L', D) + (B, 1, D)
 
         # Add absolute time embedding.
-        from flash_aurora.aurora.model.inference_tensors import cached_absolute_hours_tensor
+        from flash_aurora.models.aurora.model.inference_tensors import cached_absolute_hours_tensor
 
         absolute_times = cached_absolute_hours_tensor(
             batch.metadata.time,

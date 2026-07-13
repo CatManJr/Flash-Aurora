@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 from flash_aurora.engine.core.netcdf_codec import read_batch_netcdf, write_batch_netcdf
 
 

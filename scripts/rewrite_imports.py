@@ -11,10 +11,10 @@ SKIP_DIRS = {".git", ".venv", "cutlass", "__pycache__", "node_modules", ".pytest
 
 # Order matters: longer / more specific patterns first.
 REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bfrom aurora\."), "from flash_aurora.aurora."),
-    (re.compile(r"\bfrom aurora import\b"), "from flash_aurora.aurora import"),
-    (re.compile(r"\bimport aurora\b"), "import flash_aurora.aurora as aurora"),
-    (re.compile(r"\bimport aurora\."), "import flash_aurora.aurora."),
+    (re.compile(r"\bfrom aurora\."), "from flash_aurora.models.aurora."),
+    (re.compile(r"\bfrom aurora import\b"), "from flash_aurora.models.aurora import"),
+    (re.compile(r"\bimport aurora\b"), "import flash_aurora.models.aurora as aurora"),
+    (re.compile(r"\bimport aurora\."), "import flash_aurora.models.aurora."),
     (re.compile(r"\bfrom engine\."), "from flash_aurora.engine."),
     (re.compile(r"\bfrom engine import\b"), "from flash_aurora.engine import"),
     (re.compile(r"\bimport engine\."), "import flash_aurora.engine."),

@@ -6,7 +6,7 @@ with the published versions of the model. You can safely ignore all of this.
 
 import torch
 
-from flash_aurora.aurora.normalisation import level_to_str
+from flash_aurora.models.aurora.normalisation import level_to_str
 
 __all__ = [
     "_adapt_checkpoint_pretrained",

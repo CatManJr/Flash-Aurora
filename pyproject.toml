@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "High-performance Aurora inference (model + engine)"
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE", "flash_aurora/LICENSE", "flash_aurora/aurora/LICENSE.txt"]
+license-files = [
+    "LICENSE",
+    "flash_aurora/LICENSE",
+    "flash_aurora/models/aurora/LICENSE.txt",
+    "flash_aurora/models/aurora_v1p5/LICENSE.txt",
+]
 requires-python = ">=3.12, <3.14"
 dependencies = [
     "einops>=0.8.2",
@@ -50,8 +55,10 @@ packages = ["flash_aurora"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "flash_aurora/LICENSE" = "flash_aurora/LICENSE"
-"flash_aurora/aurora/LICENSE.txt" = "flash_aurora/aurora/LICENSE.txt"
-"flash_aurora/aurora/NOTICE.md" = "flash_aurora/aurora/NOTICE.md"
+"flash_aurora/models/aurora/LICENSE.txt" = "flash_aurora/models/aurora/LICENSE.txt"
+"flash_aurora/models/aurora/NOTICE.md" = "flash_aurora/models/aurora/NOTICE.md"
+"flash_aurora/models/aurora_v1p5/LICENSE.txt" = "flash_aurora/models/aurora_v1p5/LICENSE.txt"
+"flash_aurora/models/aurora_v1p5/NOTICE.md" = "flash_aurora/models/aurora_v1p5/NOTICE.md"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

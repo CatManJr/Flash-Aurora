@@ -6,8 +6,8 @@ from collections.abc import Callable, Generator
 from typing import TYPE_CHECKING
 
 import torch
-from flash_aurora.aurora.batch import Batch
-from flash_aurora.aurora.rollout import advance_rollout_batch, prepare_rollout_batch
+from flash_aurora.models.aurora.batch import Batch
+from flash_aurora.models.aurora.rollout import advance_rollout_batch, prepare_rollout_batch
 
 from flash_aurora.engine.distributed.batch_utils import batch_to_device
 from flash_aurora.engine.runtime.cuda_memory import (
@@ -18,7 +18,7 @@ from flash_aurora.engine.runtime.cuda_memory import (
 from flash_aurora.engine.distributed.pipeline import parallel_plan
 
 if TYPE_CHECKING:
-    from flash_aurora.aurora.model.aurora import Aurora
+    from flash_aurora.models.aurora.model.aurora import Aurora
 
 
 def run_encoder_stage(model: Aurora, batch: Batch) -> tuple[Batch, torch.Tensor, tuple[int, int, int]]:
@@ -27,7 +27,7 @@ def run_encoder_stage(model: Aurora, batch: Batch) -> tuple[Batch, torch.Tensor,
         raise RuntimeError("model is not pipeline-parallel")
 
     enc_dev = torch.device(plan.encoder_device)
-    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+    from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
     batch = batch_to_device(batch, enc_dev)
     batch, transformed_batch, patch_res = model._prepare_encoder_batch(batch)
@@ -84,7 +84,7 @@ def run_decoder_stage(
     bb_dev = torch.device(plan.backbone_device)
     dec_dev = torch.device(plan.decoder_device)
 
-    from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+    from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
     with torch.inference_mode():
         if plan.decoder_spatial_parallel:

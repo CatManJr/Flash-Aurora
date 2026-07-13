@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 from tests.aurora.conftest import SavedBatch
 
-from flash_aurora.aurora import Aurora, AuroraSmallPretrained, Batch
+from flash_aurora.models.aurora import Aurora, AuroraSmallPretrained, Batch
 
 
 @pytest.fixture(scope="session")

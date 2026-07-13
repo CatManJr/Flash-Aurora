@@ -63,7 +63,7 @@ class _Swin3DBlockTraceWrapper(torch.nn.Module):
 def main() -> None:
     import torch
 
-    from flash_aurora.aurora.model.swin3d import Swin3DTransformerBlock
+    from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBlock
 
     p = argparse.ArgumentParser(description="Export Swin3DTransformerBlock computation graph (JIT / export).")
     p.add_argument("--preset", choices=("small", "aurora", "none"), default="small")

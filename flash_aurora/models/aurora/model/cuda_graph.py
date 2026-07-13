@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from flash_aurora.aurora.batch import Batch
+from flash_aurora.models.aurora.batch import Batch
 
 
 def _batch_tensor_shapes(batch: Batch) -> dict[str, tuple[int, ...]]:
@@ -175,7 +175,7 @@ class CudaGraphAuroraBackboneRunner:
             self.static_out = self._forward_static()
 
     def _forward_static(self) -> torch.Tensor:
-        from flash_aurora.aurora.model.custom_op_paths import run_backbone_with_dtype_routing
+        from flash_aurora.models.aurora.model.custom_op_paths import run_backbone_with_dtype_routing
 
         with torch.inference_mode():
             return run_backbone_with_dtype_routing(
@@ -257,7 +257,7 @@ class CudaGraphAuroraGpuRunner:
             self.static_pred = self._forward_static()
 
     def _forward_static(self) -> Batch:
-        from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+        from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
         with torch.inference_mode():
             x = run_with_encoder_decoder_routing(

@@ -70,7 +70,7 @@ layernorm_affine_add_residual_forward = None
 try:
     import triton  # noqa: F401
 
-    from flash_aurora.aurora.ops.triton_perceiver_ln import (
+    from flash_aurora.models.ops.triton_perceiver_ln import (
         layernorm_affine_add_residual_forward as _ln_add,
         layernorm_affine_forward as _ln_only,
     )

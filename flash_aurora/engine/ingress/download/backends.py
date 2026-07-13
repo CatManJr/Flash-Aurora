@@ -64,6 +64,22 @@ class CdsEra5Backend:
         return _partition(keys, before, expected)
 
 
+class CdsEra5V1p5Backend:
+    def ensure(
+        self,
+        source: SourceProfile,
+        valid_time: datetime,
+        cache_dir: Path,
+        *,
+        workers: int = 1,
+    ) -> DownloadOutcome:
+        day = layout.day_token(valid_time)
+        keys, before = _keys_and_before(source, valid_time, cache_dir)
+        cds.download_era5_v1p5_day(cache_dir, day, workers=workers)
+        expected = layout.expected_paths(source, valid_time, cache_dir)
+        return _partition(keys, before, expected)
+
+
 class Wb2HresBackend:
     def ensure(
         self,
@@ -171,6 +187,7 @@ class UnsupportedBackend:
 
 DEFAULT_BACKENDS: dict[str, DownloadBackend] = {
     "cds_era5": CdsEra5Backend(),
+    "cds_era5_v1p5": CdsEra5V1p5Backend(),
     "wb2_hres": Wb2HresBackend(),
     "wb2_wam": Wb2WamBackend(),
     "cams": CamsBackend(),

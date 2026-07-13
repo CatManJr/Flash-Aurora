@@ -1,0 +1,6 @@
+"""Compatibility shim. Prefer ``flash_aurora.models.ops``."""
+
+from __future__ import annotations
+
+from flash_aurora.models.ops import *  # noqa: F403
+from flash_aurora.models.ops import __all__ as __all__  # noqa: F401

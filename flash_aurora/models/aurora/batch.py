@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from scipy.interpolate import RegularGridInterpolator as RGI
 
-from flash_aurora.aurora.normalisation import (
+from flash_aurora.models.aurora.normalisation import (
     normalise_atmos_var,
     normalise_surf_var,
     unnormalise_atmos_var,

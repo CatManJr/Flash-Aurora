@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterator, TypeVar
 
 import torch
 
-from flash_aurora.aurora.model.inference_precision import BackboneComputeDtype
+from flash_aurora.models.inference_precision import BackboneComputeDtype
 
 _TRITON_ELEM_DTYPES = frozenset({torch.float32, torch.bfloat16})
 

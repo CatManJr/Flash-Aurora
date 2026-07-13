@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import xarray as xr
 
-from flash_aurora.aurora import Batch, Metadata
+from flash_aurora.models.aurora import Batch, Metadata
 
 # Engine egress (Batch round-trip) uses NetCDF3 via scipy for broad compatibility.
 NETCDF_ENGINE = "scipy"

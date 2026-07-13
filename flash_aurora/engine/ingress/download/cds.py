@@ -122,6 +122,54 @@ def download_era5_surface(cache_dir: Path | str, day: str) -> Path:
     return target
 
 
+ERA5_V1P5_SURFACE_VARS: tuple[str, ...] = (
+    "2m_temperature",
+    "10m_u_component_of_wind",
+    "10m_v_component_of_wind",
+    "mean_sea_level_pressure",
+    "2m_dewpoint_temperature",
+    "total_column_water_vapour",
+    "total_cloud_cover",
+    "100m_u_component_of_wind",
+    "100m_v_component_of_wind",
+    "surface_pressure",
+    "low_cloud_cover",
+    "medium_cloud_cover",
+    "high_cloud_cover",
+    "skin_temperature",
+    "soil_temperature_level_1",
+    "volumetric_soil_water_layer_1",
+    "sea_ice_cover",
+    "snow_depth",
+)
+
+
+def download_era5_v1p5_surface(cache_dir: Path | str, day: str) -> Path:
+    """Download the extended single-level set required by Aurora 1.5 (upstream tutorial)."""
+    target = normalize_path(cache_dir) / f"{day}-surface-level.nc"
+    if target.is_file():
+        return target
+
+    year, month, dd = day.split("-")
+    ensure_directory(target.parent)
+    client = cds_client()
+    _cds_retrieve(
+        client,
+        "reanalysis-era5-single-levels",
+        {
+            "product_type": "reanalysis",
+            "variable": list(ERA5_V1P5_SURFACE_VARS),
+            "year": year,
+            "month": month,
+            "day": dd,
+            "time": ["00:00", "06:00", "12:00", "18:00"],
+            "format": "netcdf",
+        },
+        str(target),
+    )
+    return target
+
+
 def download_era5_atmospheric(cache_dir: Path | str, day: str) -> Path:
     target = normalize_path(cache_dir) / f"{day}-atmospheric.nc"
     if target.is_file():
@@ -169,4 +217,20 @@ def download_era5_day(
     tasks.append(("atmospheric", lambda: download_era5_atmospheric(cache_dir, day)))
 
     results = run_labeled_tasks(tasks, workers=workers, description="CDS ERA5")
+    return {key: results[key] for key, _ in tasks}
+
+
+def download_era5_v1p5_day(
+    cache_dir: Path | str,
+    day: str,
+    *,
+    workers: int = 1,
+) -> dict[str, Path]:
+    """ERA5 meteorology for Aurora 1.5. Static vars come from the HF pickle, not CDS."""
+    cache_dir = normalize_path(cache_dir)
+    tasks: list[tuple[str, Callable[[], Path]]] = [
+        ("surface", lambda: download_era5_v1p5_surface(cache_dir, day)),
+        ("atmospheric", lambda: download_era5_atmospheric(cache_dir, day)),
+    ]
+    results = run_labeled_tasks(tasks, workers=workers, description="CDS ERA5 V1p5")
     return {key: results[key] for key, _ in tasks}

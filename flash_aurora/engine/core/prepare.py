@@ -7,8 +7,8 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-from flash_aurora.aurora import Batch
-from flash_aurora.aurora.model.aurora import Aurora
+from flash_aurora.models.aurora import Batch
+from flash_aurora.models.aurora.model.aurora import Aurora
 
 
 @dataclass(frozen=True)

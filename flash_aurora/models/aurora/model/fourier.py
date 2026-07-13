@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from flash_aurora.aurora.area import area, radius_earth
+from flash_aurora.models.aurora.area import area, radius_earth
 
 __all__ = [
     "FourierExpansion",

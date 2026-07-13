@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from flash_aurora.aurora.batch import interpolate_numpy
+from flash_aurora.models.aurora.batch import interpolate_numpy
 
 from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.core.paths import AssetStore

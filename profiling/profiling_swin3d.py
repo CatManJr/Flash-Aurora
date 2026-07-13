@@ -235,7 +235,7 @@ def _randomize_lora_weights(backbone: Any, *, seed: int) -> None:
     import torch
     import torch.nn as nn
 
-    from flash_aurora.aurora.model.lora import LoRARollout
+    from flash_aurora.models.aurora.model.lora import LoRARollout
 
     torch.manual_seed(seed)
     for m in backbone.modules():
@@ -295,8 +295,8 @@ def _run_profile_once(
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from flash_aurora.aurora.model.swin3d import Swin3DTransformerBackbone
-    from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
+    from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBackbone
+    from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 
     _cuda_reset_before_run(args)
 
@@ -519,7 +519,7 @@ def _build_shared_init_state_dict(args: argparse.Namespace) -> dict[str, Any]:
     """Build one reference state dict for fair A/B/C compare."""
     import torch
 
-    from flash_aurora.aurora.model.swin3d import Swin3DTransformerBackbone
+    from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBackbone
 
     if getattr(args, "randomize_lora", False):
         torch.manual_seed(int(getattr(args, "lora_random_seed", 0)))
@@ -1023,7 +1023,7 @@ def main() -> None:
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from flash_aurora.aurora.model.swin3d import Swin3DTransformerBackbone
+    from flash_aurora.models.aurora.model.swin3d import Swin3DTransformerBackbone
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("CUDA required unless --device cpu.")

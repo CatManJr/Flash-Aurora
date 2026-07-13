@@ -11,7 +11,7 @@ import torch.nn as nn
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_layernorm_affine_matches_module(dtype: torch.dtype) -> None:
     pytest.importorskip("triton")
-    from flash_aurora.aurora.ops.triton_perceiver_ln import layernorm_affine_forward
+    from flash_aurora.models.ops.triton_perceiver_ln import layernorm_affine_forward
 
     B, L, D = 2, 31, 256
     x = torch.randn(B, L, D, device="cuda", dtype=dtype)
@@ -26,7 +26,7 @@ def test_layernorm_affine_matches_module(dtype: torch.dtype) -> None:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_layernorm_affine_add_residual_matches_torch(dtype: torch.dtype) -> None:
     pytest.importorskip("triton")
-    from flash_aurora.aurora.ops.triton_perceiver_ln import layernorm_affine_add_residual_forward
+    from flash_aurora.models.ops.triton_perceiver_ln import layernorm_affine_add_residual_forward
 
     B, L, D = 2, 31, 256
     x = torch.randn(B, L, D, device="cuda", dtype=dtype)
@@ -41,7 +41,7 @@ def test_layernorm_affine_add_residual_matches_torch(dtype: torch.dtype) -> None
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_perceiver_resampler_fused_matches_eager_bf16() -> None:
     pytest.importorskip("triton")
-    from flash_aurora.aurora.model.perceiver import PerceiverResampler
+    from flash_aurora.models.aurora.model.perceiver import PerceiverResampler
 
     B, Lq, Lk, D = 2, 8, 64, 128
     eager = PerceiverResampler(

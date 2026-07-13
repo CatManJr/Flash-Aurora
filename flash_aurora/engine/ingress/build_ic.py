@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from flash_aurora.aurora import Batch
+from flash_aurora.models.aurora import Batch
 
 from flash_aurora.engine.core.config import EngineConfig
 from flash_aurora.engine.core.paths import AssetStore

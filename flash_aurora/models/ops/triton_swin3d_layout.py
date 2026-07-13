@@ -20,8 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
-from flash_aurora.aurora.model.util import maybe_adjust_windows
-from flash_aurora.aurora.model.workspace_pool import InferenceWorkspacePool
+from flash_aurora.models.aurora.model.util import maybe_adjust_windows
+from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 
 
 def _get_two_sided_padding(H_padding: int, W_padding: int) -> tuple[int, int, int, int]:

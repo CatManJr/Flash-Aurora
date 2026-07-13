@@ -10,7 +10,7 @@ FP32 (strict / TF32) is delegated to torch SDPA or PyTorch fallbacks.
 See submodules for flash-attn / CUTLASS reference notes.
 """
 
-from flash_aurora.aurora.ops.cute.window_attn_fwd import (
+from flash_aurora.models.ops.cute.window_attn_fwd import (
     _CUTE_KERNEL_VERSION,
     WinAttnPrecision,
     window_attn_dispatch,

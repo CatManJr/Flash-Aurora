@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import torch
 
-from flash_aurora.aurora import AuroraSmallPretrained, Batch, Metadata, rollout
+from flash_aurora.models.aurora import AuroraSmallPretrained, Batch, Metadata, rollout
 
 
 def test_rollout():

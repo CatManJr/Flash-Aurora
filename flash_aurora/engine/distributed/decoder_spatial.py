@@ -9,14 +9,14 @@ from typing import TYPE_CHECKING
 
 import torch
 from einops import rearrange
-from flash_aurora.aurora.batch import Batch, Metadata
+from flash_aurora.models.aurora.batch import Batch, Metadata
 
-from flash_aurora.aurora.model.util import check_lat_lon_dtype, unpatchify
+from flash_aurora.models.aurora.model.util import check_lat_lon_dtype, unpatchify
 from flash_aurora.engine.runtime.cuda_memory import release_tensor_storage, trim_cuda_cache
 
 if TYPE_CHECKING:
-    from flash_aurora.aurora.model.aurora import Aurora
-    from flash_aurora.aurora.model.decoder import Perceiver3DDecoder
+    from flash_aurora.models.aurora.model.aurora import Aurora
+    from flash_aurora.models.aurora.model.decoder import Perceiver3DDecoder
 
 _DECODER_SPATIAL_REPLICA_ATTR = "_flash_aurora_decoder_spatial_replica"
 
@@ -112,7 +112,7 @@ def _forward_decoder_slice(
     autocast_bf16: bool,
     use_tensor_core: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from flash_aurora.aurora.model.custom_op_paths import (
+    from flash_aurora.models.aurora.model.custom_op_paths import (
         backbone_tf32_matmul_context,
         encoder_decoder_autocast,
     )
@@ -198,7 +198,7 @@ def forward_decoder_spatial_parallel(
 
     west_dev, east_dev = spatial_devices
     if west_dev == east_dev:
-        from flash_aurora.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+        from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
         with _device_context(east_dev):
             with torch.inference_mode():

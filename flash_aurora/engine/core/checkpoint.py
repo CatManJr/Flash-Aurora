@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from flash_aurora.aurora.model.aurora import Aurora
-
 from flash_aurora.engine.core.config import EngineConfig
+from flash_aurora.engine.core.model_protocol import AuroraModel, is_v1p5_model_class
 from flash_aurora.engine.core.model_registry import ModelFactory
 from flash_aurora.engine.core.paths import AssetStore, normalize_asset_path
 from flash_aurora.engine.core.redaction import redact_text, safe_path
@@ -15,7 +14,7 @@ class CheckpointLoader:
         self._config = config
         self._assets = AssetStore(root=config.asset_root)
 
-    def load(self, model: Aurora) -> Path:
+    def load(self, model: AuroraModel) -> Path:
         variant = self._config.variant
         hub = self._config.hub_download_options()
         explicit = self._config.checkpoint_path
@@ -43,17 +42,24 @@ class CheckpointLoader:
         model.load_checkpoint_local(str(path), strict=variant.strict_checkpoint)
         return path
 
-    def build_model(self) -> Aurora:
+    def build_model(self) -> AuroraModel:
         variant = self._config.variant
         model_kwargs: dict[str, object] = {}
-        if self._config.inference_precision is not None:
+        if (
+            self._config.inference_precision is not None
+            and not is_v1p5_model_class(variant.model_class)
+        ):
             model_kwargs["inference_precision"] = self._config.inference_precision
+
+        create_kwargs: dict[str, object] = dict(model_kwargs)
+        if not is_v1p5_model_class(variant.model_class):
+            create_kwargs["use_lora_merged_inference"] = variant.use_lora
+
         model = ModelFactory.create(
             variant.model_class,
             use_lora=variant.use_lora,
             lora_mode=variant.lora_mode,
-            use_lora_merged_inference=variant.use_lora,
-            **model_kwargs,
+            **create_kwargs,
         )
         model.eval()
         return model
