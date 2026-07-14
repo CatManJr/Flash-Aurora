@@ -43,7 +43,7 @@ Attention $Q$, $K$, and $V$ use layout $(B, H, N, D_h)$, where $B = B_{\mathrm{b
   <img src="docs/image/window_attn_cute_vs_sdpa_blackwell.svg" alt="CuTe DSL BF16 and TF32 window attention vs PyTorch SDPA on Blackwell, unmasked and masked" width="95%"/>
 </p>
 
-*Measured on RTX PRO 6000 Blackwell (`sm_120a`). X-axis labels are $Q/K/V$ shapes $(B, H, N, D_h)$. Masked bars apply Swin shifted-window bias $-100$.*
+Measured on RTX PRO 6000 Blackwell (`sm_120a`). X-axis labels are $Q/K/V$ shapes $(B, H, N, D_h)$. Masked bars apply Swin shifted-window bias $-100$.
 
 ### Mixed-precision inference
 
