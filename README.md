@@ -6,6 +6,7 @@ Companion documents:
 
 - [docs/tutorial.md](docs/tutorial.md): install steps, Engine and scheduler API examples, notebook index.
 - [docs/benchmarks.md](docs/benchmarks.md): full latency, numerical-error, window-attention, and multi-GPU rollout tables.
+- [Examples](#examples): linked walkthrough notebooks for each preset, ROI export, and the ZMQ scheduler.
 
 ## Highlights
 
@@ -96,6 +97,10 @@ Left: one job per worker and preset. Right: faster workers take follow-up jobs w
   </tr>
 </table>
 
+### Batched ROI mask export
+
+In practice, application users rarely need a full global field after inference (the same pattern as clipping and exporting AOIs in Google Earth Engine). Shipping every grid cell through egress is wasteful: the dominant costs are GPU-to-CPU transfer and CPU-to-disk write for large NetCDF/GeoTIFF volumes. Flash-Aurora therefore clips on the egress path. `RoiBatch` exports several named masks from one rollout step with a *ingle GPU-to-CPU copy, then applies each mask and writes only the regional product (GeoTIFF recommended; NetCDF also supported) without re-running inference. That cuts both host memory traffic and on-disk footprint relative to a global dump. Masks come from axis-aligned bounds, GeoJSON, shapefile, or georeferenced raster; GeoTIFF defaults to Web Mercator (EPSG:3857) and handles the $0^{\circ}/360^{\circ}$ meridian. Walkthrough: [docs/example_roi_export.ipynb](docs/example_roi_export.ipynb).
+
 ## Install
 
 ```bash
@@ -122,10 +127,28 @@ Dependencies are listed in `pyproject.toml` and pinned in `uv.lock`. If CuTe ker
 
 ## Reading guide
 
-1. Run forecasts in one process: [Engine](#engine), then [docs/tutorial.md](docs/tutorial.md) or `docs/example_*.ipynb`.
+1. Run forecasts in one process: [Engine](#engine), then [docs/tutorial.md](docs/tutorial.md) or the [Examples](#examples) notebooks.
 2. Fit a preset that needs two GPUs: [Distributed pipeline](#distributed-pipeline) and [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline).
 3. Serve outside the notebook: [Forecast scheduler](#forecast-scheduler-zmq) and [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment).
 4. Compare precision or latency: [Precision tiers](#precision-tiers) and [docs/benchmarks.md](docs/benchmarks.md).
+
+## Examples
+
+| Example | Topic |
+| ------- | ----- |
+| [example_era5.ipynb](docs/example_era5.ipynb) | Baseline in-process `era5_pretrained`; populate cache and checkpoints. |
+| [example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb) | Aurora 1.5: extended ERA5 IC, 6 h / hourly leads, optional ensemble. |
+| [example_hres_t0.ipynb](docs/example_hres_t0.ipynb) | WeatherBench2 HRES T0 finetuned preset. |
+| [example_hres_0.1.ipynb](docs/example_hres_0.1.ipynb) | $0.1^{\circ}$ high-resolution Aurora (`hres_0.1`). |
+| [example_cams.ipynb](docs/example_cams.ipynb) | CAMS air-pollution preset. |
+| [example_wave.ipynb](docs/example_wave.ipynb) | Wave preset; manual MARS GRIB cache placement when needed. |
+| [example_tc_tracking.ipynb](docs/example_tc_tracking.ipynb) | Tropical-cyclone tracking LoRA preset. |
+| [example_roi_export.ipynb](docs/example_roi_export.ipynb) | Batched ROI mask export (NetCDF / GeoTIFF) via `RoiBatch`. |
+| [example_scheduler_single_worker.ipynb](docs/example_scheduler_single_worker.ipynb) | Single-GPU ZeroMQ queue; preflight cleanup; graceful shutdown. |
+| [example_scheduler_distributed_workers.ipynb](docs/example_scheduler_distributed_workers.ipynb) | Heterogeneous multi-GPU dispatch and refill while a slow job is pending. |
+| [example_scheduler.py](docs/example_scheduler.py) | Command-line version of the single-worker scheduler tutorial. |
+
+API sketches that accompany these notebooks: [docs/tutorial.md](docs/tutorial.md).
 
 ## Engine
 
@@ -157,7 +180,7 @@ A preset pairs a model variant with a data profile. The downloader fills the loc
 | `wave` | AuroraWave | $721 \times 1440$ | WB2 meteorology + MARS wave | WB2 + MARS |
 | `tc_tracking` | Aurora (LoRA) | $721 \times 1440$ | WeatherBench2 HRES | WB2 + ERA5 static |
 
-Personal ECMWF accounts typically lack MARS access; see `docs/example_wave.ipynb` for placing wave GRIB files in the cache by hand.
+Personal ECMWF accounts typically lack MARS access; see [example_wave.ipynb](docs/example_wave.ipynb) for placing wave GRIB files in the cache by hand.
 
 ### Capabilities (summary)
 

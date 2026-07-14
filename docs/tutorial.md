@@ -135,7 +135,12 @@ For incremental progress UI, call `client.submit(request)` and iterate `client.e
 | -------- | ----- |
 | [`example_era5.ipynb`](example_era5.ipynb) | Baseline in-process `era5_pretrained`; populate cache and checkpoints. |
 | [`example_aurora_v1p5.ipynb`](example_aurora_v1p5.ipynb) | Aurora 1.5: extended ERA5 IC, 6 h / hourly leads, optional ensemble, viz vs ERA5. |
-| [`example_hres_t0.ipynb`](example_hres_t0.ipynb), [`example_hres_0.1.ipynb`](example_hres_0.1.ipynb), [`example_cams.ipynb`](example_cams.ipynb), [`example_wave.ipynb`](example_wave.ipynb), [`example_tc_tracking.ipynb`](example_tc_tracking.ipynb) | Other presets in process. |
+| [`example_hres_t0.ipynb`](example_hres_t0.ipynb) | WeatherBench2 HRES T0 finetuned preset. |
+| [`example_hres_0.1.ipynb`](example_hres_0.1.ipynb) | $0.1^{\circ}$ high-resolution Aurora (`hres_0.1`). |
+| [`example_cams.ipynb`](example_cams.ipynb) | CAMS air-pollution preset. |
+| [`example_wave.ipynb`](example_wave.ipynb) | Wave preset; manual MARS GRIB cache placement when needed. |
+| [`example_tc_tracking.ipynb`](example_tc_tracking.ipynb) | Tropical-cyclone tracking LoRA preset. |
+| [`example_roi_export.ipynb`](example_roi_export.ipynb) | Batched ROI mask export (NetCDF / GeoTIFF) via `RoiBatch`. |
 | [`example_scheduler_single_worker.ipynb`](example_scheduler_single_worker.ipynb) | Single-GPU ZMQ queue; scoped preflight cleanup; graceful shutdown. |
 | [`example_scheduler_distributed_workers.ipynb`](example_scheduler_distributed_workers.ipynb) | Heterogeneous four-GPU dispatch; cold-start timing; device status; `last_step_array` previews; refill while a slow job is pending. |
 | [`example_scheduler.py`](example_scheduler.py) | Command-line version of the single-worker tutorial. |
