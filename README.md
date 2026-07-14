@@ -1,64 +1,76 @@
 # Flash-Aurora: Toward Efficient Inference for Geospatial Foundation Models
 
-Flash-Aurora is an inference stack for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model. It provides Triton and CuTe DSL kernels, mixed-precision routing, data ingress, checkpoint loading, autoregressive rollout, NetCDF export, and a ZeroMQ scheduler for out-of-process serving.
+Flash-Aurora is an inference and serving engine for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model, with the same stack intended to host further geospatial foundation models. It provides shape-specialized Triton and CuTe DSL kernels, named mixed-precision routing (`inference_precision`), data ingress, checkpoint loading, autoregressive rollout, NetCDF/GeoTIFF export, and a ZeroMQ scheduler for out-of-process serving.
 
 Companion documents:
 
-- [docs/tutorial.md](docs/tutorial.md): install sketches, Engine and scheduler API examples, notebook index.
-- [docs/benchmarks.md](docs/benchmarks.md): full latency, precision-drift, window-attention, and distributed-rollout tables.
+- [docs/tutorial.md](docs/tutorial.md): install steps, Engine and scheduler API examples, notebook index.
+- [docs/benchmarks.md](docs/benchmarks.md): full latency, numerical-error, window-attention, and multi-GPU rollout tables.
 
 ## Highlights
 
-### Extensible inference & serving engine: Aurora 1.5 on day 1
+### Extensible inference and serving: Aurora 1.5 Day-1 support
 
-New model families plug into the same Engine without rewriting the hot path. Aurora 1.5 (Microsoft Aurora tag `v2.0.0`) is the first proof point: a side-path package beside the frozen legacy family (upstream **v1.8.0**), registered through the same preset, registry, and adapter surface.
+New model families plug into the same Engine without rewriting the performance-critical path. In the same sense as Day-1 model support in systems such as vLLM, a modular preset / registry / adapter surface lets a new family land with shared kernels and serving, rather than a fork of the hot path. Aurora 1.5 (Microsoft Aurora release tag `v2.0.0`) is the first proof point: a side-path package beside the frozen legacy family (upstream **v1.8.0**).
 
-- **Fixed composition root.** Presets `aurora_v1p5` and `aurora_v1p5_ensemble`, `ModelFactory`, ingress `cds_era5_v1p5`, and `RolloutSession` dispatch connect download, validate, load, rollout, and export. Clients continue to call `AuroraEngine.from_preset(...)`.
-- **Shared modules.** `Batch`, `models/ops` (Triton / CuTe), and `inference_precision` accelerate the 1.5 Swin backbone. Variable `fine_lead_times`, prescribed insolation, and ensemble `reset_noise()` loops stay in the side path.
-- **Day-one surface.** Deterministic and ensemble checkpoints, extended ERA5 initial conditions, hourly fine leads, and `bf16_mixed@fp32` end-to-end latency on par with `era5_pretrained` (about $3.1\times$ versus PyTorch FP32 on a $721 \times 1440$ grid). See [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb).
+- **Fixed composition root.** Presets `aurora_v1p5` and `aurora_v1p5_ensemble`, `ModelFactory`, ingress profile `cds_era5_v1p5`, and `RolloutSession` dispatch connect download, validate, load, rollout, and export. Clients continue to call `AuroraEngine.from_preset(...)`.
+- **Shared acceleration modules.** `Batch`, `flash_aurora.models.ops` (Triton layout/AdaLN and CuTe window attention / GEMM), and `inference_precision` accelerate the 1.5 Swin3D backbone. Aurora 1.5-only semantics (`fine_lead_times`, prescribed insolation, ensemble `reset_noise()`) stay in `flash_aurora.models.aurora_v1p5`.
+- **Shipped with the adaptation.** Deterministic and ensemble checkpoints, extended ERA5 initial conditions, hourly fine leads, and production `bf16_mixed@fp32` with **one-step** end-to-end forward latency on par with `era5_pretrained` (about $3.1\times$ versus the unfused PyTorch FP32 reference on a $721 \times 1440$ grid). Walkthrough: [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb).
 
-The same pattern (model package, preset, adapter; reuse Engine and kernels) applies to later Aurora generations or other geospatial foundation models with a compatible contract.
+The same pattern (model package, preset, adapter; reuse Engine and kernels) is how later Aurora generations or other geospatial foundation models can get Day-1 support under a compatible code adaption.
 
 ### Kernel fusion for lower backbone memory traffic
 
-PyTorch Swin3D materializes many short-lived tensors for window layout and AdaLN boundaries. Flash-Aurora fuses these on the backbone hot path:
+PyTorch Swin3D materializes many short-lived tensors at window-layout and AdaLN boundaries. Flash-Aurora fuses those steps on the backbone hot path:
 
-- **Fused window layout** (`triton_swin3d_layout.py`): cyclic shift, pad, 3D partition, and inverse merge in fused kernels; optional `InferenceWorkspacePool` reuse for fixed shapes.
-- **Fused AdaLN and residual** (`triton_adaln.py`): LayerNorm, FiLM, and residual add without a full-width AdaLN intermediate.
+- **Fused window layout** (`triton_swin3d_layout.py`, `use_triton_layout`): cyclic shift, pad, 3D window partition, and inverse merge in fused Triton kernels instead of a chain of eager views and copies. For fixed inference shapes, `InferenceWorkspacePool` can reuse a scratch buffer for the backbone--decoder concat and related temporaries.
+- **Fused AdaLN and residual** (`triton_adaln.py`, `use_triton_adaln`): LayerNorm, FiLM modulation, and residual add without writing a full-width AdaLN intermediate.
 
-On `bf16_mixed@*` and `tf32@*` tiers, AdaLN can keep FP32 activations between Swin blocks (`output_fp32`), reducing global-memory traffic while preserving inter-block precision. Details: [Precision tiers](#precision-tiers).
+On `bf16_mixed@*` and `tf32@*` tiers, AdaLN can emit FP32 activations between Swin blocks (`output_fp32`), so the next block reads higher-precision residuals while GEMM and attention still use Tensor Cores. That reduces global-memory traffic relative to the decomposed PyTorch path without collapsing inter-block precision to BF16. Details: [Precision tiers](#precision-tiers).
 
 ### CuTe DSL window attention
 
-Aurora Swin windows are short ($N = 144$ for window size $(2, 6, 12)$). The CuTe kernels load the full window $K$ and $V$ into shared memory in a single stage ($tile_n \ge N$), run QK and PV MMAs with FP32 online softmax, and never materialize an $N \times N$ attention matrix in global memory. Two operators cover the production path: BF16 (`BF16_MIXED`) and TF32-accumulated FP32 I/O (`TF32_ACC_FP32`).
+Aurora Swin windows are short ($N = 144$ for window size $(2, 6, 12)$ on the default $0.25^{\circ}$ encoder). The kernels follow a fused multi-head attention structure: load $Q$, $K$, and $V$ into shared memory, form logits $S = \mathrm{scale}\, QK^{\top}$, apply the optional Swin mask, compute row-wise online softmax in FP32, then accumulate $O \leftarrow \mathrm{softmax}(S)V$ without materializing the full $N \times N$ matrix in global memory.
 
-Attention $Q$, $K$, and $V$ use layout $(B, H, N, D_h)$: $B$ is the folded window batch ($B = B_{\mathrm{batch}} \cdot n_W$), $H$ is the head count, $N$ is tokens per window, and $D_h$ is the head dimension ($D_h = 64$ here). The figure reports three shapes from the default $0.25^{\circ}$ ERA5 encoder, $(1800, 8, 144, 64)$, $(450, 16, 144, 64)$, and $(128, 32, 144, 64)$, plus a shifted-window mask case on $(1800, 8, 144, 64)$ (Swin relative-position bias $-100$). On Blackwell (`sm_120`) unmasked speedups are about $1.07$--$1.09\times$ versus BF16 SDPA and about $1.59$--$1.60\times$ versus FP32 SDPA; the masked $(1800, 8, 144, 64)$ case reaches about $1.22\times$ (BF16) and $1.69\times$ (TF32). On RTX 4090 (`sm_89`) absolute latency is higher, with about $2.2\times$ versus FP32 SDPA. Full tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
+**Why short windows matter.** When $tile_n \ge N$, `_smem_utils.py` selects the **single-stage** path (`single_kv_tile=True`, `num_stages=1`): one shared-memory tile holds the entire window $K$ and $V$, then QK and PV Tensor Core MMAs run locally. There is no multi-stage $K/V$ stream and no second global round-trip for the attention map. If $N$ exceeds the SMEM budget, the code falls back to a multi-stage streaming variant (TMA double-buffering, `num_stages=2`); production $0.25^{\circ}$ inference stays on the single-stage path for $N=144$.
+
+Two precision modes (`WinAttnPrecision`) cover the production path:
+
+- **`BF16_MIXED`:** BF16 activations and Tensor Core MMA; FP32 online softmax.
+- **`TF32_ACC_FP32`:** FP32 inputs and outputs with TF32-accumulated MMA, for closer FP32 fidelity at lower throughput than BF16.
+
+Shifted-window masks are packed once as compact `uint8` and applied inside the kernel as the additive bias equivalent of PyTorch's $-100$ relative-position mask, so logits match `scaled_dot_product_attention` (SDPA).
+
+Attention $Q$, $K$, and $V$ use layout $(B, H, N, D_h)$, where $B = B_{\mathrm{batch}} \cdot n_W$ folds batch and window index, $H$ is heads, $N$ is tokens per window, and $D_h$ is the head dimension ($D_h = 64$ here). The figure reports three ERA5 encoder shapes, $(1800, 8, 144, 64)$, $(450, 16, 144, 64)$, and $(128, 32, 144, 64)$, plus a shifted-window mask on $(1800, 8, 144, 64)$. On Blackwell (`sm_120`) unmasked speedups are about $1.07$--$1.09\times$ versus BF16 SDPA and about $1.59$--$1.60\times$ versus FP32 SDPA; the masked $(1800, 8, 144, 64)$ case reaches about $1.22\times$ (BF16) and $1.69\times$ (TF32). On RTX 4090 (`sm_89`) absolute latency is higher, with about $2.2\times$ versus FP32 SDPA (larger gaps versus default SDPA dispatch; forced memory-efficient SDPA is within a few percent of CuTe BF16). Full tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
 
 <p align="center">
   <img src="docs/image/window_attn_cute_vs_sdpa_blackwell.svg" alt="CuTe DSL BF16 and TF32 window attention vs PyTorch SDPA on Blackwell, unmasked and masked" width="95%"/>
 </p>
 
-<p align="center"><em>RTX PRO 6000 Blackwell (<code>sm_120a</code>). X-axis labels are $Q/K/V$ shapes $(B, H, N, D_h)$. Masked bars apply Swin shifted-window bias $-100$.</em></p>
+*Measured on RTX PRO 6000 Blackwell (`sm_120a`). X-axis labels are $Q/K/V$ shapes $(B, H, N, D_h)$. Masked bars apply Swin shifted-window bias $-100$.*
 
 ### Mixed-precision inference
 
-Tiers use the label `backbone@encoder_decoder` (default production tier `bf16_mixed@fp32`):
+Tiers use the label `backbone@encoder_decoder` (default production tier `bf16_mixed@fp32`). The left token selects Swin3D GEMM and window-attention dtype; the right token selects Perceiver encoder/decoder GEMM dtype.
 
-- **`bf16_mixed` backbone:** BF16 CuTe attention and BF16 MLP; TF32 Tensor Core GEMM elsewhere; FP32 activations between blocks via Triton fusion.
-- **`tf32` backbone:** TF32 GEMM throughout Swin plus CuTe attention with FP32 I/O.
+- **`bf16_mixed` backbone:** BF16 CuTe attention (QKV/proj) and BF16 MLP; TF32 Tensor Core GEMM elsewhere; FP32 inter-block activations via Triton AdaLN (`output_fp32`).
+- **`tf32` backbone:** TF32 GEMM throughout Swin plus CuTe `TF32_ACC_FP32` attention (FP32 I/O).
 - **`fp32` backbone:** Strict FP32 GEMM and PyTorch SDPA; accuracy baseline with Triton fusion still enabled.
+- **`bf16` backbone:** Full backbone BF16 GEMM with fused CuTe attention (faster path exists, but larger drift; not recommended for production).
 
-Encoder and Perceiver decoder default to `@fp32` because errors map directly into output fields, while the Swin backbone dominates runtime (about $63\%$ on `era5_pretrained`). Across production presets, `bf16_mixed@fp32` cuts forward latency to about $570$--$680\,\mathrm{ms}$ versus about $1.7$--$2.1\,\mathrm{s}$ for the PyTorch FP32 reference (isolate-tiers). Full tables: [docs/benchmarks.md](docs/benchmarks.md).
+Encoder and Perceiver decoder default to `@fp32` because their errors map directly into output fields, while the Swin backbone dominates runtime (about $63\%$ of forward time on `era5_pretrained`). Across production presets, `bf16_mixed@fp32` brings a **single rollout step** (`model.forward`, one lead) to about $570$--$680\,\mathrm{ms}$, versus about $1.7$--$2.1\,\mathrm{s}$ for the unfused PyTorch FP32 reference (`pytorch_backbone_fp32_encoder_decoder_fp32`). These end-to-end bars are not multi-step autoregressive rollouts. Each tier is timed in a fresh subprocess (`--isolate-tiers`) so cuDNN autotune from an earlier tier cannot deflate a later baseline. Full tables: [docs/benchmarks.md](docs/benchmarks.md).
+
+Precision tier details: [Precision tiers](#precision-tiers).
 
 <p align="center">
-  <img src="docs/image/e2e_latency_by_tier_all_presets.svg" alt="End-to-end forward latency by precision tier with models as colors" width="95%"/>
+  <img src="docs/image/e2e_latency_by_tier_all_presets.svg" alt="One-step end-to-end forward latency by precision tier with models as colors" width="95%"/>
 </p>
 
-<p align="center"><em>RTX PRO 6000 Blackwell, isolate-tiers; LoRA presets use <code>lora_merged</code>. <code>aurora_v1p5</code> is within a few percent of <code>era5_pretrained</code>; see [docs/benchmarks.md](docs/benchmarks.md).</em></p>
+*RTX PRO 6000 Blackwell; one `model.forward` (single rollout step) per bar; each tier in a separate process (`--isolate-tiers`). Finetuned presets merge LoRA into base weights before timing (`lora_merged`). `aurora_v1p5` is within a few percent of `era5_pretrained`; see [docs/benchmarks.md](docs/benchmarks.md).*
 
 ### Asynchronous multi-GPU serving
 
-One ZeroMQ worker per GPU binds a preset. A coordinator routes jobs to idle workers and streams events to clients. This is job-level scheduling across heterogeneous models, not tensor parallelism inside one rollout. CLI and client sketches: [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment).
+One long-lived ZeroMQ worker owns one GPU and one model preset. A coordinator routes jobs to idle workers and streams step events to clients. This is **job-level** scheduling across heterogeneous presets, not tensor or pipeline parallelism inside one forward. Commands and client sketches: [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment).
 
 <table width="100%">
   <tr>
@@ -75,7 +87,7 @@ Left: one job per worker and preset. Right: faster workers take follow-up jobs w
 
 ### Pipeline parallelism for GPUs under $40\,\mathrm{GiB}$
 
-`DistributedConfig` splits encoder, backbone, and spatial decoder across two GPUs in one process (not `torchrun`). Spatial decoder split cuts peak decoder VRAM from about $28\,\mathrm{GiB}$ to about $14\,\mathrm{GiB}$ per card on ERA5. On $2\times$ RTX 5090, a $4$-step run reaches about $1.3\,\mathrm{s}$/step on `era5_pretrained` and about $3.6\,\mathrm{s}$/step on `hres_0.1` (export-bound). Placement and timing tables: [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline).
+`DistributedConfig` places encoder, Swin backbone, and spatial decoder on two devices **inside one process** (not a multi-process `torchrun` job). The VRAM planner in `engine/distributed/plan.py` chooses the split from `ModelVariantSpec` and per-card limits; `decoder_spatial.py` can bisect the decoder west/east so peak decoder activation memory falls from about $28\,\mathrm{GiB}$ to about $14\,\mathrm{GiB}$ per card on ERA5. On $2\times$ RTX 5090, a $4$-step `rollout_and_export` run reaches about $1.3\,\mathrm{s}$/step on `era5_pretrained` and about $3.6\,\mathrm{s}$/step on `hres_0.1`, where GPU-to-CPU offload and NetCDF write dominate (export-bound). Aurora 1.5 does not yet enable this path. Placement and timing tables: [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline).
 
 <table width="100%">
   <tr>
@@ -96,44 +108,44 @@ cd flash-aurora
 uv sync
 ```
 
-Dependencies are declared in `pyproject.toml` and pinned by `uv.lock`. Set `CUTE_DSL_ARCH` when needed (for example `sm_89` or `sm_120a`). API sketches and a minimal forecast script: [docs/tutorial.md](docs/tutorial.md#quick-start).
+Dependencies are listed in `pyproject.toml` and pinned in `uv.lock`. If CuTe kernels need an explicit GPU architecture, set `CUTE_DSL_ARCH` (for example `sm_89` on RTX 4090, `sm_120a` on Blackwell). API sketches: [docs/tutorial.md](docs/tutorial.md#quick-start).
 
 ## Repository layout
 
 | Path | Role |
 | ---- | ---- |
-| `flash_aurora/models/aurora/` | Legacy optimized Aurora family (upstream freeze **v1.8.0**). |
-| `flash_aurora/models/aurora_v1p5/` | Aurora 1.5 side path (`v2.0.0` semantics); shares ops and `inference_precision`. |
+| `flash_aurora/models/aurora/` | Legacy optimized Aurora (upstream freeze **v1.8.0**). |
+| `flash_aurora/models/aurora_v1p5/` | Aurora 1.5 package (`v2.0.0` release); shares kernels and precision modes. |
 | `flash_aurora/models/ops/` | Shared Triton and CuTe kernels. |
 | `flash_aurora/models/inference_precision.py` | Named precision presets. |
 | `flash_aurora/engine/` | Preset Engine: core, ingress, egress, runtime, distributed. |
 | `flash_aurora/scheduler/` | ZeroMQ worker, coordinator, client, supervisor. |
 | `docs/` | Notebooks, [tutorial.md](docs/tutorial.md), [benchmarks.md](docs/benchmarks.md). |
-| `benchmark/` | Latency, precision, kernel, and distributed harnesses. |
+| `benchmark/` | Latency, numerical-error, kernel, and multi-GPU timing scripts. |
 | `tests/` | Model, kernel, engine, and scheduler tests (`./scripts/run_tests.sh`). |
 
 ## Reading guide
 
-1. Run forecasts in process: [Engine](#engine) then [docs/tutorial.md](docs/tutorial.md) or `docs/example_*.ipynb`.
-2. Fit a preset that exceeds one GPU: [Distributed pipeline](#distributed-pipeline) and [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline).
+1. Run forecasts in one process: [Engine](#engine), then [docs/tutorial.md](docs/tutorial.md) or `docs/example_*.ipynb`.
+2. Fit a preset that needs two GPUs: [Distributed pipeline](#distributed-pipeline) and [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline).
 3. Serve outside the notebook: [Forecast scheduler](#forecast-scheduler-zmq) and [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment).
 4. Compare precision or latency: [Precision tiers](#precision-tiers) and [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Engine
 
-`flash_aurora.engine` is the preset-driven inference layer: model variants, data profiles, checkpoints, batch validation, rollout, NetCDF export, and optional single-process multi-GPU pipeline.
+`flash_aurora.engine` is the preset-driven inference layer: choose a model and data source, load weights, validate the input batch, run multi-step forecasts, write NetCDF, and optionally place stages on two GPUs in one process.
 
 ### Architecture
 
 | Layer | Path | Role |
 | ----- | ---- | ---- |
-| Core | `engine/core/` | `EngineConfig`, presets, `AuroraEngine`, checkpoints, `RolloutSession`, lifecycle. |
-| Ingress | `engine/ingress/` | Downloaders, adapters, `InitialConditionBuilder`, validator, optional IC cache. |
-| Egress | `engine/egress/` | Offload, step NetCDF naming, optional async export. |
-| Runtime | `engine/runtime/` | Warmup / graph pool, `GpuGuard`, VRAM estimates, resource monitor. |
-| Distributed | `engine/distributed/` | Placement plan and pipeline forward for multi-GPU rollout. |
+| Core | `engine/core/` | Config, presets, `AuroraEngine`, checkpoints, forecast session, lifecycle. |
+| Ingress | `engine/ingress/` | Downloaders, format adapters, initial-condition builder, validator, optional disk cache. |
+| Egress | `engine/egress/` | Move results off GPU, name step NetCDF files, optional background export. |
+| Runtime | `engine/runtime/` | Warmup, optional CUDA graph pool, GPU reservation, memory estimates. |
+| Distributed | `engine/distributed/` | Two-GPU placement plan and pipelined forward. |
 
-A preset pairs a `ModelVariantSpec` with a `SourceProfile`. `DataDownloader.ensure()` fills the cache; `InitialConditionBuilder` builds a validated `Batch`; `AuroraEngine.load()` applies `inference_precision` and optional pipeline placement; `rollout_stream` advances $K$ steps by $\Delta t$; `rollout_and_export` can overlap D2H and NetCDF writes with the next forward when `async_export=True`.
+A preset pairs a model variant with a data profile. The downloader fills the local cache when files are missing; the initial-condition builder builds a validated batch; `load()` applies the chosen precision mode and optional two-GPU layout; `rollout_stream` advances $K$ forecast steps by the model time step $\Delta t$; with background export on, NetCDF writes can overlap the next forward.
 
 ### Presets and data sources
 
@@ -146,24 +158,24 @@ A preset pairs a `ModelVariantSpec` with a `SourceProfile`. `DataDownloader.ensu
 | `small_pretrained` | AuroraSmallPretrained | $400 \times 800$ | CDS ERA5 | CDS |
 | `hres_0.1` | AuroraHighRes | $1801 \times 3600$ | IFS analysis | ECMWF Open Data / GRIB |
 | `cams` | AuroraAirPollution | $451 \times 900$ | CAMS | ADS |
-| `wave` | AuroraWave | $721 \times 1440$ | WB2 met + MARS wave | WB2 + MARS |
+| `wave` | AuroraWave | $721 \times 1440$ | WB2 meteorology + MARS wave | WB2 + MARS |
 | `tc_tracking` | Aurora (LoRA) | $721 \times 1440$ | WeatherBench2 HRES | WB2 + ERA5 static |
 
-Personal ECMWF accounts typically lack MARS access; see `docs/example_wave.ipynb` for manual wave GRIB cache setup.
+Personal ECMWF accounts typically lack MARS access; see `docs/example_wave.ipynb` for placing wave GRIB files in the cache by hand.
 
 ### Capabilities (summary)
 
-Local checkpoints with optional Hub download (`allow_hub_download`, `HF_MIRROR_ENDPOINT`); `inference_precision` for Triton / CuTe / BF16 / TF32 routing on the legacy family and Aurora 1.5 backbone; `DistributedConfig` for legacy multi-GPU pipeline (not enabled for Aurora 1.5); ingress for CDS (including Aurora 1.5 extended surface), ADS, WeatherBench2, Open Data GRIB, and MARS when permitted; `fine_lead_times` on Aurora 1.5 rollouts; optional async export, IC load overlap, disk `ic_cache`, and `GpuGuard`. CUDA graph capture remains experimental and is forced off for Aurora 1.5.
+Checkpoints load from disk, with optional Hugging Face Hub download. Precision modes route Triton, CuTe, BF16, and TF32 on the legacy family and the Aurora 1.5 backbone. Two-GPU pipeline placement is available for the legacy family (not for Aurora 1.5). Data sources include CDS (including Aurora 1.5 extended surface fields), ADS, WeatherBench2, Open Data GRIB, and MARS when the account allows it. Aurora 1.5 can use hourly lead times. Optional features include background NetCDF export, overlapping initial-condition load with compute, a disk cache of prepared initial conditions, and a GPU reservation guard. CUDA graph capture is still experimental and is turned off for Aurora 1.5.
 
-API sketches, lifecycle notes, and IC-cache examples: [docs/tutorial.md](docs/tutorial.md).
+API sketches and lifecycle notes: [docs/tutorial.md](docs/tutorial.md).
 
 ### Distributed pipeline
 
-Single-process pipeline parallelism for presets that exceed one GPU. Pass `distributed=DistributedConfig(devices=("cuda:0", "cuda:1"), ...)` to `from_preset` or set `engine.config.distributed` before `load()`. Benchmarks: [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline) and `benchmark/bench_distributed_rollout.py`.
+Single-process pipeline parallelism for presets that exceed one GPU. Pass `distributed=DistributedConfig(devices=("cuda:0", "cuda:1"), ...)` to `from_preset`, or set `engine.config.distributed` before `load()`. Benchmarks: [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline).
 
 ### Forecast scheduler (ZMQ)
 
-Long-lived workers each own one GPU and one preset. Clients send JSON commands and receive step events (`export_paths`, `metadata_only`, or `last_step_array`). Deployment commands, client sketches, notebook list, and supervisor CLI: [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment).
+Long-lived workers each own one GPU and one preset. Clients send JSON commands and receive per-step events (exported file paths, metadata only, or the last step as an array). Deployment commands and client sketches: [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment).
 
 ## Precision tiers
 
@@ -171,32 +183,32 @@ Tiers are labeled `backbone@encoder_decoder` (for example `bf16_mixed@fp32`).
 
 | Backbone token | Meaning |
 | -------------- | ------- |
-| `fp32` | Strict FP32 GEMM; PyTorch SDPA unless replaced. |
-| `tf32` | TF32 Tensor Core GEMM; CuTe window attention (FP32 I/O). |
-| `bf16_mixed` | BF16 attention QKV/proj and MLP; TF32 elsewhere; CuTe BF16 attention. |
+| `fp32` | Strict FP32 GEMM; PyTorch SDPA unless a higher tier replaces window attention. |
+| `tf32` | TF32 Tensor Core GEMM; CuTe `TF32_ACC_FP32` window attention (FP32 I/O). |
+| `bf16_mixed` | BF16 attention QKV/proj and MLP; TF32 GEMM elsewhere; CuTe `BF16_MIXED` attention; FP32 inter-block activations via Triton AdaLN when enabled. |
 | `bf16` | Full backbone BF16 GEMM with fused CuTe attention (not recommended for production). |
 
-Encoder/decoder tokens are `fp32` or `tf32`. Set via `inference_precision=` on `from_preset` or `EngineConfig`.
+Encoder/decoder tokens are `fp32` or `tf32` and control Perceiver GEMM dtype. Set with `inference_precision=` on `from_preset` or `EngineConfig`.
 
-All custom tiers enable the same Triton fusion base (layout and AdaLN). CuTe attention and GEMM precision layer on top. The PyTorch reference tier `pytorch_backbone_fp32_encoder_decoder_fp32` disables Triton and CuTe for drift baselines.
+All custom tiers enable the same Triton fusion base (`use_triton_layout`, `use_triton_adaln`). CuTe attention and GEMM precision layer on top. The reference tier `pytorch_backbone_fp32_encoder_decoder_fp32` disables Triton and CuTe so drift is measured against an unfused baseline.
 
 Official per-variable tolerances $\tau_v$ and full drift tables: [docs/benchmarks.md](docs/benchmarks.md#official-per-variable-tolerances).
 
 ## Window attention kernels
 
-Flash-Aurora replaces PyTorch SDPA on Swin windows with CuTe DSL kernels under `flash_aurora/models/ops/cute/`. Inputs use layout $(B, H, N, D_h)$: $B$ is the folded window batch, $H$ is the head count, $N$ is tokens per window, and $D_h$ is the head dimension. For production $0.25^{\circ}$ shapes with $N = 144$ and $D_h = 64$, a single shared-memory tile holds the full window $K$ and $V$ (`tile_n \ge N`). Logits use FP32 online softmax; the full $N \times N$ map is not written to global memory. Modes `BF16_MIXED` and `TF32_ACC_FP32` trade throughput against FP32 fidelity. Microbenchmark tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
+Flash-Aurora replaces PyTorch SDPA on Swin windows with CuTe DSL kernels under `flash_aurora/models/ops/cute/`. Inputs use layout $(B, H, N, D_h)$ as above. For production $0.25^{\circ}$ shapes with $N = 144$ and $D_h = 64$, `_choose_tile_n` keeps $tile_n \ge N$ so a single SMEM tile holds $K$ and $V$ (`single_kv_tile=True`). Softmax accumulates in FP32; the full $N \times N$ map is not written to global memory. `BF16_MIXED` and `TF32_ACC_FP32` trade Tensor Core throughput against FP32 fidelity; masks are `uint8`-packed equivalents of the PyTorch $-100$ bias. Microbenchmark tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
 
 ## Benchmarks (summary)
 
-End-to-end numbers use NVIDIA RTX PRO 6000 Blackwell, PyTorch $2.12.1+\mathrm{cu}130$, `CUTE_DSL_ARCH=sm_120a`, warmup $2$, repeat $5$, and `--isolate-tiers` for fair speedups. The wave preset is omitted (MARS). Tier `bf16@*` is excluded from latency tables (no speed gain over `bf16_mixed@*`, larger drift). Charts above are regenerated with `uv run python benchmark/plot_readme_perf_charts.py`.
+End-to-end figures mean a **single** `model.forward` (one rollout step), measured on NVIDIA RTX PRO 6000 Blackwell, PyTorch $2.12.1+\mathrm{cu}130$, CUDA $13.0$, and `CUTE_DSL_ARCH=sm_120a`. Each timing run warms up twice, then averages five measured forwards. **Each precision tier runs in its own process** (`--isolate-tiers`) so cuDNN autotune from an earlier tier cannot deflate a later baseline. The `wave` preset is omitted (needs MARS). Full BF16 backbone tiers (`bf16@*`) are left out of the latency charts: they are no faster than `bf16_mixed@*` and show larger numerical drift. Multi-step rollout timings live under the distributed section of [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline). Regenerate the figures with `uv run python benchmark/plot_readme_perf_charts.py`.
 
-**`aurora_v1p5` precision** (seed $42$, baseline PyTorch FP32): recommended tiers (`bf16_mixed@*`, `tf32@*`, `fp32@fp32`) pass $31/31$ output variables; `bf16@fp32` and plain PyTorch autocast fail selected extended surface fields.
+**`aurora_v1p5` numerical check** (seed $42$, baseline `pytorch_backbone_fp32_encoder_decoder_fp32`): recommended tiers (`bf16_mixed@*`, `tf32@*`, `fp32@fp32`) pass all $31$ output variables against the published per-variable tolerances $\tau_v$; `bf16@fp32` and plain PyTorch autocast fail on some extended surface fields.
 
-Full latency grids, precision-drift tables for all presets, reproduce commands, and distributed rollout numbers: [docs/benchmarks.md](docs/benchmarks.md).
+Full latency grids, drift tables, reproduce commands, and multi-GPU numbers: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Testing notes
 
-`test_aurora_small` compares FP64 forwards to Microsoft Hugging Face reference pickles. On recent PyTorch builds a small drift on a few surface variables can appear even with the official `microsoft-aurora` wheel; the test passes and emits a `UserWarning` when drift exceeds upstream tolerances.
+`test_aurora_small` compares FP64 forwards to Microsoft Hugging Face reference tensors. On recent PyTorch builds, a small drift on a few surface variables can appear even with the official `microsoft-aurora` wheel; the test still passes and emits a warning when drift exceeds upstream tolerances.
 
 ## License
 

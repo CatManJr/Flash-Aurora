@@ -55,9 +55,10 @@ def _style() -> None:
     mpl.rcParams.update(
         {
             "font.family": "DejaVu Sans",
-            "font.size": 10,
-            "axes.titlesize": 12,
-            "axes.labelsize": 10,
+            "font.size": 11,
+            "axes.titlesize": 18,
+            "axes.labelsize": 12,
+            "axes.titlepad": 14,
             "axes.spines.top": False,
             "axes.spines.right": False,
             "axes.grid": True,
@@ -147,13 +148,13 @@ def plot_window_attention() -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(categories)
     ax.set_ylabel("Latency (ms)")
-    ax.set_title("BF16 window attention", pad=10)
+    ax.set_title("BF16 window attention", fontsize=18, pad=14)
     y_hi = max(bf16_cute + bf16_sdpa) * 1.55
     ax.set_ylim(0, y_hi)
     _bar_values(ax, b1, bf16_cute, y_hi)
     _bar_values(ax, b2, bf16_sdpa, y_hi)
     _annotate_speedups(ax, x, bf16_cute, bf16_sdpa, C_CUTE_BF16)
-    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.24), ncol=2, fontsize=9)
+    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.24), ncol=2, fontsize=10)
 
     ax = axes[1]
     b1 = ax.bar(x - w, tf32_cute, w * 1.7, label="CuTe DSL TF32", color=C_CUTE_TF32, zorder=3)
@@ -161,13 +162,13 @@ def plot_window_attention() -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(categories)
     ax.set_ylabel("Latency (ms)")
-    ax.set_title("TF32-acc FP32 window attention", pad=10)
+    ax.set_title("TF32-acc FP32 window attention", fontsize=18, pad=14)
     y_hi = max(tf32_cute + fp32_sdpa) * 1.50
     ax.set_ylim(0, y_hi)
     _bar_values(ax, b1, tf32_cute, y_hi)
     _bar_values(ax, b2, fp32_sdpa, y_hi)
     _annotate_speedups(ax, x, tf32_cute, fp32_sdpa, C_CUTE_TF32)
-    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.24), ncol=2, fontsize=9)
+    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.24), ncol=2, fontsize=10)
 
     fig.tight_layout()
     _save(fig, "window_attn_cute_vs_sdpa_blackwell")
@@ -198,11 +199,15 @@ def plot_e2e_latency_by_tier() -> None:
 
     ax.set_xticks(x)
     ax.set_xticklabels(TIER_LABELS, fontsize=13)
-    ax.set_ylabel("Forward latency (ms)", fontsize=14)
+    ax.set_ylabel("One-step forward latency (ms)", fontsize=14)
     ax.tick_params(axis="y", labelsize=12)
     y_max = max(max(v) for v in MODEL_LATENCY_MS.values())
     ax.set_ylim(0, y_max * 1.12)
-    ax.set_title("End-to-end forward latency by precision tier", fontsize=15, pad=14)
+    ax.set_title(
+        "End-to-end latency by precision tier (single rollout step / model.forward)",
+        fontsize=18,
+        pad=16,
+    )
     ax.legend(
         frameon=False,
         ncol=3,

@@ -2,7 +2,7 @@
 
 This page collects the full latency, precision-drift, and window-attention microbenchmark tables for Flash-Aurora. Headline summary numbers and bar charts remain in the [project README](../README.md). Regenerate README figures with `uv run python benchmark/plot_readme_perf_charts.py`.
 
-**Machine context.** Unless noted otherwise, end-to-end numbers were measured on NVIDIA RTX PRO 6000 Blackwell Server Edition, PyTorch 2.12.1+cu130, CUDA 13.0, `CUTE_DSL_ARCH=sm_120a`, batch size 1, and cached ingress. Window-attention microbenchmarks also report RTX 4090 (`sm_89`). Distributed rollout tables cover 2x RTX 5090 and 2x RTX 4090.
+**Machine context.** Unless noted otherwise, end-to-end latency means a **single** `model.forward` (one rollout step / one lead), measured on NVIDIA RTX PRO 6000 Blackwell Server Edition, PyTorch 2.12.1+cu130, CUDA 13.0, `CUTE_DSL_ARCH=sm_120a`, batch size 1, and cached ingress. Multi-step autoregressive rollouts are reported separately under [Distributed pipeline](#distributed-pipeline). Window-attention microbenchmarks also report RTX 4090 (`sm_89`). Distributed rollout tables cover 2x RTX 5090 and 2x RTX 4090.
 
 **How to reproduce.** Commands live in [Reproducing the benchmarks](#reproducing-the-benchmarks) below and in scripts under [`../benchmark/`](../benchmark/). Install dependencies with `uv sync` from the repository root (see [Install](../README.md#install)).
 
