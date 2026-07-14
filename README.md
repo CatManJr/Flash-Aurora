@@ -11,22 +11,18 @@ Companion documents:
 
 ### Extensible inference and serving: Aurora 1.5 Day-1 support
 
-New model families plug into the same Engine without rewriting the performance-critical path. In the same sense as Day-1 model support in systems such as vLLM, a modular preset / registry / adapter surface lets a new family land with shared kernels and serving, rather than a fork of the hot path. Aurora 1.5 (Microsoft Aurora release tag `v2.0.0`) is the first proof point: a side-path package beside the frozen legacy family (upstream **v1.8.0**).
-
-- **Fixed composition root.** Presets `aurora_v1p5` and `aurora_v1p5_ensemble`, `ModelFactory`, ingress profile `cds_era5_v1p5`, and `RolloutSession` dispatch connect download, validate, load, rollout, and export. Clients continue to call `AuroraEngine.from_preset(...)`.
-- **Shared acceleration modules.** `Batch`, `flash_aurora.models.ops` (Triton layout/AdaLN and CuTe window attention / GEMM), and `inference_precision` accelerate the 1.5 Swin3D backbone. Aurora 1.5-only semantics (`fine_lead_times`, prescribed insolation, ensemble `reset_noise()`) stay in `flash_aurora.models.aurora_v1p5`.
-- **Shipped with the adaptation.** Deterministic and ensemble checkpoints, extended ERA5 initial conditions, hourly fine leads, and production `bf16_mixed@fp32` with **one-step** end-to-end forward latency on par with `era5_pretrained` (about $3.1\times$ versus the unfused PyTorch FP32 reference on a $721 \times 1440$ grid). Walkthrough: [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb).
+New model families plug into the same Engine without rewriting the performance-critical path. In the same sense as Day-1 model support in systems such as vLLM, a modular preset / registry / adapter surface lets a new family land with shared kernels and serving, rather than a fork of the hot path. Aurora 1.5 (Microsoft Aurora release tag `v2.0.0`) is the first proof point: a side-path package beside the archived legacy family (upstream **v1.8.0**). Walkthrough: [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb).
 
 The same pattern (model package, preset, adapter; reuse Engine and kernels) is how later Aurora generations or other geospatial foundation models can get Day-1 support under a compatible code adaption.
 
-### Kernel fusion for lower backbone memory traffic
+### Kernel fusion for backbone memory traffic
 
 PyTorch Swin3D materializes many short-lived tensors at window-layout and AdaLN boundaries. Flash-Aurora fuses those steps on the backbone hot path:
 
 - **Fused window layout** (`triton_swin3d_layout.py`, `use_triton_layout`): cyclic shift, pad, 3D window partition, and inverse merge in fused Triton kernels instead of a chain of eager views and copies. For fixed inference shapes, `InferenceWorkspacePool` can reuse a scratch buffer for the backbone--decoder concat and related temporaries.
 - **Fused AdaLN and residual** (`triton_adaln.py`, `use_triton_adaln`): LayerNorm, FiLM modulation, and residual add without writing a full-width AdaLN intermediate.
 
-On `bf16_mixed@*` and `tf32@*` tiers, AdaLN can emit FP32 activations between Swin blocks (`output_fp32`), so the next block reads higher-precision residuals while GEMM and attention still use Tensor Cores. That reduces global-memory traffic relative to the decomposed PyTorch path without collapsing inter-block precision to BF16. Details: [Precision tiers](#precision-tiers).
+On `bf16_mixed@*` and `tf32@*` tiers, AdaLN can emit FP32 activations between Swin3D blocks (`output_fp32`), so the next block reads higher-precision residuals while GEMM and attention still use Tensor Cores. That reduces global-memory traffic relative to the decomposed PyTorch path without collapsing inter-block precision to BF16. Details: [Precision tiers](#precision-tiers).
 
 ### CuTe DSL window attention
 
