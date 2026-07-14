@@ -424,11 +424,29 @@ def run_backbone_with_dtype_routing(
     backbone_compute_dtype: torch.dtype | None = None,
     backbone_matmul_bf16: bool = False,
     backbone_matmul_tf32: bool = False,
-    lead_time: Any,
+    lead_time: Any = None,
+    lead_times: Any = None,
     patch_res: tuple[int, int, int],
     rollout_step: int,
 ) -> torch.Tensor:
-    """Shared backbone entry for eager forward and CUDA graph capture."""
+    """Shared backbone entry for eager forward and CUDA graph capture.
+
+    Pass either ``lead_time`` (optimized family, typically a ``timedelta``) or
+    ``lead_times`` (Aurora 1.5, hours tensor). Exactly one should be set.
+    """
+    if lead_times is not None:
+        backbone_kwargs: dict[str, Any] = {
+            "lead_times": lead_times,
+            "patch_res": patch_res,
+            "rollout_step": rollout_step,
+        }
+    else:
+        backbone_kwargs = {
+            "lead_time": lead_time,
+            "patch_res": patch_res,
+            "rollout_step": rollout_step,
+        }
+
     decoder_dtype = x.dtype
     with backbone_matmul_context(tf32=backbone_matmul_tf32, bf16=backbone_matmul_bf16):
         if autocast:
@@ -439,12 +457,7 @@ def run_backbone_with_dtype_routing(
             else:
                 device_type = "cpu"
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                x = backbone(
-                    x,
-                    lead_time=lead_time,
-                    patch_res=patch_res,
-                    rollout_step=rollout_step,
-                )
+                x = backbone(x, **backbone_kwargs)
             return finalize_backbone_output(x, decoder_dtype=decoder_dtype)
 
         if backbone_matmul_bf16 and not backbone_matmul_tf32 and not autocast:
@@ -456,12 +469,7 @@ def run_backbone_with_dtype_routing(
         ):
             x = prepare_backbone_input(x, backbone_compute_dtype)
 
-        x = backbone(
-            x,
-            lead_time=lead_time,
-            patch_res=patch_res,
-            rollout_step=rollout_step,
-        )
+        x = backbone(x, **backbone_kwargs)
 
         if backbone_matmul_bf16 and not autocast:
             return finalize_backbone_output(x, decoder_dtype=decoder_dtype)

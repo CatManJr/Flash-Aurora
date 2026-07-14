@@ -4,7 +4,7 @@ import contextlib
 import dataclasses
 import warnings
 from datetime import timedelta
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from flash_aurora.models.aurora.batch import Batch
+from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 from flash_aurora.models.aurora_v1p5.insolation import insolation
 from flash_aurora.models.aurora_v1p5.model.compat import (
     _adapt_checkpoint_air_pollution,
@@ -28,6 +29,14 @@ from flash_aurora.models.aurora_v1p5.model.lora import LoRAMode
 from flash_aurora.models.aurora_v1p5.model.perceiver import PerceiverAttention
 from flash_aurora.models.aurora_v1p5.model.swin3d import Swin3DTransformerBackbone, WindowAttention
 from flash_aurora.models.aurora_v1p5.normalisation import log_transform, log_untransform
+from flash_aurora.models.inference_precision import (
+    AuroraInferenceConfig,
+    AuroraInferencePrecision,
+    BackboneMatmulLevel,
+    EncoderDecoderMatmulLevel,
+    apply_inference_config,
+    resolve_inference_config,
+)
 
 __all__ = [
     "Aurora",
@@ -108,6 +117,14 @@ class Aurora(torch.nn.Module):
         rollout_input_clipping: Optional[dict[str, dict[str, Optional[float]]]] = None,
         output_only_surf_vars: tuple[str, ...] = (),
         output_only_atmos_vars: tuple[str, ...] = (),
+        inference_precision: Optional[Union[str, AuroraInferencePrecision]] = None,
+        backbone_matmul_level: Optional[Union[str, BackboneMatmulLevel]] = None,
+        encoder_decoder_matmul_level: Optional[Union[str, EncoderDecoderMatmulLevel]] = None,
+        use_triton_layout: bool = False,
+        use_triton_adaln: bool = False,
+        use_triton_mlp: bool = False,
+        use_cute_window_attn: bool = False,
+        workspace_pool: Optional[InferenceWorkspacePool] = None,
     ) -> None:
         """Construct an instance of the model.
 
@@ -218,8 +235,53 @@ class Aurora(torch.nn.Module):
             output_only_atmos_vars (tuple[str, ...], optional): Atmospheric variables that the
                 model predicts but that are not present in real input data. These will be
                 zero-padded in the input batch during rollout. Defaults to `()`.
+            inference_precision (str, optional): Named preset or combo string
+                (``backbone@encoder_decoder``). When set, enables Triton/CuTe Swin ops and
+                BF16/TF32 matmul routing; upstream FP16 autocast is disabled.
+            backbone_matmul_level / encoder_decoder_matmul_level: Optional overrides of
+                ``inference_precision`` levels.
+            use_triton_* / use_cute_window_attn: Manual Swin op flags when
+                ``inference_precision`` is unset; overwritten by the preset when set.
+            workspace_pool (InferenceWorkspacePool, optional): Optional scratch buffer pool for
+                the Swin backbone.
         """
         super().__init__()
+        self.inference_config: AuroraInferenceConfig | None = resolve_inference_config(
+            inference_precision,
+            backbone_matmul_level=backbone_matmul_level,
+            encoder_decoder_matmul_level=encoder_decoder_matmul_level,
+        )
+        if self.inference_config is not None:
+            preset_kwargs = apply_inference_config(
+                inference_precision,
+                backbone_matmul_level=backbone_matmul_level,
+                encoder_decoder_matmul_level=encoder_decoder_matmul_level,
+            )
+            autocast = preset_kwargs["autocast"]
+            window_attn_compute_dtype_name = preset_kwargs["window_attn_compute_dtype"]
+            use_triton_layout = preset_kwargs["use_triton_layout"]
+            use_triton_adaln = preset_kwargs["use_triton_adaln"]
+            use_triton_mlp = preset_kwargs["use_triton_mlp"]
+            use_cute_window_attn = preset_kwargs["use_cute_window_attn"]
+            autocast_encoder_decoder = preset_kwargs["autocast_encoder_decoder"]
+            encoder_decoder_use_tensor_core = preset_kwargs["encoder_decoder_use_tensor_core"]
+            # CuTe/Triton kernels expect BF16/FP32, not upstream FP16-safe attention.
+            use_fp16_safe_attention = False
+            autocast_dtype = torch.bfloat16
+        else:
+            window_attn_compute_dtype_name = "float32"
+            autocast_encoder_decoder = False
+            encoder_decoder_use_tensor_core = False
+
+        if use_cute_window_attn:
+            from flash_aurora.models.ops.cute._arch_env import ensure_cute_dsl_arch
+
+            ensure_cute_dsl_arch()
+
+        from flash_aurora.models.aurora.model.custom_op_paths import backbone_dtype_from_name
+
+        self.cute_window_attn_dtype = backbone_dtype_from_name(window_attn_compute_dtype_name)
+
         self.surf_vars = surf_vars
         self.static_vars = static_vars
         self.atmos_vars = atmos_vars
@@ -282,6 +344,12 @@ class Aurora(torch.nn.Module):
             lora_mode=lora_mode,
             stochastic=stochastic,
             use_updated_lead_time_embedding=use_updated_lead_time_embedding,
+            use_triton_layout=use_triton_layout,
+            use_triton_adaln=use_triton_adaln,
+            use_triton_mlp=use_triton_mlp,
+            use_cute_window_attn=use_cute_window_attn,
+            cute_window_attn_dtype=self.cute_window_attn_dtype,
+            workspace_pool=workspace_pool,
         )
 
         self.decoder = Perceiver3DDecoder(
@@ -313,6 +381,10 @@ class Aurora(torch.nn.Module):
 
         self.autocast = autocast
         self.autocast_dtype = autocast_dtype
+        self.autocast_encoder_decoder = autocast_encoder_decoder
+        self.encoder_decoder_use_tensor_core = encoder_decoder_use_tensor_core
+        # Upstream FP16 path (when inference_precision is unset): backbone-only by default;
+        # AuroraV1p5 may widen encoder/decoder autocast after super().__init__.
         self.autocast_encoder = False
         self.autocast_backbone = autocast
         self.autocast_decoder = False
@@ -338,6 +410,43 @@ class Aurora(torch.nn.Module):
             n (int): Number of steps for noise accumulation. Disables accumulation if `n=0`.
         """
         self.backbone.set_noise_accumulation(n)
+
+    def _run_backbone(
+        self,
+        x: torch.Tensor,
+        *,
+        lead_times: torch.Tensor,
+        patch_res: tuple[int, int, int],
+        rollout_step: int,
+    ) -> torch.Tensor:
+        """Run Swin3D backbone with preset-specific dtype routing (autocast or explicit BF16)."""
+        from flash_aurora.models.aurora.model.custom_op_paths import run_backbone_with_dtype_routing
+
+        backbone_compute_dtype = None
+        backbone_matmul_bf16 = False
+        backbone_matmul_tf32 = False
+        if self.inference_config is not None:
+            backbone_matmul_bf16 = self.inference_config.backbone_matmul_bf16
+            backbone_matmul_tf32 = self.inference_config.backbone_matmul_tf32
+            if (
+                not self.autocast
+                and not backbone_matmul_bf16
+                and not backbone_matmul_tf32
+                and self.inference_config.backbone_compute_dtype == "bfloat16"
+            ):
+                backbone_compute_dtype = self.cute_window_attn_dtype
+
+        return run_backbone_with_dtype_routing(
+            self.backbone,
+            x,
+            autocast=self.autocast,
+            backbone_compute_dtype=backbone_compute_dtype,
+            backbone_matmul_bf16=backbone_matmul_bf16,
+            backbone_matmul_tf32=backbone_matmul_tf32,
+            lead_times=lead_times,
+            patch_res=patch_res,
+            rollout_step=rollout_step,
+        )
 
     def forward(self, batch: Batch, lead_times: Optional[torch.Tensor] = None) -> Batch:
         """Forward pass.
@@ -411,36 +520,64 @@ class Aurora(torch.nn.Module):
             lead_hours = self.timestep.total_seconds() / 3600
             lead_times = torch.full((B,), lead_hours, device=p.device, dtype=p.dtype)
 
-        if torch.cuda.is_available():
-            device_type = "cuda"
-        elif torch.xpu.is_available():
-            device_type = "xpu"
-        else:
-            device_type = "cpu"
-        autocast = torch.autocast(device_type=device_type, dtype=self.autocast_dtype)
-        context_encoder = autocast if self.autocast_encoder else contextlib.nullcontext()
-        context_backbone = autocast if self.autocast_backbone else contextlib.nullcontext()
-        context_decoder = autocast if self.autocast_decoder else contextlib.nullcontext()
+        if self.inference_config is not None:
+            from flash_aurora.models.aurora.model.custom_op_paths import (
+                run_with_encoder_decoder_routing,
+            )
 
-        with context_encoder:
-            x = self.encoder(
+            x = run_with_encoder_decoder_routing(
+                self.encoder,
                 transformed_batch,
+                autocast_bf16=self.autocast_encoder_decoder,
+                use_tensor_core=self.encoder_decoder_use_tensor_core,
                 lead_times=lead_times,
             )
-        with context_backbone:
-            x = self.backbone(
+            x = self._run_backbone(
                 x,
                 lead_times=lead_times,
                 patch_res=patch_res,
                 rollout_step=batch.metadata.rollout_step,
             )
-        with context_decoder:
-            pred = self.decoder(
+            pred = run_with_encoder_decoder_routing(
+                self.decoder,
                 x,
                 batch,
+                autocast_bf16=self.autocast_encoder_decoder,
+                use_tensor_core=self.encoder_decoder_use_tensor_core,
                 lead_times=lead_times,
                 patch_res=patch_res,
             )
+        else:
+            if torch.cuda.is_available():
+                device_type = "cuda"
+            elif torch.xpu.is_available():
+                device_type = "xpu"
+            else:
+                device_type = "cpu"
+            autocast = torch.autocast(device_type=device_type, dtype=self.autocast_dtype)
+            context_encoder = autocast if self.autocast_encoder else contextlib.nullcontext()
+            context_backbone = autocast if self.autocast_backbone else contextlib.nullcontext()
+            context_decoder = autocast if self.autocast_decoder else contextlib.nullcontext()
+
+            with context_encoder:
+                x = self.encoder(
+                    transformed_batch,
+                    lead_times=lead_times,
+                )
+            with context_backbone:
+                x = self.backbone(
+                    x,
+                    lead_times=lead_times,
+                    patch_res=patch_res,
+                    rollout_step=batch.metadata.rollout_step,
+                )
+            with context_decoder:
+                pred = self.decoder(
+                    x,
+                    batch,
+                    lead_times=lead_times,
+                    patch_res=patch_res,
+                )
 
         # Remove batch and history dimension from static variables.
         pred = dataclasses.replace(
@@ -1154,9 +1291,11 @@ class AuroraV1p5(Aurora):
             autocast_dtype=autocast_dtype,
             **kw_args,
         )
-        self.autocast_encoder = autocast
-        self.autocast_backbone = autocast
-        self.autocast_decoder = autocast
+        # Upstream FP16 defaults: cast encoder/backbone/decoder. Precision presets disable this.
+        if self.inference_config is None:
+            self.autocast_encoder = autocast
+            self.autocast_backbone = autocast
+            self.autocast_decoder = autocast
 
         # Variable naming scheme assumes that all log-transformed variables start with "scaled_".
         self.log_transformed_surf_vars = tuple(v for v in self.surf_vars if v.startswith("scaled_"))

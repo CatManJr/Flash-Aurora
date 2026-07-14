@@ -31,6 +31,8 @@ _DEFAULT_VALID_TIME: dict[str, datetime] = {
     "hres_0.1": datetime(2022, 5, 11, 6),
     "cams": datetime(2022, 6, 11, 12),
     "tc_tracking": datetime(2022, 9, 17, 12),
+    "aurora_v1p5": datetime(2023, 1, 1, 6),
+    "aurora_v1p5_ensemble": datetime(2023, 1, 1, 6),
 }
 
 _DEFAULT_TIME_INDEX: dict[str, int] = {name: 1 for name in PRECISION_PRESETS}

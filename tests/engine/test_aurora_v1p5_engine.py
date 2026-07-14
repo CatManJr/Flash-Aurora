@@ -33,12 +33,12 @@ def test_preset_aurora_v1p5_registered() -> None:
     assert "cds_era5_v1p5" in DEFAULT_ADAPTERS.names()
 
 
-def test_model_factory_drops_optimized_kwargs_for_v1p5() -> None:
+def test_model_factory_accepts_inference_precision_for_v1p5() -> None:
     model = ModelFactory.create(
         "AuroraV1p5",
         use_lora=False,
         lora_mode="single",
-        inference_precision="bf16_mixed",
+        inference_precision="bf16_mixed@fp32",
         use_lora_merged_inference=True,
         surf_vars=("2t", "10u", "10v", "msl", "insolation", "scaled_tp_1h"),
         static_vars=("lsm", "z"),
@@ -54,6 +54,18 @@ def test_model_factory_drops_optimized_kwargs_for_v1p5() -> None:
         use_fp16_safe_attention=False,
     )
     assert isinstance(model, AuroraV1p5)
+    assert model.inference_config is not None
+    assert not any(
+        getattr(m, "use_fp16_safe_attention", False)
+        for m in model.modules()
+        if hasattr(m, "use_fp16_safe_attention")
+    )
+    # use_lora_merged_inference remains optimized-only and is stripped.
+    assert not any(
+        getattr(m, "use_lora_merged_inference", False)
+        for m in model.modules()
+        if hasattr(m, "use_lora_merged_inference")
+    )
 
 
 def test_validator_skips_output_only_surf_vars() -> None:

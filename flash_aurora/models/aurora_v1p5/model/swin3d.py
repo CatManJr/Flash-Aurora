@@ -6,6 +6,7 @@ Code adapted from
 
 """
 
+import contextlib
 import itertools
 import warnings
 from functools import lru_cache
@@ -17,6 +18,14 @@ import torch.nn.functional as F
 from einops import rearrange
 from timm.layers import DropPath, to_3tuple
 
+from flash_aurora.models.aurora.model.custom_op_paths import (
+    can_use_cute_qkvpacked,
+    can_use_cute_window_attention,
+    can_use_triton_adaln,
+    can_use_triton_gelu,
+    can_use_triton_layout,
+)
+from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 from flash_aurora.models.aurora_v1p5.model.film import AdaptiveLayerNorm
 from flash_aurora.models.aurora_v1p5.model.fourier import lead_time_expansion, lead_time_expansion_v3
 from flash_aurora.models.aurora_v1p5.model.lora import LoRAMode, LoRARollout
@@ -39,6 +48,7 @@ class MLP(nn.Module):
         out_features: Optional[int] = None,
         act_layer: type = nn.GELU,
         drop: float = 0.0,
+        use_triton_gelu: bool = False,
     ) -> None:
         """Initialise.
 
@@ -59,13 +69,43 @@ class MLP(nn.Module):
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
+        self.use_triton_gelu = use_triton_gelu
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
-        x = self.fc1(x)
-        x = self.act(x)
+        from flash_aurora.models.aurora.model.custom_op_paths import (
+            backbone_bf16_hybrid_matmul_active,
+            backbone_bf16_mlp_matmul_scope,
+        )
+
+        use_bf16_mlp = (
+            backbone_bf16_hybrid_matmul_active()
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+            and x.dtype in (torch.float32, torch.bfloat16)
+        )
+        if use_bf16_mlp:
+            with backbone_bf16_mlp_matmul_scope():
+                x = self.fc1(x)
+        else:
+            x = self.fc1(x)
+        if can_use_triton_gelu(
+            x,
+            enabled=self.use_triton_gelu,
+            training=self.training,
+            drop_p=self.drop.p,
+        ):
+            from flash_aurora.models.ops.triton_gelu import gelu_forward_triton
+
+            x = gelu_forward_triton(x)
+        else:
+            x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
+        if use_bf16_mlp:
+            with backbone_bf16_mlp_matmul_scope():
+                x = self.fc2(x)
+        else:
+            x = self.fc2(x)
         x = self.drop(x)
         return x
 
@@ -91,6 +131,9 @@ class WindowAttention(nn.Module):
         lora_steps: int = 40,
         lora_mode: LoRAMode = "single",
         use_lora: bool = False,
+        use_lora_merged_inference: bool = False,
+        use_cute_window_attn: bool = False,
+        cute_window_attn_dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialise.
 
@@ -112,6 +155,12 @@ class WindowAttention(nn.Module):
                 steps, `"from_second"` uses the same LoRA from the second roll-out step on,
                 and `"all"` uses a different LoRA for every roll-out step. Defaults to `"single"`.
             use_lora (bool, optional): Enable LoRA. By default, LoRA is disabled.
+            use_lora_merged_inference (bool, optional): Merge LoRA into base linear weights during
+                inference to reduce extra GEMM/IO. Defaults to `False`.
+            use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
+                core on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel (BF16 I/O,
+                FP32 accumulators); float32 tensors delegate to torch SDPA with TF32 enabled.
+                Requires ``attn_drop=0``. Defaults to ``False``.
         """
         super().__init__()
 
@@ -120,11 +169,18 @@ class WindowAttention(nn.Module):
         self.num_heads = num_heads
         assert dim % num_heads == 0, f"dim ({dim}) should be divisible by num_heads ({num_heads})."
         self.head_dim = dim // num_heads
+        self.use_cute_window_attn = use_cute_window_attn
+        self.cute_window_attn_dtype = cute_window_attn_dtype
 
         self.attn_drop = attn_drop
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.use_lora_merged_inference = use_lora_merged_inference
+        self._merged_linear_cache: dict[
+            tuple[str, torch.device, torch.dtype, int],
+            tuple[torch.Tensor, tuple[int, int, int, int, int]],
+        ] = {}
         self.use_fp16_safe_attention = False
 
         if use_lora:
@@ -137,6 +193,64 @@ class WindowAttention(nn.Module):
         else:
             self.lora_proj = lambda *args, **kwargs: 0  # type: ignore
             self.lora_qkv = lambda *args, **kwargs: 0  # type: ignore
+
+    def _state_token(self, linear: nn.Linear, lora: LoRARollout, step: int) -> tuple[int, int, int, int, int]:
+        layer = lora.layer_for_step(step)
+        if layer is None:
+            return (
+                int(getattr(linear.weight, "_version", 0)),
+                int(getattr(linear.bias, "_version", -1)) if linear.bias is not None else -1,
+                -1,
+                -1,
+                step,
+            )
+        return (
+            int(getattr(linear.weight, "_version", 0)),
+            int(getattr(linear.bias, "_version", -1)) if linear.bias is not None else -1,
+            int(getattr(layer.lora_A, "_version", 0)),
+            int(getattr(layer.lora_B, "_version", 0)),
+            step,
+        )
+
+    def _linear_with_optional_lora_merge(
+        self,
+        x: torch.Tensor,
+        linear: nn.Linear,
+        lora: LoRARollout,
+        *,
+        step: int,
+        cache_name: str,
+    ) -> torch.Tensor:
+        should_merge = (
+            self.use_lora_merged_inference
+            and (not self.training)
+            and (not torch.is_grad_enabled())
+            and x.is_cuda
+        )
+        if not should_merge:
+            return linear(x) + lora(x, step)
+
+        layer = lora.layer_for_step(step)
+        if layer is None:
+            return linear(x)
+
+        key = (cache_name, x.device, x.dtype, step)
+        token = self._state_token(linear, lora, step)
+        cached = self._merged_linear_cache.get(key)
+        if cached is not None and cached[1] == token:
+            merged_weight = cached[0]
+        else:
+            merged_weight = linear.weight + layer.delta_weight(
+                device=linear.weight.device,
+                dtype=linear.weight.dtype,
+            )
+            merged_weight = merged_weight.to(device=x.device, dtype=x.dtype)
+            self._merged_linear_cache[key] = (merged_weight, token)
+
+        bias = linear.bias
+        if bias is not None and (bias.device != x.device or bias.dtype != x.dtype):
+            bias = bias.to(device=x.device, dtype=x.dtype)
+        return F.linear(x, merged_weight, bias)
 
     def forward(
         self,
@@ -156,30 +270,149 @@ class WindowAttention(nn.Module):
         Returns:
             torch.Tensor: Output of shape `(nW*B, N, C)`.
         """
-        qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
-        qkv = rearrange(qkv, "B N (qkv H D) -> qkv B H N D", H=self.num_heads, qkv=3)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        from flash_aurora.models.aurora.model.custom_op_paths import (
+            backbone_bf16_attention_matmul_scope,
+            backbone_bf16_matmul_active,
+            backbone_bf16_speed_stream_active,
+            cast_activation_dtype,
+            use_bf16_fused_attention_chain,
+        )
+
+        use_bf16_fused_chain = use_bf16_fused_attention_chain(
+            use_cute_window_attn=self.use_cute_window_attn,
+            cute_window_attn_dtype=self.cute_window_attn_dtype,
+            is_cuda=x.is_cuda,
+        )
+        bf16_cute_attn = (
+            backbone_bf16_matmul_active()
+            and self.cute_window_attn_dtype == torch.bfloat16
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+        )
+        # bf16 speed stream keeps BF16 activations; bf16_mixed keeps FP32 between blocks.
+        if x.dtype == torch.bfloat16 and not bf16_cute_attn:
+            x = cast_activation_dtype(x, torch.float32)
+
+        qkv_scope = (
+            backbone_bf16_attention_matmul_scope()
+            if use_bf16_fused_chain
+            else contextlib.nullcontext()
+        )
+        with qkv_scope:
+            if isinstance(self.lora_qkv, LoRARollout):
+                qkv = self._linear_with_optional_lora_merge(
+                    x,
+                    self.qkv,
+                    self.lora_qkv,
+                    step=rollout_step,
+                    cache_name="qkv",
+                )
+            else:
+                qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
         attn_dropout = self.attn_drop if self.training else 0.0
 
-        if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(0)  # (1, nW, 1, ws, ws)
-            # Repeat the mask for every batch size and merge `B` and `nW` into one
-            # dimension.
-            B = q.shape[0] // mask.shape[1]
-            mask = mask.repeat(B, 1, 1, 1, 1).reshape(-1, *mask.shape[2:])
-
-        sdpa = (
-            fp16_safe_scaled_dot_product_attention
-            if self.use_fp16_safe_attention
-            else F.scaled_dot_product_attention
+        use_cute = can_use_cute_window_attention(
+            qkv,
+            enabled=self.use_cute_window_attn,
+            training=self.training,
+            attn_dropout=attn_dropout,
         )
-        if mask is not None:
-            x = sdpa(q, k, v, attn_mask=mask, dropout_p=attn_dropout)
-        else:
-            x = sdpa(q, k, v, dropout_p=attn_dropout)
+        use_cute_qkvpacked = can_use_cute_qkvpacked(
+            qkv,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            cute_enabled=self.use_cute_window_attn,
+            training=self.training,
+            attn_dropout=attn_dropout,
+        )
+        if use_cute_qkvpacked:
+            from flash_aurora.models.ops.cute import window_attn_fwd_cute_qkvpacked
 
-        x = rearrange(x, "B H N D -> B N (H D)")
-        x = self.proj(x) + self.lora_proj(x, rollout_step)
+            if qkv.dtype != self.cute_window_attn_dtype:
+                qkv = qkv.to(dtype=self.cute_window_attn_dtype, non_blocking=True)
+            bias = None
+            if mask is not None:
+                bias = mask.to(
+                    dtype=torch.float32,
+                    device=qkv.device,
+                    non_blocking=True,
+                )
+            if bias is not None and not bias.is_contiguous():
+                bias = bias.contiguous()
+            x = window_attn_fwd_cute_qkvpacked(
+                qkv,
+                self.num_heads,
+                bias=bias,
+                output_layout="bnc",
+            )
+        else:
+            qkv = rearrange(qkv, "B N (qkv H D) -> qkv B H N D", H=self.num_heads, qkv=3)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            if use_cute:
+                from flash_aurora.models.ops.cute import WinAttnPrecision, window_attn_fwd_cute
+
+                if self.cute_window_attn_dtype == torch.bfloat16 and q.dtype != torch.bfloat16:
+                    q, k, v = (
+                        q.to(torch.bfloat16, non_blocking=True),
+                        k.to(torch.bfloat16, non_blocking=True),
+                        v.to(torch.bfloat16, non_blocking=True),
+                    )
+                precision = (
+                    WinAttnPrecision.BF16_MIXED
+                    if q.dtype == torch.bfloat16
+                    else WinAttnPrecision.TF32_ACC_FP32
+                )
+                # Bias kept as float32: the CuTeDSL kernel takes FP32 bias.
+                bias = None
+                if mask is not None:
+                    bias = mask.to(
+                        dtype=torch.float32,
+                        device=q.device,
+                        non_blocking=True,
+                    )
+                if bias is not None and not bias.is_contiguous():
+                    bias = bias.contiguous()
+                if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+                    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+                x = window_attn_fwd_cute(q, k, v, bias=bias, precision=precision)
+            else:
+                sdpa = (
+                    fp16_safe_scaled_dot_product_attention
+                    if self.use_fp16_safe_attention
+                    else F.scaled_dot_product_attention
+                )
+                if mask is not None:
+                    mask = mask.unsqueeze(1).unsqueeze(0)  # (1, nW, 1, ws, ws)
+                    # Repeat the mask for every batch size and merge `B` and `nW` into one
+                    # dimension.
+                    B = q.shape[0] // mask.shape[1]
+                    mask = mask.repeat(B, 1, 1, 1, 1).reshape(-1, *mask.shape[2:])
+                    x = sdpa(q, k, v, attn_mask=mask, dropout_p=attn_dropout)
+                else:
+                    x = sdpa(q, k, v, dropout_p=attn_dropout)
+            x = rearrange(x, "B H N D -> B N (H D)")
+        # AdaLN requires FP32 branch input.  Fused BF16 chain keeps proj in BF16 and
+        # promotes once after proj instead of casting attn output to FP32 mid-chain.
+        if bf16_cute_attn and not use_bf16_fused_chain and x.dtype == torch.bfloat16:
+            x = cast_activation_dtype(x, torch.float32)
+        proj_scope = (
+            backbone_bf16_attention_matmul_scope()
+            if use_bf16_fused_chain
+            else contextlib.nullcontext()
+        )
+        with proj_scope:
+            if isinstance(self.lora_proj, LoRARollout):
+                x = self._linear_with_optional_lora_merge(
+                    x,
+                    self.proj,
+                    self.lora_proj,
+                    step=rollout_step,
+                    cache_name="proj",
+                )
+            else:
+                x = self.proj(x) + self.lora_proj(x, rollout_step)
+        if use_bf16_fused_chain and x.dtype == torch.bfloat16 and not backbone_bf16_speed_stream_active():
+            x = cast_activation_dtype(x, torch.float32)
         x = self.proj_drop(x)
         return x
 
@@ -394,6 +627,12 @@ class Swin3DTransformerBlock(nn.Module):
         lora_steps: int = 40,
         lora_mode: LoRAMode = "single",
         use_lora: bool = False,
+        use_triton_layout: bool = False,
+        use_triton_adaln: bool = False,
+        use_triton_mlp: bool = False,
+        use_lora_merged_inference: bool = False,
+        use_cute_window_attn: bool = False,
+        cute_window_attn_dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialise.
 
@@ -420,6 +659,17 @@ class Swin3DTransformerBlock(nn.Module):
                 steps, `"from_second"` uses the same LoRA from the second roll-out step on,
                 and `"all"` uses a different LoRA for every roll-out step. Defaults to `"single"`.
             use_lora (bool): Enable LoRA. By default, LoRA is disabled.
+            use_triton_layout (bool, optional): Fused roll/pad/window layout on CUDA float32.
+                Defaults to `False`.
+            use_triton_adaln (bool, optional): Fused AdaLN forward on CUDA float32. Defaults to
+                `False`.
+            use_triton_mlp (bool, optional): Use Triton GELU in MLP for inference-only
+                ``drop=0`` CUDA float32 path. Defaults to `False`.
+            use_lora_merged_inference (bool, optional): Merge LoRA with base linear in
+                attention inference path to reduce extra GEMM/IO. Defaults to `False`.
+            use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
+                core on CUDA inference paths (BF16 -> CuTeDSL kernel; float32 -> torch SDPA).
+                Defaults to ``False``.
         """
         super().__init__()
         self.dim = dim
@@ -427,8 +677,12 @@ class Swin3DTransformerBlock(nn.Module):
         self.shift_size = shift_size
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
+        self.use_triton_layout = use_triton_layout
+        self._layout_pool: Optional[InferenceWorkspacePool] = None
 
-        self.norm1 = AdaptiveLayerNorm(dim, time_dim, scale_bias=scale_bias)
+        self.norm1 = AdaptiveLayerNorm(
+            dim, time_dim, scale_bias=scale_bias, use_triton=use_triton_adaln
+        )
         self.attn = WindowAttention(
             dim,
             window_size=self.window_size,
@@ -439,16 +693,22 @@ class Swin3DTransformerBlock(nn.Module):
             lora_steps=lora_steps,
             use_lora=use_lora,
             lora_mode=lora_mode,
+            use_lora_merged_inference=use_lora_merged_inference,
+            use_cute_window_attn=use_cute_window_attn,
+            cute_window_attn_dtype=cute_window_attn_dtype,
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = AdaptiveLayerNorm(dim, time_dim, scale_bias=scale_bias)
+        self.norm2 = AdaptiveLayerNorm(
+            dim, time_dim, scale_bias=scale_bias, use_triton=use_triton_adaln
+        )
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = MLP(
             in_features=dim,
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
             drop=drop,
+            use_triton_gelu=use_triton_mlp,
         )
 
     def forward(
@@ -477,49 +737,89 @@ class Swin3DTransformerBlock(nn.Module):
 
         # If the window size is larger than the input resolution, we do not partition windows.
         ws, ss = maybe_adjust_windows(self.window_size, self.shift_size, res)
-
         shortcut = x
-        x = x.view(B, C, H, W, D)
+        x_5d = x.view(B, C, H, W, D)
 
-        # Perform cyclic shift.
         if not all(s == 0 for s in ss):
-            shifted_x = torch.roll(x, shifts=(-ss[0], -ss[1], -ss[2]), dims=(1, 2, 3))
             attn_mask, _ = compute_3d_shifted_window_mask(
                 C, H, W, ws, ss, x.device, x.dtype, warped=warped
             )
         else:
-            shifted_x = x
             attn_mask = None
 
-        # Pad the input to multiple of window size.
-        pad_size = ((-C) % ws[0], (-H) % ws[1], (-W) % ws[2])
-        shifted_x = pad_3d(shifted_x, pad_size)
+        use_triton = can_use_triton_layout(x_5d, enabled=self.use_triton_layout)
+        if use_triton:
+            from flash_aurora.models.ops.triton_swin3d_layout import (
+                crop_roll_unmerge_windows_triton,
+                roll_pad_partition_windows_triton,
+            )
 
-        # Partition the patches/tokens into windows.
-        x_windows = window_partition_3d(shifted_x, ws)  # (nW*B, ws, ws, D)
-        x_windows = x_windows.view(-1, ws[0] * ws[1] * ws[2], D)  # (nW*B, ws*ws, D)
-
-        # W-MSA/SW-MSA. Has shape (nW*B, ws*ws, D).
-        attn_windows = self.attn(x_windows, mask=attn_mask, rollout_step=rollout_step)
-
-        # Merge the windows into the original input (patch) resolution.
-        attn_windows = attn_windows.view(-1, ws[0], ws[1], ws[2], D)  # (nW*B, Wc, Wh, Ww, D)
-        _, pad_C, pad_H, pad_W, _ = shifted_x.shape
-        shifted_x = window_reverse_3d(attn_windows, ws, pad_C, pad_H, pad_W)  # (B C' H' W' D)
-
-        # Reverse the padding after the attention computations are done.
-        shifted_x = crop_3d(shifted_x, pad_size)
-
-        # Reverse the cyclic shift.
-        if not all(s == 0 for s in ss):
-            x = torch.roll(shifted_x, shifts=(ss[0], ss[1], ss[2]), dims=(1, 2, 3))
+            x_windows = roll_pad_partition_windows_triton(
+                x_5d, res, self.window_size, self.shift_size, pool=self._layout_pool
+            )
+            attn_windows = self.attn(x_windows, mask=attn_mask, rollout_step=rollout_step)
+            x = crop_roll_unmerge_windows_triton(
+                attn_windows, res, self.window_size, self.shift_size, pool=self._layout_pool
+            )
+            x = x.reshape(B, C * H * W, D)
         else:
-            x = shifted_x
+            # Perform cyclic shift.
+            if not all(s == 0 for s in ss):
+                shifted_x = torch.roll(
+                    x_5d, shifts=(-ss[0], -ss[1], -ss[2]), dims=(1, 2, 3)
+                )
+            else:
+                shifted_x = x_5d
 
-        x = x.reshape(B, C * H * W, D)
+            # Pad the input to multiple of window size.
+            pad_size = ((-C) % ws[0], (-H) % ws[1], (-W) % ws[2])
+            shifted_x = pad_3d(shifted_x, pad_size)
 
-        x = shortcut + self.drop_path(self.norm1(x, c))
-        x = x + self.drop_path(self.norm2(self.mlp(x), c))
+            # Partition the patches/tokens into windows.
+            x_windows = window_partition_3d(shifted_x, ws)  # (nW*B, ws, ws, D)
+            x_windows = x_windows.view(-1, ws[0] * ws[1] * ws[2], D)  # (nW*B, ws*ws, D)
+
+            # W-MSA/SW-MSA. Has shape (nW*B, ws*ws, D).
+            attn_windows = self.attn(x_windows, mask=attn_mask, rollout_step=rollout_step)
+
+            # Merge the windows into the original input (patch) resolution.
+            attn_windows = attn_windows.view(-1, ws[0], ws[1], ws[2], D)  # (nW*B, Wc, Wh, Ww, D)
+            _, pad_C, pad_H, pad_W, _ = shifted_x.shape
+            shifted_x = window_reverse_3d(attn_windows, ws, pad_C, pad_H, pad_W)  # (B C' H' W' D)
+
+            # Reverse the padding after the attention computations are done.
+            shifted_x = crop_3d(shifted_x, pad_size)
+
+            # Reverse the cyclic shift.
+            if not all(s == 0 for s in ss):
+                x = torch.roll(shifted_x, shifts=(ss[0], ss[1], ss[2]), dims=(1, 2, 3))
+            else:
+                x = shifted_x
+
+            x = x.reshape(B, C * H * W, D)
+
+        use_d2_adaln_residual = can_use_triton_adaln(
+            shortcut,
+            enabled=self.norm1.use_triton,
+            training=self.training,
+            drop_path_is_identity=isinstance(self.drop_path, nn.Identity),
+        )
+        if use_d2_adaln_residual:
+            x = self.norm1.forward_add_residual(shortcut, x, c)
+        else:
+            x = shortcut + self.drop_path(self.norm1(x, c))
+
+        h = self.mlp(x)
+        use_d2_norm2 = can_use_triton_adaln(
+            x,
+            enabled=self.norm2.use_triton,
+            training=self.training,
+            drop_path_is_identity=isinstance(self.drop_path, nn.Identity),
+        )
+        if use_d2_norm2:
+            x = self.norm2.forward_add_residual(x, h, c)
+        else:
+            x = x + self.drop_path(self.norm2(h, c))
         return x
 
 
@@ -661,6 +961,12 @@ class BasicLayer3D(nn.Module):
         lora_steps: int = 40,
         lora_mode: LoRAMode = "single",
         use_lora: bool = False,
+        use_triton_layout: bool = False,
+        use_triton_adaln: bool = False,
+        use_triton_mlp: bool = False,
+        use_lora_merged_inference: bool = False,
+        use_cute_window_attn: bool = False,
+        cute_window_attn_dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialise.
 
@@ -686,6 +992,16 @@ class BasicLayer3D(nn.Module):
                 steps, `"from_second"` uses the same LoRA from the second roll-out step on,
                 and `"all"` uses a different LoRA for every roll-out step. Defaults to `"single"`.
             use_lora (bool): Enable LoRA. By default, LoRA is disabled.
+            use_triton_layout (bool, optional): Fused window layout on CUDA float32. Defaults to
+                `False`.
+            use_triton_adaln (bool, optional): Fused AdaLN on CUDA float32. Defaults to `False`.
+            use_triton_mlp (bool, optional): Use Triton GELU in MLP for inference-only
+                ``drop=0`` CUDA float32 path. Defaults to `False`.
+            use_lora_merged_inference (bool, optional): Merge LoRA with base linear in
+                attention inference path to reduce extra GEMM/IO. Defaults to `False`.
+            use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
+                core on CUDA inference paths (BF16 -> CuTeDSL kernel; float32 -> torch SDPA).
+                Defaults to ``False``.
         """
         super().__init__()
 
@@ -714,6 +1030,12 @@ class BasicLayer3D(nn.Module):
                     use_lora=use_lora,
                     lora_steps=lora_steps,
                     lora_mode=lora_mode,
+                    use_triton_layout=use_triton_layout,
+                    use_triton_adaln=use_triton_adaln,
+                    use_triton_mlp=use_triton_mlp,
+                    use_lora_merged_inference=use_lora_merged_inference,
+                    use_cute_window_attn=use_cute_window_attn,
+                    cute_window_attn_dtype=cute_window_attn_dtype,
                 )
                 for i in range(depth)
             ]
@@ -794,6 +1116,13 @@ class Swin3DTransformerBackbone(nn.Module):
         lora_steps: int = 40,
         lora_mode: LoRAMode = "single",
         use_lora: bool = False,
+        use_triton_layout: bool = False,
+        use_triton_adaln: bool = False,
+        use_triton_mlp: bool = False,
+        use_lora_merged_inference: bool = False,
+        use_cute_window_attn: bool = False,
+        cute_window_attn_dtype: torch.dtype = torch.float32,
+        workspace_pool: Optional[InferenceWorkspacePool] = None,
         stochastic: bool = False,
         use_updated_lead_time_embedding: bool = False,
     ) -> None:
@@ -822,6 +1151,20 @@ class Swin3DTransformerBackbone(nn.Module):
                 steps, `"from_second"` uses the same LoRA from the second roll-out step on,
                 and `"all"` uses a different LoRA for every roll-out step. Defaults to `"single"`.
             use_lora (bool, optional): Enable LoRA. By default, LoRA is disabled.
+            use_triton_layout (bool, optional): Fused roll/pad/window layout on CUDA float32.
+                Defaults to `False`.
+            use_triton_adaln (bool, optional): Fused AdaLN on CUDA float32. Defaults to `False`.
+            use_triton_mlp (bool, optional): Use Triton GELU in MLP for inference-only
+                ``drop=0`` CUDA float32 path. Defaults to `False`.
+            use_lora_merged_inference (bool, optional): Merge LoRA with base linear in
+                attention inference path to reduce extra GEMM/IO. Defaults to `False`.
+            use_cute_window_attn (bool, optional): Use :mod:`aurora.ops.cute` for the attention
+                core on CUDA inference paths.  BF16 tensors use the CuTeDSL kernel (BF16 I/O,
+                FP32 accumulators); float32 tensors delegate to torch SDPA with TF32 enabled.
+                Requires ``attn_drop_rate=0``. Defaults to ``False``.
+            workspace_pool (InferenceWorkspacePool, optional): Optional scratch buffer pool
+                for inference (e.g. last decoder ``cat``). If ``None``, tensors are allocated
+                each forward. Defaults to ``None``.
             stochastic (bool, optional): If `True`, enable stochastic mode with noise injection.
                 Defaults to `False`.
             use_updated_lead_time_embedding (bool, optional): Whether to use the updated lead time
@@ -829,6 +1172,7 @@ class Swin3DTransformerBackbone(nn.Module):
         """
         super().__init__()
 
+        self.workspace_pool = workspace_pool
         self.window_size = to_3tuple(window_size)
         self.num_encoder_layers = len(encoder_depths)
         self.num_decoder_layers = len(decoder_depths)
@@ -881,6 +1225,12 @@ class Swin3DTransformerBackbone(nn.Module):
                 use_lora=use_lora,
                 lora_steps=lora_steps,
                 lora_mode=lora_mode,
+                use_triton_layout=use_triton_layout,
+                use_triton_adaln=use_triton_adaln,
+                use_triton_mlp=use_triton_mlp,
+                use_lora_merged_inference=use_lora_merged_inference,
+                use_cute_window_attn=use_cute_window_attn,
+                cute_window_attn_dtype=cute_window_attn_dtype,
             )
             self.encoder_layers.append(layer)
             if self.stochastic and downsample is not None:
@@ -905,6 +1255,12 @@ class Swin3DTransformerBackbone(nn.Module):
                 use_lora=use_lora,
                 lora_steps=lora_steps,
                 lora_mode=lora_mode,
+                use_triton_layout=use_triton_layout,
+                use_triton_adaln=use_triton_adaln,
+                use_triton_mlp=use_triton_mlp,
+                use_lora_merged_inference=use_lora_merged_inference,
+                use_cute_window_attn=use_cute_window_attn,
+                cute_window_attn_dtype=cute_window_attn_dtype,
             )
             self.decoder_layers.append(layer)
 
@@ -1048,7 +1404,18 @@ class Swin3DTransformerBackbone(nn.Module):
                 x = x + skips[index - 1]
             elif i == self.num_decoder_layers - 1:
                 # For the last stage, we perform concatentation like in Pangu.
-                x = torch.cat([x, skips[0]], dim=-1)
+                if self.workspace_pool is not None:
+                    d_cat = x.shape[-1] + skips[0].shape[-1]
+                    buf = self.workspace_pool.get(
+                        "decoder_concat_skip0",
+                        (x.shape[0], x.shape[1], d_cat),
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    torch.cat([x, skips[0]], dim=-1, out=buf)
+                    x = buf
+                else:
+                    x = torch.cat([x, skips[0]], dim=-1)
 
             if self.stochastic:
                 c = saved_cs[index - 1]

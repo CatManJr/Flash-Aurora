@@ -29,13 +29,13 @@ MODEL_REGISTRY: dict[str, type] = {
     "AuroraV1p5Ensemble": AuroraV1p5Ensemble,
 }
 
-# Kwargs that belong to the optimized flash family only.
+# Kwargs that belong to the optimized flash family only (not yet on Aurora 1.5).
 _OPTIMIZED_ONLY_KWARGS: frozenset[str] = frozenset(
     {
-        "inference_precision",
         "use_lora_merged_inference",
     }
 )
+
 
 
 class ModelFactory:

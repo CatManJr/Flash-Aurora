@@ -49,3 +49,23 @@ def test_warmup_forwards_zero_iters_is_noop() -> None:
     out = warmup_forwards(model, batch, iters=0, device=torch.device("cpu"))
     assert out is batch
     model.forward.assert_not_called()
+
+
+def test_warmup_forwards_passes_lead_times_for_v1p5() -> None:
+    from datetime import timedelta
+
+    batch = _tiny_batch()
+    model = MagicMock()
+    model.timestep = timedelta(hours=6)
+    model.forward.return_value = batch
+    # Structural marker used by model_uses_v1p5_rollout.
+    model.variable_lead_time = True
+
+    out = warmup_forwards(model, batch, iters=2, device=torch.device("cpu"))
+    assert out is batch
+    assert model.forward.call_count == 2
+    for call in model.forward.call_args_list:
+        assert call.args[0] is batch
+        lead_times = call.kwargs["lead_times"]
+        assert lead_times.shape == (1,)
+        assert float(lead_times[0]) == 6.0

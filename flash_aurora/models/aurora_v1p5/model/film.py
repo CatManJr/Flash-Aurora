@@ -1,5 +1,8 @@
 """Copyright (c) Microsoft Corporation. Licensed under the MIT license.
 
+This file includes modifications and original contributions by Catman Jr.;
+those portions are licensed under the MIT License (see LICENSE).
+
 `AdaptiveLayerNorm` was inspired by the following file:
 
     https://github.com/facebookresearch/DiT/blob/ed81ce2229091fd4ecc9a223645f95cf379d582b/models.py#L101
@@ -14,19 +17,28 @@ __all__ = ["AdaptiveLayerNorm"]
 class AdaptiveLayerNorm(nn.Module):
     """Adaptive layer normalisation with scale and shift modulation."""
 
-    def __init__(self, dim: int, context_dim: int, scale_bias: float = 0) -> None:
+    def __init__(
+        self,
+        dim: int,
+        context_dim: int,
+        scale_bias: float = 0,
+        use_triton: bool = False,
+    ) -> None:
         """Initialise.
 
         Args:
-            dim (int): Input dimension.
+            dim (int): Input dimensionality.
             context_dim (int): Dimension of the conditioning signal.
             scale_bias (float, optional): Scale bias to add to the scaling factor. Defaults to `0`.
+            use_triton (bool, optional): Use fused CUDA Triton for LayerNorm + modulation when
+                inputs are float32 on CUDA. Defaults to `False`.
         """
         super().__init__()
 
         self.ln = nn.LayerNorm(dim, elementwise_affine=False)
         self.ln_modulation = nn.Sequential(nn.SiLU(), nn.Linear(context_dim, dim * 2))
         self.scale_bias = scale_bias
+        self.use_triton = use_triton
 
         self.init_weights()
 
@@ -34,6 +46,32 @@ class AdaptiveLayerNorm(nn.Module):
         """Initialise the weights."""
         nn.init.zeros_(self.ln_modulation[-1].weight)
         nn.init.zeros_(self.ln_modulation[-1].bias)
+
+    def _adaln_branch_input(self, x: torch.Tensor) -> torch.Tensor:
+        """AdaLN must run on FP32 activations; BF16 branch inputs explode numerically."""
+        if x.dtype == torch.float32:
+            return x
+        from flash_aurora.models.aurora.model.custom_op_paths import cast_activation_dtype
+
+        return cast_activation_dtype(x, torch.float32)
+
+    def _finalize_adaln_output(self, x: torch.Tensor) -> torch.Tensor:
+        from flash_aurora.models.aurora.model.custom_op_paths import downcast_bf16_speed_activation
+
+        return downcast_bf16_speed_activation(x)
+
+    def _use_triton_film(self, x: torch.Tensor) -> bool:
+        from flash_aurora.models.aurora.model.custom_op_paths import triton_elemwise_dtype_ok
+
+        return self.use_triton and x.is_cuda and triton_elemwise_dtype_ok(x.dtype)
+
+    def _modulate(self, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(shift, scale)`` for conditioning of shape ``(B, D)`` or ``(B, L, D)``."""
+        c = self.ln_modulation(c)
+        if c.ndim == 2:
+            c = c.unsqueeze(1)
+        shift, scale = c.chunk(2, dim=-1)
+        return shift, scale
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -45,8 +83,62 @@ class AdaptiveLayerNorm(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape `(B, L, D)`.
         """
-        c = self.ln_modulation(c)
-        if c.ndim == 2:
-            c = c.unsqueeze(1)
-        shift, scale = c.chunk(2, dim=-1)
-        return self.ln(x) * (self.scale_bias + scale) + shift
+        shift, scale = self._modulate(c)
+        x = self._adaln_branch_input(x)
+        # Triton FiLM path only supports batch conditioning broadcast over L.
+        if self._use_triton_film(x) and shift.shape[1] == 1:
+            from flash_aurora.models.ops.triton_adaln import adaptive_layernorm_film_forward
+
+            return self._finalize_adaln_output(
+                adaptive_layernorm_film_forward(
+                    x,
+                    scale,
+                    shift,
+                    float(self.scale_bias),
+                    float(self.ln.eps),
+                    output_fp32=True,
+                )
+            )
+        return self._finalize_adaln_output(self.ln(x) * (self.scale_bias + scale) + shift)
+
+    def forward_add_residual(
+        self, residual: torch.Tensor, x: torch.Tensor, c: torch.Tensor
+    ) -> torch.Tensor:
+        """Return ``residual + self.forward(x, c)`` with one modulation of ``c``.
+
+        When ``use_triton`` and CUDA float32 with batch conditioning, uses a fused kernel that
+        avoids writing a full intermediate AdaLN tensor before the add. ``residual`` must not
+        alias ``x``. Per-token conditioning ``(B, L, D)`` always uses the eager path.
+
+        Args:
+            residual: Tensor of shape ``(B, L, D)``.
+            x: Same shape; AdaLN input (e.g. attention or MLP output).
+            c: Conditioning ``(B, context_dim)`` or ``(B, L, context_dim)``.
+
+        Returns:
+            Tensor of shape ``(B, L, D)``.
+        """
+        shift, scale = self._modulate(c)
+        x = self._adaln_branch_input(x)
+        if (
+            self.use_triton
+            and residual.is_cuda
+            and residual.dtype == torch.float32
+            and self._use_triton_film(x)
+            and shift.shape[1] == 1
+        ):
+            from flash_aurora.models.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
+
+            return self._finalize_adaln_output(
+                adaptive_layernorm_film_add_residual_forward(
+                    residual,
+                    x,
+                    scale,
+                    shift,
+                    float(self.scale_bias),
+                    float(self.ln.eps),
+                    output_fp32=True,
+                )
+            )
+        branch = self.ln(x) * (self.scale_bias + scale) + shift
+        return residual + self._finalize_adaln_output(branch)

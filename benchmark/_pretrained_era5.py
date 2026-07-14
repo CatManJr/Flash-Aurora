@@ -509,9 +509,25 @@ def time_forward(
     repeat: int,
     device: torch.device,
 ) -> tuple[Any, float, float, float]:
+    def _call_forward() -> Any:
+        from flash_aurora.engine.core.model_protocol import model_uses_v1p5_rollout
+
+        if model_uses_v1p5_rollout(model):
+            batch_size = next(iter(batch.surf_vars.values())).shape[0]
+            param = next(model.parameters())
+            lead_hours = model.timestep.total_seconds() / 3600.0
+            lead_times = torch.full(
+                (batch_size,),
+                lead_hours,
+                device=param.device,
+                dtype=param.dtype,
+            )
+            return model.forward(batch, lead_times=lead_times)
+        return model.forward(batch)
+
     with torch.inference_mode():
         for _ in range(warmup):
-            _ = model.forward(batch)
+            _ = _call_forward()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
@@ -522,7 +538,7 @@ def time_forward(
             start.record()
             pred = None
             for _ in range(repeat):
-                pred = model.forward(batch)
+                pred = _call_forward()
             end.record()
             torch.cuda.synchronize(device)
             ms_total = start.elapsed_time(end)
@@ -534,7 +550,7 @@ def time_forward(
             t0 = time.perf_counter()
             pred = None
             for _ in range(repeat):
-                pred = model.forward(batch)
+                pred = _call_forward()
             ms_total = (time.perf_counter() - t0) * 1e3
             peak_alloc = float("nan")
             peak_reserved = float("nan")

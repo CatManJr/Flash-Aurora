@@ -159,15 +159,11 @@ class AuroraEngine:
         if hf_token is not None:
             config.hf_token = hf_token
         if inference_precision is not None:
-            if is_v1p5_model_class(config.variant.model_class):
-                raise ValueError(
-                    "inference_precision is only supported for the optimized Aurora family; "
-                    "Aurora 1.5 uses upstream fp16 autocast."
-                )
             config.inference_precision = inference_precision
         if is_v1p5_model_class(config.variant.model_class):
+            # Variable lead times / ensemble noise conflict with CUDA graph capture.
             config.cuda_graph = False
-            config.inference_precision = None
+
         if overlap_ic_load is not None:
             config.overlap_ic_load = overlap_ic_load
         if async_export is not None:

@@ -45,10 +45,7 @@ class CheckpointLoader:
     def build_model(self) -> AuroraModel:
         variant = self._config.variant
         model_kwargs: dict[str, object] = {}
-        if (
-            self._config.inference_precision is not None
-            and not is_v1p5_model_class(variant.model_class)
-        ):
+        if self._config.inference_precision is not None:
             model_kwargs["inference_precision"] = self._config.inference_precision
 
         create_kwargs: dict[str, object] = dict(model_kwargs)

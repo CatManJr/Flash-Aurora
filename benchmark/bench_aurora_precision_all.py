@@ -151,10 +151,24 @@ def build_model(
 
 
 def run_forward_tensors(model: Any, batch: Any, *, device: torch.device) -> dict[str, torch.Tensor]:
+    from flash_aurora.engine.core.model_protocol import model_uses_v1p5_rollout
+
     set_benchmark_seed()
     dev_batch = batch.to(device)
     with torch.inference_mode():
-        pred = model.forward(dev_batch)
+        if model_uses_v1p5_rollout(model):
+            batch_size = next(iter(dev_batch.surf_vars.values())).shape[0]
+            param = next(model.parameters())
+            lead_hours = model.timestep.total_seconds() / 3600.0
+            lead_times = torch.full(
+                (batch_size,),
+                lead_hours,
+                device=param.device,
+                dtype=param.dtype,
+            )
+            pred = model.forward(dev_batch, lead_times=lead_times)
+        else:
+            pred = model.forward(dev_batch)
     return prediction_tensors(pred)
 
 
