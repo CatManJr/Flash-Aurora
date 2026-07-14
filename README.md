@@ -19,7 +19,7 @@ New model families plug into the same Engine without rewriting the hot path. Aur
 
 The same pattern (model package, preset, adapter; reuse Engine and kernels) applies to later Aurora generations or other geospatial foundation models with a compatible contract.
 
-### Triton fusion for lower backbone memory traffic
+### Kernel fusion for lower backbone memory traffic
 
 PyTorch Swin3D materializes many short-lived tensors for window layout and AdaLN boundaries. Flash-Aurora fuses these on the backbone hot path:
 
