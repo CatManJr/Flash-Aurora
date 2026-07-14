@@ -30,7 +30,15 @@ On `bf16_mixed@*` and `tf32@*` tiers, AdaLN can keep FP32 activations between Sw
 
 ### CuTe DSL window attention
 
-Aurora Swin windows are short ($N = 144$ for window size $(2, 6, 12)$). The CuTe kernels load the full window $K$ and $V$ into shared memory in a single stage ($tile_n \ge N$), run QK and PV MMAs with FP32 online softmax, and never materialize an $N \times N$ attention matrix in global memory. BF16 and TF32-simulated FP32 variants target these fixed shapes. On Blackwell (`sm_120`) microbenchmarks report about $1.07$--$1.22\times$ versus BF16 SDPA and about $1.59$--$1.69\times$ versus FP32 SDPA; on RTX 4090 (`sm_89`) about $1.04$--$1.05\times$ versus the fastest SDPA backend and about $2.2\times$ versus FP32 SDPA. Full tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
+Aurora Swin windows are short ($N = 144$ for window size $(2, 6, 12)$). The CuTe kernels load the full window $K$ and $V$ into shared memory in a single stage ($tile_n \ge N$), run QK and PV MMAs with FP32 online softmax, and never materialize an $N \times N$ attention matrix in global memory. Two operators cover the production path: BF16 (`BF16_MIXED`) and TF32-accumulated FP32 I/O (`TF32_ACC_FP32`).
+
+Attention $Q$, $K$, and $V$ use layout $(B, H, N, D_h)$: $B$ is the folded window batch ($B = B_{\mathrm{batch}} \cdot n_W$), $H$ is the head count, $N$ is tokens per window, and $D_h$ is the head dimension ($D_h = 64$ here). The figure reports three shapes from the default $0.25^{\circ}$ ERA5 encoder, $(1800, 8, 144, 64)$, $(450, 16, 144, 64)$, and $(128, 32, 144, 64)$, plus a shifted-window mask case on $(1800, 8, 144, 64)$ (Swin relative-position bias $-100$). On Blackwell (`sm_120`) unmasked speedups are about $1.07$--$1.09\times$ versus BF16 SDPA and about $1.59$--$1.60\times$ versus FP32 SDPA; the masked $(1800, 8, 144, 64)$ case reaches about $1.22\times$ (BF16) and $1.69\times$ (TF32). On RTX 4090 (`sm_89`) absolute latency is higher, with about $2.2\times$ versus FP32 SDPA. Full tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
+
+<p align="center">
+  <img src="docs/image/window_attn_cute_vs_sdpa_blackwell.svg" alt="CuTe DSL BF16 and TF32 window attention vs PyTorch SDPA on Blackwell, unmasked and masked" width="95%"/>
+</p>
+
+<p align="center"><em>RTX PRO 6000 Blackwell (<code>sm_120a</code>). X-axis labels are $Q/K/V$ shapes $(B, H, N, D_h)$. Masked bars apply Swin shifted-window bias $-100$.</em></p>
 
 ### Mixed-precision inference
 
@@ -40,7 +48,13 @@ Tiers use the label `backbone@encoder_decoder` (default production tier `bf16_mi
 - **`tf32` backbone:** TF32 GEMM throughout Swin plus CuTe attention with FP32 I/O.
 - **`fp32` backbone:** Strict FP32 GEMM and PyTorch SDPA; accuracy baseline with Triton fusion still enabled.
 
-Encoder and Perceiver decoder default to `@fp32` because errors map directly into output fields, while the Swin backbone dominates runtime (about $63\%$ on `era5_pretrained`). Headline end-to-end latency for `bf16_mixed@fp32` is about $3.2\times$ versus PyTorch FP32 on `era5_pretrained` (about $680\,\mathrm{ms}$/step), about $3.1\times$ on `aurora_v1p5` (about $701\,\mathrm{ms}$/step), and about $3\times$ on finetuned presets with merged LoRA. Full tables: [docs/benchmarks.md](docs/benchmarks.md).
+Encoder and Perceiver decoder default to `@fp32` because errors map directly into output fields, while the Swin backbone dominates runtime (about $63\%$ on `era5_pretrained`). Across production presets, `bf16_mixed@fp32` cuts forward latency to about $570$--$680\,\mathrm{ms}$ versus about $1.7$--$2.1\,\mathrm{s}$ for the PyTorch FP32 reference (isolate-tiers). Full tables: [docs/benchmarks.md](docs/benchmarks.md).
+
+<p align="center">
+  <img src="docs/image/e2e_latency_by_tier_all_presets.svg" alt="End-to-end forward latency by precision tier with models as colors" width="95%"/>
+</p>
+
+<p align="center"><em>RTX PRO 6000 Blackwell, isolate-tiers; LoRA presets use <code>lora_merged</code>. <code>aurora_v1p5</code> is within a few percent of <code>era5_pretrained</code>; see [docs/benchmarks.md](docs/benchmarks.md).</em></p>
 
 ### Asynchronous multi-GPU serving
 
@@ -170,19 +184,11 @@ Official per-variable tolerances $\tau_v$ and full drift tables: [docs/benchmark
 
 ## Window attention kernels
 
-Flash-Aurora replaces PyTorch SDPA on Swin windows with CuTe DSL kernels under `flash_aurora/models/ops/cute/`. For production $0.25^{\circ}$ stages with $N = 144$, a single shared-memory tile holds the full window $K$ and $V$ (`tile_n \ge N`). Logits use FP32 online softmax; the full $N \times N$ map is not written to global memory. Modes `BF16_MIXED` and `TF32_ACC_FP32` trade throughput against FP32 fidelity. Microbenchmark tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
+Flash-Aurora replaces PyTorch SDPA on Swin windows with CuTe DSL kernels under `flash_aurora/models/ops/cute/`. Inputs use layout $(B, H, N, D_h)$: $B$ is the folded window batch, $H$ is the head count, $N$ is tokens per window, and $D_h$ is the head dimension. For production $0.25^{\circ}$ shapes with $N = 144$ and $D_h = 64$, a single shared-memory tile holds the full window $K$ and $V$ (`tile_n \ge N`). Logits use FP32 online softmax; the full $N \times N$ map is not written to global memory. Modes `BF16_MIXED` and `TF32_ACC_FP32` trade throughput against FP32 fidelity. Microbenchmark tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
 
 ## Benchmarks (summary)
 
-End-to-end numbers use NVIDIA RTX PRO 6000 Blackwell, PyTorch $2.12.1+\mathrm{cu}130$, `CUTE_DSL_ARCH=sm_120a`, warmup $2$, repeat $5$, and `--isolate-tiers` for fair speedups. The wave preset is omitted (MARS). Tier `bf16@*` is excluded from latency tables (no speed gain over `bf16_mixed@*`, larger drift).
-
-**`aurora_v1p5` latency** ($721 \times 1440$, 2026-07-14):
-
-| Tier | forward ($\mathrm{ms}$) | vs PyTorch FP32 |
-| ---- | ----------------------: | --------------: |
-| `bf16_mixed@fp32` | $700.8$ | $3.12\times$ |
-| `tf32@tf32` | $946.0$ | $2.31\times$ |
-| PyTorch FP32 ref | $2185.8$ | base |
+End-to-end numbers use NVIDIA RTX PRO 6000 Blackwell, PyTorch $2.12.1+\mathrm{cu}130$, `CUTE_DSL_ARCH=sm_120a`, warmup $2$, repeat $5$, and `--isolate-tiers` for fair speedups. The wave preset is omitted (MARS). Tier `bf16@*` is excluded from latency tables (no speed gain over `bf16_mixed@*`, larger drift). Charts above are regenerated with `uv run python benchmark/plot_readme_perf_charts.py`.
 
 **`aurora_v1p5` precision** (seed $42$, baseline PyTorch FP32): recommended tiers (`bf16_mixed@*`, `tf32@*`, `fp32@fp32`) pass $31/31$ output variables; `bf16@fp32` and plain PyTorch autocast fail selected extended surface fields.
 
