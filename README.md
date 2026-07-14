@@ -9,12 +9,12 @@ Companion documents:
 
 ## Highlights
 
-### Extensible inference stack: Aurora 1.5 on day one
+### Extensible inference & serving engine: Aurora 1.5 on day 1
 
 New model families plug into the same Engine without rewriting the hot path. Aurora 1.5 (Microsoft Aurora tag `v2.0.0`) is the first proof point: a side-path package beside the frozen legacy family (upstream **v1.8.0**), registered through the same preset, registry, and adapter surface.
 
 - **Fixed composition root.** Presets `aurora_v1p5` and `aurora_v1p5_ensemble`, `ModelFactory`, ingress `cds_era5_v1p5`, and `RolloutSession` dispatch connect download, validate, load, rollout, and export. Clients continue to call `AuroraEngine.from_preset(...)`.
-- **Shared acceleration.** `Batch`, `models/ops` (Triton / CuTe), and `inference_precision` accelerate the 1.5 Swin backbone. Variable `fine_lead_times`, prescribed insolation, and ensemble `reset_noise()` loops stay in the side path.
+- **Shared modules.** `Batch`, `models/ops` (Triton / CuTe), and `inference_precision` accelerate the 1.5 Swin backbone. Variable `fine_lead_times`, prescribed insolation, and ensemble `reset_noise()` loops stay in the side path.
 - **Day-one surface.** Deterministic and ensemble checkpoints, extended ERA5 initial conditions, hourly fine leads, and `bf16_mixed@fp32` end-to-end latency on par with `era5_pretrained` (about $3.1\times$ versus PyTorch FP32 on a $721 \times 1440$ grid). See [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb).
 
 The same pattern (model package, preset, adapter; reuse Engine and kernels) applies to later Aurora generations or other geospatial foundation models with a compatible contract.
