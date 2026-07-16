@@ -217,7 +217,8 @@ def plot_stacked_by_model() -> None:
         y=0.995,
     )
     fig.tight_layout(rect=(0, 0.02, 1, 0.96))
-    fig.subplots_adjust(hspace=0.55, wspace=0.28)
+    # Extra vertical gap so row-1 legends do not cover row-2 titles/bars.
+    fig.subplots_adjust(hspace=0.92, wspace=0.28)
     _save(fig, "precision_mean_rel_stacked_by_model")
 
 
