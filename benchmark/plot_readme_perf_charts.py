@@ -31,12 +31,13 @@ MODEL_COLORS = {
     "tc_tracking": "#5C7A86",
 }
 
-# X-axis: four custom tiers + two PyTorch baselines
+# X-axis: five custom tiers + two PyTorch baselines.
 TIER_LABELS = [
     "bf16_mixed\n@fp32",
     "bf16_mixed\n@tf32",
     "tf32\n@fp32",
     "tf32\n@tf32",
+    "fp32\n@fp32",
     "PyTorch\nautocast",
     "PyTorch\nFP32 ref",
 ]
@@ -45,12 +46,12 @@ TIER_LABELS = [
 # Order matches TIER_LABELS. Omits small_pretrained.
 # aurora_v1p5 from benchmark/latency_aurora_v1p5_latest.md
 MODEL_LATENCY_MS = {
-    "era5_pretrained": [676.4, 676.8, 1077.5, 919.2, 1004.4, 2128.2],
-    "aurora_v1p5": [700.8, 702.4, 1109.3, 946.0, 1034.5, 2185.8],
-    "hres_t0_finetuned": [638.7, 638.4, 1006.3, 846.5, 967.7, 2061.9],
-    "hres_0.1": [672.0, 672.4, 1019.9, 861.3, 986.2, 1994.6],
-    "cams": [571.0, 571.9, 916.5, 718.3, 888.6, 1691.6],
-    "tc_tracking": [638.5, 638.3, 1006.1, 847.0, 967.4, 2059.9],
+    "era5_pretrained": [676.4, 676.8, 1077.5, 919.2, 1945.0, 1004.4, 2128.2],
+    "aurora_v1p5": [700.8, 702.4, 1109.3, 946.0, 2005.6, 1034.5, 2185.8],
+    "hres_t0_finetuned": [638.7, 638.4, 1006.3, 846.5, 1890.4, 967.7, 2061.9],
+    "hres_0.1": [672.0, 672.4, 1019.9, 861.3, 1838.0, 986.2, 1994.6],
+    "cams": [571.0, 571.9, 916.5, 718.3, 1562.3, 888.6, 1691.6],
+    "tc_tracking": [638.5, 638.3, 1006.1, 847.0, 1890.9, 967.4, 2059.9],
 }
 
 
@@ -202,12 +203,18 @@ def plot_window_attention() -> None:
 
 
 def plot_e2e_latency_by_tier() -> None:
-    """Grouped bars: x = precision tiers, color = model, y = forward latency (ms)."""
+    """Grouped bars: x = precision tiers, color = model, y = forward latency (ms).
+
+    A dashed horizontal line marks each model's baseline (the "PyTorch FP32
+    ref" tier, last entry of TIER_LABELS) so every other tier's bar can be
+    read as faster/slower than that model without cross-referencing values.
+    """
     models = list(MODEL_LATENCY_MS.keys())
     n_tiers = len(TIER_LABELS)
     n_models = len(models)
     x = np.arange(n_tiers)
     width = 0.78 / n_models
+    baseline_tier_index = n_tiers - 1
 
     fig, ax = plt.subplots(figsize=(12.5, 5.6))
     for i, name in enumerate(models):
@@ -223,6 +230,16 @@ def plot_e2e_latency_by_tier() -> None:
             linewidth=0.4,
             zorder=3,
         )
+        ax.hlines(
+            vals[baseline_tier_index],
+            xmin=x[0] - 0.42,
+            xmax=x[baseline_tier_index] + offset - width * 0.46,
+            color=MODEL_COLORS[name],
+            linestyle="--",
+            linewidth=1.3,
+            alpha=0.75,
+            zorder=2,
+        )
 
     ax.set_xticks(x)
     ax.set_xticklabels(TIER_LABELS, fontsize=13)
@@ -230,10 +247,21 @@ def plot_e2e_latency_by_tier() -> None:
     ax.tick_params(axis="y", labelsize=12)
     y_max = max(max(v) for v in MODEL_LATENCY_MS.values())
     ax.set_ylim(0, y_max * 1.12)
+    ax.set_xlim(x[0] - 0.42, x[-1] + 0.42)
     ax.set_title(
         "End-to-end latency by precision tier (single rollout step / model.forward)",
         fontsize=18,
         pad=16,
+    )
+    ax.text(
+        x[0] - 0.42,
+        y_max * 1.10,
+        "dashed = each model's PyTorch FP32 ref baseline",
+        ha="left",
+        va="top",
+        fontsize=10.5,
+        color="#555555",
+        style="italic",
     )
     ax.legend(
         frameon=False,
