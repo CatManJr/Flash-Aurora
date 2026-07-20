@@ -4,6 +4,7 @@ Flash-Aurora is an inference and serving engine for the [Microsoft Aurora](https
 
 Companion documents:
 
+- [Slide deck (GitHub Pages)](https://catmanjr.github.io/Flash-Aurora-walkthrough/): interactive walkthrough of architecture, precision tiers, Engine/Scheduler workflows, and measured results.
 - [docs/tutorial.md](docs/tutorial.md): install steps, Engine and scheduler API examples, notebook index.
 - [docs/benchmarks.md](docs/benchmarks.md): full latency, numerical-error, window-attention, and multi-GPU rollout tables.
 - [Examples](#examples): linked walkthrough notebooks for each preset, ROI export, and the ZMQ scheduler.
