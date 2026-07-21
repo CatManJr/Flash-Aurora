@@ -1,10 +1,10 @@
-# Flash-Aurora: Toward Efficient Inference for Geospatial Foundation Models
+# Flash-Aurora: Towards Efficient Inference & Serving for Geospatial Foundation Models
 
 Flash-Aurora is an inference and serving engine for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model, with the same stack intended to host further geospatial foundation models. It provides shape-specialized Triton and CuTe DSL kernels, named mixed-precision routing (`inference_precision`), data ingress, checkpoint loading, autoregressive rollout, NetCDF/GeoTIFF export, and a ZeroMQ scheduler to deploy asynchronized service on a GPU cluster.
 
-Companion documents:
+### [A walk through slides deck](https://catmanjr.github.io/Flash-Aurora-walkthrough/)
 
-- [Slide deck (GitHub Pages)](https://catmanjr.github.io/Flash-Aurora-walkthrough/): interactive walkthrough of architecture, precision tiers, Engine/Scheduler workflows, and measured results.
+Companion documents:
 - [docs/tutorial.md](docs/tutorial.md): install steps, Engine and scheduler API examples, notebook index.
 - [docs/benchmarks.md](docs/benchmarks.md): full latency, numerical-error, window-attention, and multi-GPU rollout tables.
 - [Examples](#examples): linked walkthrough notebooks for each preset, ROI export, and the ZMQ scheduler.
