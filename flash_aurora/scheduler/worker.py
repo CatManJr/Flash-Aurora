@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import queue
 import signal
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +25,11 @@ from flash_aurora.scheduler.protocol import (
     encode_array,
     encode_event,
 )
+
+# Sentinel that asks the compute thread to exit after draining queued jobs.
+_COMPUTE_STOP = object()
+# Shutdown join budget: one rollout step is O(seconds); allow a short multi-step job to finish.
+_COMPUTE_JOIN_TIMEOUT_S = 120.0
 
 
 @dataclass
@@ -72,6 +79,13 @@ class ForecastWorker:
         )
         self._running = True
         self._model_ready = False
+        self._busy = False
+        self._state_lock = threading.Lock()
+        self._emit_lock = threading.Lock()
+        self._job_queue: queue.Queue[Any] = queue.Queue()
+        self._compute_thread: threading.Thread | None = None
+        self._detached_compute = False
+        self._fatal_error: BaseException | None = None
         self._command_socket = self._context.socket(zmq.PULL)
         self._event_socket = self._context.socket(zmq.PUSH)
         self._command_socket.bind(config.command_addr)
@@ -98,7 +112,13 @@ class ForecastWorker:
 
     @property
     def model_ready(self) -> bool:
-        return self._model_ready
+        with self._state_lock:
+            return self._model_ready
+
+    @property
+    def busy(self) -> bool:
+        with self._state_lock:
+            return self._busy
 
     @property
     def worker_id(self) -> str:
@@ -161,6 +181,7 @@ class ForecastWorker:
             return
         self._closed = True
         self._running = False
+        self._stop_compute_thread()
         try:
             self._engine.close()
         except Exception:
@@ -170,36 +191,54 @@ class ForecastWorker:
         if self._owns_context:
             self._context.term()
 
+    def _set_model_ready(self, ready: bool) -> None:
+        with self._state_lock:
+            self._model_ready = ready
+
+    def _set_busy(self, busy: bool) -> None:
+        with self._state_lock:
+            self._busy = busy
+
+    def _health_message(self) -> str:
+        with self._state_lock:
+            if self._busy:
+                return "busy"
+            if self._model_ready:
+                return "ready"
+            return "listening"
+
     def _emit(self, event: ForecastEvent) -> None:
-        self._event_socket.send(encode_event(event))
+        with self._emit_lock:
+            self._event_socket.send(encode_event(event))
 
     def _emit_ready(self, *, message: str) -> None:
         # NOBLOCK: startup ready must not stall when no PULL peer is connected yet.
         # Late clients recover via health (message ready|listening).
         try:
-            self._event_socket.send(
-                encode_event(
-                    ForecastEvent(
-                        kind="ready",
-                        worker_preset=self._config.preset,
-                        worker_id=self.worker_id,
-                        worker_device=self.device,
-                        worker_capacity=self.capacity,
-                        message=message,
-                    )
-                ),
-                flags=zmq.NOBLOCK,
-            )
+            with self._emit_lock:
+                self._event_socket.send(
+                    encode_event(
+                        ForecastEvent(
+                            kind="ready",
+                            worker_preset=self._config.preset,
+                            worker_id=self.worker_id,
+                            worker_device=self.device,
+                            worker_capacity=self.capacity,
+                            message=message,
+                        )
+                    ),
+                    flags=zmq.NOBLOCK,
+                )
         except zmq.Again:
             pass
 
     def ensure_loaded(self, *, rollout_steps: int | None = None) -> None:
         """Load weights onto the device and mark the worker warm."""
-        if self._model_ready:
+        if self.model_ready:
             return
         steps = rollout_steps if rollout_steps is not None else self._config.preload_rollout_steps
         self._engine.load(rollout_steps=steps)
-        self._model_ready = True
+        self._set_model_ready(True)
 
     def _validate_request(self, request: ForecastRequest) -> None:
         if request.preset != self._config.preset:
@@ -306,10 +345,10 @@ class ForecastWorker:
             )
 
     def run_forecast(self, request: ForecastRequest) -> None:
+        """Run one forecast on the compute plane (``accepted`` already emitted)."""
         self._validate_request(request)
         if request.ensemble_members is not None and request.ensemble_members < 1:
             raise ValueError("ensemble_members must be >= 1 when set")
-        self._emit(ForecastEvent(kind="accepted", request_id=request.request_id))
         self._emit(ForecastEvent(kind="preparing", request_id=request.request_id))
 
         if request.netcdf_path is not None:
@@ -346,9 +385,78 @@ class ForecastWorker:
 
         self._emit(ForecastEvent(kind="completed", request_id=request.request_id))
 
+    def _execute_forecast_job(self, request: ForecastRequest) -> None:
+        """Run one job with error handling (compute plane or inline)."""
+        self._set_busy(True)
+        try:
+            self.run_forecast(request)
+            self._set_model_ready(True)
+        except InsufficientVramError as exc:
+            self._emit(
+                ForecastEvent(
+                    kind="failed",
+                    request_id=request.request_id,
+                    error=str(exc),
+                )
+            )
+            self._fatal_error = exc
+            self._running = False
+        except Exception as exc:
+            try:
+                self._engine.release_gpu(move_model_to_cpu=True)
+            except Exception:
+                pass
+            self._emit(
+                ForecastEvent(
+                    kind="failed",
+                    request_id=request.request_id,
+                    error=str(exc),
+                )
+            )
+        finally:
+            self._set_busy(False)
+
+    def _compute_loop(self) -> None:
+        while True:
+            item = self._job_queue.get()
+            if item is _COMPUTE_STOP:
+                break
+            assert isinstance(item, ForecastRequest)
+            self._execute_forecast_job(item)
+            if self._fatal_error is not None:
+                # Drain stop signal if present; wake control loop via _running=False.
+                break
+
+    def _start_compute_thread(self) -> None:
+        if self._compute_thread is not None:
+            return
+        self._detached_compute = True
+        self._compute_thread = threading.Thread(
+            target=self._compute_loop,
+            name=f"forecast-compute-{self.worker_id}",
+            daemon=True,
+        )
+        self._compute_thread.start()
+
+    def _stop_compute_thread(self) -> None:
+        if self._compute_thread is None:
+            return
+        self._job_queue.put(_COMPUTE_STOP)
+        self._compute_thread.join(timeout=_COMPUTE_JOIN_TIMEOUT_S)
+        self._compute_thread = None
+        self._detached_compute = False
+
     def handle_command(self, command: ForecastCommand) -> bool:
-        """Handle one command. Returns False when the worker should stop."""
+        """Handle one control-plane command. Returns False when the worker should stop.
+
+        ``health`` / ``shutdown`` run on the calling thread. ``forecast`` is enqueued for
+        the compute thread when ``serve_forever`` is active; otherwise it runs inline
+        (``serve_once`` / tests without a compute thread).
+        """
         if command.kind == "shutdown":
+            self._running = False
+            if self._detached_compute:
+                self._job_queue.put(_COMPUTE_STOP)
             return False
         if command.kind == "health":
             self._emit(
@@ -358,7 +466,7 @@ class ForecastWorker:
                     worker_id=self.worker_id,
                     worker_device=self.device,
                     worker_capacity=self.capacity,
-                    message="ready" if self._model_ready else "listening",
+                    message=self._health_message(),
                 )
             )
             return True
@@ -371,39 +479,35 @@ class ForecastWorker:
                     )
                 )
                 return True
+            request = command.request
             try:
-                self.run_forecast(command.request)
-                # prepare()/rollout paths load the model; treat success as warm.
-                self._model_ready = True
-            except InsufficientVramError as exc:
-                request_id = command.request.request_id
-                self._emit(
-                    ForecastEvent(
-                        kind="failed",
-                        request_id=request_id,
-                        error=str(exc),
-                    )
-                )
-                self.close()
-                raise SystemExit(1) from exc
+                self._validate_request(request)
+                if request.ensemble_members is not None and request.ensemble_members < 1:
+                    raise ValueError("ensemble_members must be >= 1 when set")
             except Exception as exc:
-                request_id = command.request.request_id
-                try:
-                    self._engine.release_gpu(move_model_to_cpu=True)
-                except Exception:
-                    pass
                 self._emit(
                     ForecastEvent(
                         kind="failed",
-                        request_id=request_id,
+                        request_id=request.request_id,
                         error=str(exc),
                     )
                 )
+                return True
+            # Queued / starting acknowledgment from the control plane.
+            self._emit(ForecastEvent(kind="accepted", request_id=request.request_id))
+            if self._detached_compute:
+                self._job_queue.put(request)
+            else:
+                self._execute_forecast_job(request)
+                if isinstance(self._fatal_error, InsufficientVramError):
+                    self.close()
+                    raise SystemExit(1) from self._fatal_error
             return True
         self._emit(ForecastEvent(kind="failed", error=f"unsupported command {command.kind!r}"))
         return True
 
     def serve_forever(self) -> None:
+        """Control plane: poll ZMQ. Compute plane: dedicated thread for forecasts."""
         poller = zmq.Poller()
         poller.register(self._command_socket, zmq.POLLIN)
 
@@ -414,7 +518,10 @@ class ForecastWorker:
             else:
                 # Sockets are bound; GPU load still happens on first forecast.
                 self._emit_ready(message="listening")
+            self._start_compute_thread()
             while self._running:
+                if self._fatal_error is not None:
+                    break
                 events = poller.poll(timeout=self._config.poll_timeout_ms)
                 if not events:
                     continue
@@ -422,11 +529,13 @@ class ForecastWorker:
                 command = decode_command(data)
                 if not self.handle_command(command):
                     break
+            if isinstance(self._fatal_error, InsufficientVramError):
+                raise SystemExit(1) from self._fatal_error
         finally:
             self.close()
 
     def serve_once(self) -> bool:
-        """Process a single command (for tests). Returns False on shutdown."""
+        """Process a single command inline (no compute thread). Returns False on shutdown."""
         if not self._command_socket.poll(timeout=self._config.poll_timeout_ms):
             return True
         command = decode_command(self._command_socket.recv())

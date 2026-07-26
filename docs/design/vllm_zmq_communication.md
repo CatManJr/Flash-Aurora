@@ -110,7 +110,7 @@ onto this ZMQ pattern; use `DistributedConfig` instead.
 | Multiplexing | Identity + many engines | Coordinator queue + `sticky_key` |
 | Handshake | HELLO/INIT/READY + port resolve | Bind + explicit `ready` after optional `load()` |
 | Codec | msgspec msgpack | JSON control plane |
-| IO vs compute | ZMQ threads + queues | Worker poll loop (forecast still blocks accept) |
+| IO vs compute | ZMQ threads + queues | Worker control plane polls ZMQ; compute thread runs forecasts |
 
 Aurora already uses an asymmetric command/event pair. It does not need
 ROUTER/DEALER or msgpack for single-GPU localhost serving.
