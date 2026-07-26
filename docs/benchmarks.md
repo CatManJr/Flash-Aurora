@@ -507,7 +507,7 @@ Use `--skip-download` when checkpoint and `era5/` cache are already present. Use
 
 Encoder, backbone, and spatial decoder can run on separate GPUs.
 
-Single-process only (one Python interpreter, not `torchrun`). Pass a `DistributedConfig` with two or more CUDA devices. On 32 GiB cards, `era5_pretrained` does **not** fit a single GPU.
+Single-process only (one Python interpreter, not `torchrun`). Pass a `DistributedConfig` with two or more CUDA devices. On 32 GiB cards, `era5_pretrained` does **not** fit a single GPU. Aurora 1.5 (`aurora_v1p5`) supports the same pipeline on **standard timestep** autoregressive steps (`lead_times` = model timestep hours). Fine-lead substeps inside `distributed_rollout` are not wired yet. CUDA graphs remain unsupported for Aurora 1.5 and stay forced off when distributed is enabled.
 
 #### Pipeline placement (2x RTX 5090, `era5_pretrained`)
 

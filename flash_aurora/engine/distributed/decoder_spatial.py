@@ -185,10 +185,11 @@ def forward_decoder_spatial_parallel(
     batch: Batch,
     *,
     patch_res: tuple[int, int, int],
-    lead_time: timedelta,
     spatial_devices: tuple[torch.device, torch.device],
     autocast_bf16: bool,
     use_tensor_core: bool,
+    lead_time: timedelta | None = None,
+    lead_times: torch.Tensor | None = None,
 ) -> Batch:
     """Run decoder on west / east spatial halves concurrently on two devices."""
     decoder = model.decoder
@@ -196,20 +197,26 @@ def forward_decoder_spatial_parallel(
     if replica is None:
         raise RuntimeError("decoder spatial replica is not installed on the model")
 
+    if lead_times is None and lead_time is None:
+        raise ValueError("forward_decoder_spatial_parallel requires lead_time or lead_times")
+
     west_dev, east_dev = spatial_devices
     if west_dev == east_dev:
         from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
+        lead_kwargs = (
+            {"lead_times": lead_times} if lead_times is not None else {"lead_time": lead_time}
+        )
         with _device_context(east_dev):
             with torch.inference_mode():
                 return run_with_encoder_decoder_routing(
                     decoder.forward,
                     x,
                     batch,
-                    patch_res,
-                    lead_time,
+                    patch_res=patch_res,
                     autocast_bf16=autocast_bf16,
                     use_tensor_core=use_tensor_core,
+                    **lead_kwargs,
                 )
 
     surf_vars = tuple(batch.surf_vars.keys())
@@ -252,7 +259,7 @@ def forward_decoder_spatial_parallel(
                     patch_res=patch_res_west,
                     height=height,
                     width=width_west,
-                    lead_time=lead_time,
+                    lead_time=lead_time or timedelta(0),
                     autocast_bf16=autocast_bf16,
                     use_tensor_core=use_tensor_core,
                 )
@@ -272,7 +279,7 @@ def forward_decoder_spatial_parallel(
                     patch_res=patch_res_east,
                     height=height,
                     width=width_east,
-                    lead_time=lead_time,
+                    lead_time=lead_time or timedelta(0),
                     autocast_bf16=autocast_bf16,
                     use_tensor_core=use_tensor_core,
                 )
@@ -286,10 +293,18 @@ def forward_decoder_spatial_parallel(
     assert surf_west is not None and surf_east is not None
     assert atmos_west is not None and atmos_east is not None
 
+    if lead_times is not None:
+        next_time = tuple(
+            t + timedelta(hours=float(lead_times[i])) for i, t in enumerate(batch.metadata.time)
+        )
+    else:
+        assert lead_time is not None
+        next_time = tuple(t + lead_time for t in batch.metadata.time)
+
     rollout_metadata = Metadata(
         lat=lat,
         lon=lon,
-        time=tuple(t + lead_time for t in batch.metadata.time),
+        time=next_time,
         atmos_levels=atmos_levels,
         rollout_step=batch.metadata.rollout_step + 1,
     )

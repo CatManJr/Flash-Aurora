@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import contextlib
 import types
 from typing import Any
 
 import torch
 from flash_aurora.models.aurora import Batch
-from flash_aurora.models.aurora.model.aurora import Aurora
 
 from flash_aurora.engine.distributed.config import ParallelPlan
 
@@ -14,15 +12,19 @@ _DISTRIBUTED_PLAN_ATTR = "_flash_aurora_parallel_plan"
 _ORIGINAL_FORWARD_ATTR = "_flash_aurora_original_forward"
 
 
-def is_pipeline_parallel(model: Aurora) -> bool:
+def is_pipeline_parallel(model: Any) -> bool:
     return getattr(model, _DISTRIBUTED_PLAN_ATTR, None) is not None
 
 
-def parallel_plan(model: Aurora) -> ParallelPlan | None:
+def parallel_plan(model: Any) -> ParallelPlan | None:
     return getattr(model, _DISTRIBUTED_PLAN_ATTR, None)
 
 
-def pipeline_forward(model: Aurora, batch: Batch) -> Batch:
+def pipeline_forward(
+    model: Any,
+    batch: Batch,
+    lead_times: torch.Tensor | None = None,
+) -> Batch:
     """Run Aurora forward with encoder / backbone / decoder on separate devices."""
     from flash_aurora.engine.distributed.rollout_pipeline import (
         run_backbone_stage,
@@ -31,12 +33,18 @@ def pipeline_forward(model: Aurora, batch: Batch) -> Batch:
     )
 
     with torch.inference_mode():
-        step_batch, x, patch_res = run_encoder_stage(model, batch)
-        x = run_backbone_stage(model, x, step_batch, patch_res)
-        return run_decoder_stage(model, x, step_batch, patch_res)
+        step_batch, x, patch_res, resolved_lead_times = run_encoder_stage(
+            model, batch, lead_times=lead_times
+        )
+        x = run_backbone_stage(
+            model, x, step_batch, patch_res, lead_times=resolved_lead_times
+        )
+        return run_decoder_stage(
+            model, x, step_batch, patch_res, lead_times=resolved_lead_times
+        )
 
 
-def apply_pipeline_parallel(model: Aurora, plan: ParallelPlan) -> Aurora:
+def apply_pipeline_parallel(model: Any, plan: ParallelPlan) -> Any:
     """Place Aurora submodules on pipeline devices and patch ``forward``."""
     if is_pipeline_parallel(model):
         existing: ParallelPlan = getattr(model, _DISTRIBUTED_PLAN_ATTR)
@@ -64,7 +72,7 @@ def apply_pipeline_parallel(model: Aurora, plan: ParallelPlan) -> Aurora:
     return model
 
 
-def restore_pipeline_parallel(model: Aurora) -> None:
+def restore_pipeline_parallel(model: Any) -> None:
     """Undo pipeline patching and move all submodules to the encoder device."""
     from flash_aurora.engine.distributed.decoder_spatial import clear_decoder_spatial_replica
 
@@ -83,7 +91,7 @@ def restore_pipeline_parallel(model: Aurora) -> None:
     delattr(model, _DISTRIBUTED_PLAN_ATTR)
 
 
-def distributed_status(model: Aurora) -> dict[str, Any]:
+def distributed_status(model: Any) -> dict[str, Any]:
     plan = parallel_plan(model)
     if plan is None:
         return {"enabled": False}

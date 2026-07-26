@@ -46,6 +46,30 @@ For a fuller argument reference, see [Core API](#core-api) below. For Aurora 1.5
 
 ## Forecast scheduler deployment
 
+For how this ZMQ layout compares to vLLM's frontend ↔ EngineCore path, see
+[design/vllm_zmq_communication.md](design/vllm_zmq_communication.md).
+
+### Localhost loopback (ready + optional preload)
+
+Bind a worker on `ipc://` under the asset root (or `tcp://127.0.0.1` with an
+ephemeral port), preload weights, emit `ready`, then serve:
+
+```bash
+export AURORA_ASSET_ROOT=/path/to/data/aurora
+
+uv run python -m flash_aurora.scheduler.localhost \
+  --preset era5_pretrained \
+  --asset-root "$AURORA_ASSET_ROOT" \
+  --transport ipc \
+  --inference-precision bf16_mixed@fp32
+```
+
+The process prints resolved `command_addr` / `event_addr` (including the real TCP
+port when using `--transport tcp`). Clients should call
+`ForecastClient.wait_for_ready()` before submitting jobs. Late joiners miss the
+startup `ready` PUSH and instead observe `health` with `message="ready"` after
+preload.
+
 ### Persistent worker
 
 Start one worker in its own terminal:
@@ -98,6 +122,8 @@ uv run python -m flash_aurora.scheduler.coordinator_main \
 ```
 
 Clients connect to `tcp://127.0.0.1:9855` and `tcp://127.0.0.1:9856`. Two concurrent `era5_pretrained` jobs can then occupy the two workers at the same time. `ForecastRequest.sticky_key` is optional; when set, the coordinator keeps requests with the same key on the same worker when capacity permits.
+
+For Aurora 1.5 workers (`aurora_v1p5` / `aurora_v1p5_ensemble`), `ForecastRequest` also accepts optional `fine_lead_times` (hourly substeps within each main AR step; last entry must match the model timestep), `use_noise_accumulation`, `ensemble_members`, and `noise_seed`. Multi-member runs call `reset_noise()` between members and tag `ForecastEvent.ensemble_member`. Fine-lead and ensemble knobs use the single-GPU rollout path; distributed workers still run standard timestep AR only. CUDA graphs remain unsupported for Aurora 1.5.
 
 ### Client sketch
 
@@ -190,7 +216,7 @@ engine = AuroraEngine.from_preset(
     presets=None,  # optional custom PresetRegistry
 )
 # EngineConfig-only (set after from_preset):
-engine.config.cuda_graph = False  # experimental; default off (low ROI, see CUDA graph status)
+engine.config.cuda_graph = False  # experimental on legacy; unsupported for Aurora 1.5 (variable lead_times / ensemble noise)
 engine.config.device = "cuda:0"  # inference device
 engine.config.gpu_guard = True  # queue large jobs when VRAM is saturated
 engine.config.gpu_guard_timeout = 3600.0  # seconds to wait for GPU slot

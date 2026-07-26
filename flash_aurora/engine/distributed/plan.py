@@ -15,6 +15,8 @@ _STAGE_FRACTIONS: dict[str, tuple[float, float, float]] = {
     "AuroraHighRes": (0.38, 0.34, 0.28),
     "AuroraAirPollution": (0.24, 0.50, 0.26),
     "AuroraWave": (0.23, 0.52, 0.25),
+    "AuroraV1p5": (0.22, 0.53, 0.25),
+    "AuroraV1p5Ensemble": (0.22, 0.53, 0.25),
 }
 
 # Relative forward compute (era5 bf16 profile; sums to ~1.0).

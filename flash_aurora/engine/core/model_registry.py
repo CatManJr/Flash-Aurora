@@ -29,15 +29,6 @@ MODEL_REGISTRY: dict[str, type] = {
     "AuroraV1p5Ensemble": AuroraV1p5Ensemble,
 }
 
-# Kwargs that belong to the optimized flash family only (not yet on Aurora 1.5).
-_OPTIMIZED_ONLY_KWARGS: frozenset[str] = frozenset(
-    {
-        "use_lora_merged_inference",
-    }
-)
-
-
-
 class ModelFactory:
     @staticmethod
     def create(
@@ -52,9 +43,8 @@ class ModelFactory:
             raise KeyError(f"Unknown model class: {class_name}")
 
         if is_v1p5_model_class(class_name):
-            filtered = {key: value for key, value in kwargs.items() if key not in _OPTIMIZED_ONLY_KWARGS}
-            # AuroraV1p5 defaults use_lora=False; do not pass flash-only lora_mode.
-            return model_cls(use_lora=use_lora, **filtered)
+            # Stock v1p5 presets are use_lora=False; still forward lora_mode / merge when enabled.
+            return model_cls(use_lora=use_lora, lora_mode=lora_mode, **kwargs)
 
         if class_name in {"AuroraPretrained", "AuroraSmallPretrained", "Aurora12hPretrained"}:
             return model_cls(use_lora=use_lora, **kwargs)

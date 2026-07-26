@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from flash_aurora.engine.core.config import EngineConfig
-from flash_aurora.engine.core.model_protocol import AuroraModel, is_v1p5_model_class
+from flash_aurora.engine.core.model_protocol import AuroraModel
 from flash_aurora.engine.core.model_registry import ModelFactory
 from flash_aurora.engine.core.paths import AssetStore, normalize_asset_path
 from flash_aurora.engine.core.redaction import redact_text, safe_path
@@ -49,8 +49,7 @@ class CheckpointLoader:
             model_kwargs["inference_precision"] = self._config.inference_precision
 
         create_kwargs: dict[str, object] = dict(model_kwargs)
-        if not is_v1p5_model_class(variant.model_class):
-            create_kwargs["use_lora_merged_inference"] = variant.use_lora
+        create_kwargs["use_lora_merged_inference"] = variant.use_lora
 
         model = ModelFactory.create(
             variant.model_class,

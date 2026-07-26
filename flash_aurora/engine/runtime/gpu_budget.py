@@ -17,6 +17,8 @@ _DEFAULT_INFERENCE_PRECISION = "bf16_mixed@fp32"
 # bf16 weights on GPU (~1.3B Aurora backbone).
 _WEIGHT_GIB_BY_CLASS: dict[str, float] = {
     "AuroraSmallPretrained": 0.35,
+    "AuroraV1p5": 2.6,
+    "AuroraV1p5Ensemble": 2.6,
 }
 
 # Patch size per model class (must match ``aurora.model.aurora`` constructors).
@@ -28,6 +30,8 @@ _PATCH_SIZE_BY_CLASS: dict[str, int] = {
     "AuroraHighRes": 10,
     "AuroraAirPollution": 3,
     "AuroraWave": 4,
+    "AuroraV1p5": 4,
+    "AuroraV1p5Ensemble": 4,
 }
 
 # Transformer activation scale vs the 0.25° reference grid (4 x 180 x 360 tokens).
@@ -67,6 +71,9 @@ _CALIBRATED_RESERVED_1STEP_GIB: dict[str, float] = {
     "aurora-0.25-wave": 38.0,
     # Lower resolution than 0.25°; conservative estimate until profiled.
     "aurora-0.4-air-pollution": 22.0,
+    # Aurora 1.5 0.25° (bf16_mixed@fp32); measured on RTX PRO 6000 (one-step reserved).
+    "aurora-0.25-v1.5": 39.0,
+    "aurora-0.25-v1.5-ensemble": 39.5,
 }
 
 # Scale reserved peak relative to bf16_mixed@fp32 (same model, one forward, batch=1).

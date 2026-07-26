@@ -14,7 +14,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
 )
 
-from flash_aurora.models.aurora.batch import Batch
+from flash_aurora.models.aurora.batch import Batch, Metadata
 from flash_aurora.models.aurora.model.workspace_pool import InferenceWorkspacePool
 from flash_aurora.models.aurora_v1p5.insolation import insolation
 from flash_aurora.models.aurora_v1p5.model.compat import (
@@ -97,6 +97,7 @@ class Aurora(torch.nn.Module):
         use_lora: bool = True,
         lora_steps: int = 40,
         lora_mode: LoRAMode = "single",
+        use_lora_merged_inference: bool = False,
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         autocast: bool = False,
         autocast_dtype: torch.dtype = torch.bfloat16,
@@ -342,6 +343,7 @@ class Aurora(torch.nn.Module):
             use_lora=use_lora,
             lora_steps=lora_steps,
             lora_mode=lora_mode,
+            use_lora_merged_inference=use_lora_merged_inference,
             stochastic=stochastic,
             use_updated_lead_time_embedding=use_updated_lead_time_embedding,
             use_triton_layout=use_triton_layout,
@@ -411,6 +413,102 @@ class Aurora(torch.nn.Module):
         """
         self.backbone.set_noise_accumulation(n)
 
+    def _prepare_encoder_batch(self, batch: Batch) -> tuple[Batch, Batch, tuple[int, int, int]]:
+        """Normalise/crop batch and expand static vars for encoder input."""
+        batch = self.batch_transform_hook(batch)
+
+        p = next(self.parameters())
+        param_dtype = p.dtype
+        batch = batch.type(param_dtype)
+        if param_dtype not in (torch.float32, torch.float64):
+            batch = dataclasses.replace(
+                batch,
+                metadata=Metadata(
+                    lat=batch.metadata.lat.to(dtype=torch.float32),
+                    lon=batch.metadata.lon.to(dtype=torch.float32),
+                    atmos_levels=batch.metadata.atmos_levels,
+                    time=batch.metadata.time,
+                    rollout_step=batch.metadata.rollout_step,
+                ),
+            )
+        batch = self._pre_norm_hook(batch)
+        batch = batch.normalise(surf_stats=self.surf_stats)
+        batch = batch.crop(patch_size=self.patch_size)
+        batch = batch.to(p.device)
+
+        H, W = batch.spatial_shape
+        patch_res = (
+            self.encoder.latent_levels,
+            H // self.encoder.patch_size,
+            W // self.encoder.patch_size,
+        )
+
+        B, T = next(iter(batch.surf_vars.values())).shape[:2]
+        batch = dataclasses.replace(
+            batch,
+            static_vars={k: v[None, None].repeat(B, T, 1, 1) for k, v in batch.static_vars.items()},
+        )
+
+        transformed_batch = batch
+        if self.positive_surf_vars:
+            transformed_batch = dataclasses.replace(
+                transformed_batch,
+                surf_vars={
+                    k: v.clamp(min=0) if k in self.positive_surf_vars else v
+                    for k, v in batch.surf_vars.items()
+                },
+            )
+        if self.positive_atmos_vars:
+            transformed_batch = dataclasses.replace(
+                transformed_batch,
+                atmos_vars={
+                    k: v.clamp(min=0) if k in self.positive_atmos_vars else v
+                    for k, v in batch.atmos_vars.items()
+                },
+            )
+
+        transformed_batch = self._pre_encoder_hook(transformed_batch)
+        return batch, transformed_batch, patch_res
+
+    def _finish_prediction(self, batch: Batch, pred: Batch) -> Batch:
+        """Post-decoder epilogue shared by eager forward and pipeline stages."""
+        pred = dataclasses.replace(
+            pred,
+            static_vars={k: v[0, 0] for k, v in batch.static_vars.items()},
+        )
+        pred = dataclasses.replace(
+            pred,
+            surf_vars={k: v[:, None] for k, v in pred.surf_vars.items()},
+            atmos_vars={k: v[:, None] for k, v in pred.atmos_vars.items()},
+        )
+        pred = self._post_decoder_hook(batch, pred)
+
+        clamp_at_rollout_step = (
+            pred.metadata.rollout_step >= 1
+            if self.clamp_at_first_step
+            else pred.metadata.rollout_step > 1
+        )
+        if self.positive_surf_vars and clamp_at_rollout_step:
+            pred = dataclasses.replace(
+                pred,
+                surf_vars={
+                    k: v.clamp(min=0) if k in self.positive_surf_vars else v
+                    for k, v in pred.surf_vars.items()
+                },
+            )
+        if self.positive_atmos_vars and clamp_at_rollout_step:
+            pred = dataclasses.replace(
+                pred,
+                atmos_vars={
+                    k: v.clamp(min=0) if k in self.positive_atmos_vars else v
+                    for k, v in pred.atmos_vars.items()
+                },
+            )
+
+        pred = pred.type(torch.float32)
+        pred = pred.unnormalise(surf_stats=self.surf_stats)
+        return self._post_unnorm_hook(batch, pred)
+
     def _run_backbone(
         self,
         x: torch.Tensor,
@@ -460,55 +558,10 @@ class Aurora(torch.nn.Module):
         Returns:
             :class:`Batch`: Prediction for the batch.
         """
-        batch = self.batch_transform_hook(batch)
-
-        # Get the first parameter. We'll derive the data type and device from this parameter.
+        batch, transformed_batch, patch_res = self._prepare_encoder_batch(batch)
         p = next(self.parameters())
-        batch = batch.type(p.dtype)
-        batch = self._pre_norm_hook(batch)
-        batch = batch.normalise(surf_stats=self.surf_stats)
-        batch = batch.crop(patch_size=self.patch_size)
-        batch = batch.to(p.device)
+        B = next(iter(batch.surf_vars.values())).shape[0]
 
-        H, W = batch.spatial_shape
-        patch_res = (
-            self.encoder.latent_levels,
-            H // self.encoder.patch_size,
-            W // self.encoder.patch_size,
-        )
-
-        # Insert batch and history dimension for static variables.
-        B, T = next(iter(batch.surf_vars.values())).shape[:2]
-        batch = dataclasses.replace(
-            batch,
-            static_vars={k: v[None, None].repeat(B, T, 1, 1) for k, v in batch.static_vars.items()},
-        )
-
-        # Apply some transformations before feeding `batch` to the encoder. We'll later want to
-        # refer to the original batch too, so rename the variable.
-        transformed_batch = batch
-
-        # Clamp positive variables.
-        if self.positive_surf_vars:
-            transformed_batch = dataclasses.replace(
-                transformed_batch,
-                surf_vars={
-                    k: v.clamp(min=0) if k in self.positive_surf_vars else v
-                    for k, v in batch.surf_vars.items()
-                },
-            )
-        if self.positive_atmos_vars:
-            transformed_batch = dataclasses.replace(
-                transformed_batch,
-                atmos_vars={
-                    k: v.clamp(min=0) if k in self.positive_atmos_vars else v
-                    for k, v in batch.atmos_vars.items()
-                },
-            )
-
-        transformed_batch = self._pre_encoder_hook(transformed_batch)
-
-        # Resolve lead times to a tensor of shape (B,) in hours.
         if self.variable_lead_time:
             if lead_times is None:
                 raise ValueError(
@@ -579,51 +632,7 @@ class Aurora(torch.nn.Module):
                     patch_res=patch_res,
                 )
 
-        # Remove batch and history dimension from static variables.
-        pred = dataclasses.replace(
-            pred,
-            static_vars={k: v[0, 0] for k, v in batch.static_vars.items()},
-        )
-
-        # Insert history dimension in prediction. The time should already be right.
-        pred = dataclasses.replace(
-            pred,
-            surf_vars={k: v[:, None] for k, v in pred.surf_vars.items()},
-            atmos_vars={k: v[:, None] for k, v in pred.atmos_vars.items()},
-        )
-
-        pred = self._post_decoder_hook(batch, pred)
-
-        # Clamp positive variables.
-        clamp_at_rollout_step = (
-            pred.metadata.rollout_step >= 1
-            if self.clamp_at_first_step
-            else pred.metadata.rollout_step > 1
-        )
-        if self.positive_surf_vars and clamp_at_rollout_step:
-            pred = dataclasses.replace(
-                pred,
-                surf_vars={
-                    k: v.clamp(min=0) if k in self.positive_surf_vars else v
-                    for k, v in pred.surf_vars.items()
-                },
-            )
-        if self.positive_atmos_vars and clamp_at_rollout_step:
-            pred = dataclasses.replace(
-                pred,
-                atmos_vars={
-                    k: v.clamp(min=0) if k in self.positive_atmos_vars else v
-                    for k, v in pred.atmos_vars.items()
-                },
-            )
-
-        # Cast to float32 before unnormalising to avoid overflow.
-        pred = pred.type(torch.float32)
-        pred = pred.unnormalise(surf_stats=self.surf_stats)
-
-        pred = self._post_unnorm_hook(batch, pred)
-
-        return pred
+        return self._finish_prediction(batch, pred)
 
     def batch_transform_hook(self, batch: Batch) -> Batch:
         """Transform the batch right after receiving it and before normalisation.

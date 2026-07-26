@@ -46,6 +46,22 @@ def test_reserved_budget_exceeds_allocated_formula_for_pretrained() -> None:
     assert reserved > allocated
 
 
+def test_aurora_v1p5_uses_calibrated_reserved_budget() -> None:
+    from flash_aurora.engine.runtime.gpu_budget import _calibrated_reserved_1step_gib
+
+    expected = {
+        "aurora_v1p5": 39.0,
+        "aurora_v1p5_ensemble": 39.5,
+    }
+    for preset, base in expected.items():
+        variant = DEFAULT_PRESETS.get(preset).variant
+        calibrated = _calibrated_reserved_1step_gib(variant)
+        assert calibrated is not None
+        assert calibrated == pytest.approx(base)
+        estimate = estimate_vram_gib(variant, rollout_steps=1)
+        assert base <= estimate <= base + 0.5
+
+
 def test_tf32_precision_scales_reserved_budget() -> None:
     variant = DEFAULT_PRESETS.get("era5_pretrained").variant
     bf16 = estimate_vram_gib(variant, inference_precision="bf16_mixed@fp32")
