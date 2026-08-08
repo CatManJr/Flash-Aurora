@@ -137,7 +137,7 @@ V1P5_STATIC: tuple[str, ...] = (
     "tvl_9",
 )
 V1P5_ATMOS: tuple[str, ...] = ("z", "u", "v", "t", "q")
-V1P5_CHECKPOINT_REVISION: str = "9751bb56e8e4a0f0a780e3cbe978f4c721e12bc7"
+V1P5_CHECKPOINT_REVISION: str = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
 
 
 @dataclass(frozen=True)

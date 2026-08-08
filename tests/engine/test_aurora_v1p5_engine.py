@@ -22,9 +22,12 @@ from flash_aurora.models.aurora_v1p5 import AuroraV1p5, AuroraV1p5Ensemble
 
 
 def test_preset_aurora_v1p5_registered() -> None:
+    from flash_aurora.engine.core.config import V1P5_CHECKPOINT_REVISION
+
     config = DEFAULT_PRESETS.get("aurora_v1p5")
     assert config.variant.model_class == "AuroraV1p5"
-    assert config.variant.hf_repo == "ikwessel/aurora-1.5"
+    assert config.variant.hf_repo == "microsoft/aurora"
+    assert config.hf_revision == V1P5_CHECKPOINT_REVISION
     assert config.source.name == "cds_era5_v1p5"
     assert config.source.time_policy == "first_two"
     assert config.cuda_graph is False
@@ -190,7 +193,7 @@ def test_preset_aurora_v1p5_ensemble_registered() -> None:
     config = DEFAULT_PRESETS.get("aurora_v1p5_ensemble")
     assert config.variant.model_class == "AuroraV1p5Ensemble"
     assert config.variant.checkpoint_filename == "aurora-0.25-v1.5-ensemble.ckpt"
-    assert config.variant.hf_repo == "ikwessel/aurora-1.5"
+    assert config.variant.hf_repo == "microsoft/aurora"
     assert config.hf_revision == V1P5_CHECKPOINT_REVISION
     assert config.source.name == "cds_era5_v1p5"
     assert "AuroraV1p5Ensemble" in MODEL_REGISTRY

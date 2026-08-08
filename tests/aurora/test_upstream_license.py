@@ -31,7 +31,7 @@ def test_aurora_v1p5_license_and_notice_present() -> None:
     assert notice_path.is_file()
     notice = notice_path.read_text(encoding="utf-8")
     assert "github.com/microsoft/aurora" in notice
-    assert "v2.0.0" in notice
+    assert "v2.0.1" in notice
 
 
 def test_legacy_aurora_notice_caps_at_v1_8_0() -> None:

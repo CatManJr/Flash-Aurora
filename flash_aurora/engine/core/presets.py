@@ -86,7 +86,7 @@ VARIANTS: dict[str, ModelVariantSpec] = {
         name="aurora-0.25-v1.5",
         model_class="AuroraV1p5",
         checkpoint_filename="aurora-0.25-v1.5.ckpt",
-        hf_repo="ikwessel/aurora-1.5",
+        hf_repo="microsoft/aurora",
         use_lora=False,
         strict_checkpoint=False,
         surf_vars=V1P5_SURF,
@@ -101,7 +101,7 @@ VARIANTS: dict[str, ModelVariantSpec] = {
         name="aurora-0.25-v1.5-ensemble",
         model_class="AuroraV1p5Ensemble",
         checkpoint_filename="aurora-0.25-v1.5-ensemble.ckpt",
-        hf_repo="ikwessel/aurora-1.5",
+        hf_repo="microsoft/aurora",
         use_lora=False,
         strict_checkpoint=False,
         surf_vars=V1P5_SURF,
@@ -203,6 +203,7 @@ class PresetRegistry:
                 source=SOURCES["cds_era5_v1p5"],
                 cuda_graph=False,
                 inference_precision=None,
+                hf_revision=V1P5_CHECKPOINT_REVISION,
             ),
         )
         self.register(

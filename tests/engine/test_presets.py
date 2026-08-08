@@ -17,9 +17,9 @@ def test_presets_use_relative_asset_names() -> None:
         assert not variant.checkpoint_filename.startswith("/")
         assert not variant.static_pickle.startswith("/")
         if name == "aurora_v1p5":
-            assert variant.hf_repo == "ikwessel/aurora-1.5"
+            assert variant.hf_repo == "microsoft/aurora"
         elif name == "aurora_v1p5_ensemble":
-            assert variant.hf_repo == "ikwessel/aurora-1.5"
+            assert variant.hf_repo == "microsoft/aurora"
         else:
             assert variant.hf_repo == "microsoft/aurora"
 

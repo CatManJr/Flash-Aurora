@@ -13,7 +13,7 @@ Companion documents:
 
 ### Extensible inference and serving: Aurora 1.5 Day-1 support
 
-New model families plug into the same Engine without rewriting the performance-critical path. In the same sense as Day-1 model support in systems such as vLLM, a modular preset / registry / adapter surface lets a new family land with shared kernels and serving, rather than a fork of the hot path. Aurora 1.5 (Microsoft Aurora release tag `v2.0.0`) is the first proof point: a side-path package beside the archived legacy family (upstream **v1.8.0**). Walkthrough: [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb).
+New model families plug into the same Engine without rewriting the performance-critical path. In the same sense as Day-1 model support in systems such as vLLM, a modular preset / registry / adapter surface lets a new family land with shared kernels and serving, rather than a fork of the hot path. Aurora 1.5 (Microsoft Aurora release tag `v2.0.1`) is the first proof point: a side-path package beside the archived legacy family (upstream **v1.8.0**). Walkthrough: [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb).
 
 The same pattern (model package, preset, adapter; reuse Engine and kernels) is how later Aurora generations or other geospatial foundation models can get Day-1 support under a compatible code adaption.
 
@@ -147,7 +147,7 @@ Note: when the configured index differs from the one recorded in `uv.lock`, `uv 
 | Path | Role |
 | ---- | ---- |
 | `flash_aurora/models/aurora/` | Legacy optimized Aurora (upstream freeze **v1.8.0**). |
-| `flash_aurora/models/aurora_v1p5/` | Aurora 1.5 package (`v2.0.0` release); shares kernels and precision modes. |
+| `flash_aurora/models/aurora_v1p5/` | Aurora 1.5 package (`v2.0.1` release); shares kernels and precision modes. |
 | `flash_aurora/models/ops/` | Shared Triton and CuTe kernels. |
 | `flash_aurora/models/inference_precision.py` | Named precision presets. |
 | `flash_aurora/engine/` | Preset Engine: core, ingress, egress, runtime, distributed. |
@@ -265,7 +265,7 @@ Full latency grids, drift tables, reproduce commands, and multi-GPU numbers: [do
 This repository is licensed under the [MIT License](LICENSE).
 
 - `flash_aurora.models.aurora` is derived from [Microsoft Aurora](https://github.com/microsoft/aurora) (MIT), frozen at upstream **v1.8.0**. See `flash_aurora/models/aurora/LICENSE.txt` and `NOTICE.md`.
-- `flash_aurora.models.aurora_v1p5` is the Aurora 1.5 side path from tag `v2.0.0` (MIT). Presets: `aurora_v1p5` / `aurora_v1p5_ensemble`. See `flash_aurora/models/aurora_v1p5/LICENSE.txt` and `NOTICE.md`.
+- `flash_aurora.models.aurora_v1p5` is the Aurora 1.5 side path from tag `v2.0.1` (MIT). Presets: `aurora_v1p5` / `aurora_v1p5_ensemble`. See `flash_aurora/models/aurora_v1p5/LICENSE.txt` and `NOTICE.md`.
 - Shared kernels live under `flash_aurora.models.ops` (see per-file headers, including NVIDIA BSD-3-Clause where noted).
 
 ## Reference

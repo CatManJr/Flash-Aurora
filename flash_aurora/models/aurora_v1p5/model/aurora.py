@@ -1237,7 +1237,7 @@ class AuroraV1p5(Aurora):
 
     default_checkpoint_repo = "microsoft/aurora"
     default_checkpoint_name = "aurora-0.25-v1.5.ckpt"
-    default_checkpoint_revision = "main"
+    default_checkpoint_revision = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
 
     def __init__(
         self,
@@ -1389,7 +1389,7 @@ class AuroraV1p5Ensemble(AuroraV1p5):
     """Aurora 1.5 ensemble version with stochastic noise injection."""
 
     default_checkpoint_name = "aurora-0.25-v1.5-ensemble.ckpt"
-    default_checkpoint_revision = "9751bb56e8e4a0f0a780e3cbe978f4c721e12bc7"
+    default_checkpoint_revision = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
 
     def __init__(
         self,
