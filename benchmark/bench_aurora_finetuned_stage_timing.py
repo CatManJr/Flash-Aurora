@@ -25,11 +25,8 @@ from pathlib import Path
 from typing import Any
 
 _BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(_BENCH_DIR)
 if _BENCH_DIR not in sys.path:
     sys.path.insert(0, _BENCH_DIR)
-if os.path.join(_REPO, "profiling") not in sys.path:
-    sys.path.insert(0, os.path.join(_REPO, "profiling"))
 import _bootstrap  # noqa: F401, E402
 
 from _asset_root import default_asset_root  # noqa: E402
@@ -105,6 +102,72 @@ def _prepare_backbone_input(model: Any, batch: Any) -> tuple[tuple[int, int, int
     return patch_res, x, batch.metadata.rollout_step
 
 
+def _bucket_tier_profile(name: str) -> str:
+    """Map a profiler op name to a coarse self-CUDA time bucket."""
+    n = name.lower()
+    if "memcpy" in n or "dtoh" in n or "htod" in n or "memset" in n:
+        return "memcpy"
+    if "aten::to" in n or "convert_element_type" in n or "_to_copy" in n:
+        return "cast_dtype"
+    if "aten::copy_" in n or "direct_copy" in n:
+        return "copy_tensor"
+    if "windowattnfwd" in n:
+        return "attention_cute_window"
+    if (
+        "efficient_attention" in n
+        or "fmha" in n
+        or "flash" in n
+        or "scaled_dot_product" in n
+        or "sdpa" in n
+    ):
+        return "attention_sdpa"
+    if "aten::linear" in n:
+        return "linear"
+    if "aten::addmm" in n:
+        return "addmm"
+    if (
+        "magma" in n
+        or "cutlass" in n
+        or "cublas" in n
+        or "aten::mm" in n
+        or n.endswith("::mm")
+        or "gemm" in n
+    ):
+        return "gemm_other"
+    if "layer_norm" in n or "native_layer_norm" in n:
+        return "layer_norm"
+    if "roll" in n or ("triton" in n and "layout" in n):
+        return "layout_triton"
+    if "triton" in n or "compiled" in n:
+        return "triton_other"
+    if "gelu" in n or "silu" in n:
+        return "gelu_act"
+    if "elementwise" in n or "::mul" in n or "::add" in n:
+        return "elementwise"
+    return "other"
+
+
+def _aggregate_buckets(prof: Any, *, use_cuda: bool) -> tuple[dict[str, float], float]:
+    buckets: dict[str, float] = {}
+    total_ms = 0.0
+    for e in prof.key_averages():
+        if use_cuda:
+            t_us = float(
+                getattr(e, "self_cuda_time_total", 0)
+                or getattr(e, "self_device_time_total", 0)
+                or 0
+            )
+        else:
+            t_us = float(getattr(e, "self_cpu_time_total", 0) or 0)
+        if t_us <= 0:
+            continue
+        t_ms = t_us / 1000.0
+        total_ms += t_ms
+        b = _bucket_tier_profile(str(e.key))
+        buckets[b] = buckets.get(b, 0.0) + t_ms
+    return buckets, total_ms
+
+
 def profile_backbone_cast_buckets(
     model: Any,
     batch: Any,
@@ -114,8 +177,6 @@ def profile_backbone_cast_buckets(
 ) -> dict[str, float]:
     """Self-CUDA buckets on backbone-only loop (cast_dtype vs gemm, etc.)."""
     from torch.profiler import ProfilerActivity, profile
-
-    from profile_precision_tiers import _aggregate_buckets
 
     patch_res, backbone_x, rollout_step = _prepare_backbone_input(model, batch)
 

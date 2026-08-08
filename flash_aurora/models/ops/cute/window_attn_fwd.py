@@ -116,7 +116,7 @@ def _bf16_stream_single_pass_enabled() -> bool:
 
 
 def _best_tile_m(is_bf16: bool, has_bias: bool) -> int:
-    """Optimal tile_m for single-pass N=144 on sm_120a (benchmark/_sweep_tile_m.py).
+    """Optimal tile_m for single-pass N=144 on sm_120a (from a tile sweep).
 
     BF16  -> 64 always (tile_m=128 is ~2.2x slower when masked).
     TF32  -> 64 when masked (Swin SW-MSA blocks); 128 when unmasked (W-MSA blocks).

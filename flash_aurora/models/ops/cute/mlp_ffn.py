@@ -5,7 +5,7 @@ those portions are licensed under the MIT License (see LICENSE).
 
 Perceiver / Swin MLP FFN - **planned** CuTeDSL or cuDNN Graph paths (not wired).
 
-Two targets only (see ``benchmark/bench_perceiver_gemm_layout.py`` microbench):
+Two targets only:
 
 1. **fc2 fast path** - ``F.linear`` GEMM ``Mx1024 @ 1024x512`` (bottleneck at M~140k).
    Weight TN prepack, optional decoder-only BF16 TC, or CuTe dense GEMM matching cuBLAS.

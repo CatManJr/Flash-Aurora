@@ -17,8 +17,7 @@ Usage (from the repository root, with the ``aurora`` package on ``PYTHONPATH``):
 
 For Nsight Systems (``nsys profile``), use ``--no-torch-profiler`` so the capture is not
 mixed with ``torch.profiler``. For steady-state GPU timelines, use
-``--cuda-profiler-api`` with ``nsys profile --capture-range=cudaProfilerApi``; see
-``aurora/scripts/profile_aurora_small_nsys.sh``.
+``--cuda-profiler-api`` with ``nsys profile --capture-range=cudaProfilerApi``.
 
 Use ``--stress`` or ``--batch-size N`` (often with ``--synthetic``) for VRAM/latency
 stress tests; HF test tensors repeated to large batch may OOM before synthetic.
