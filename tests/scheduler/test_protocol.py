@@ -44,6 +44,38 @@ def test_forecast_request_json_round_trip() -> None:
     assert restored.parsed_valid_time() == datetime(2024, 6, 1, 6, 0, 0)
 
 
+def test_forecast_request_v1p5_scheduler_fields_round_trip() -> None:
+    request = ForecastRequest(
+        request_id="job-v1p5",
+        preset="aurora_v1p5_ensemble",
+        steps=2,
+        valid_time="2024-06-01T06:00:00",
+        fine_lead_times=(3.0, 6.0),
+        use_noise_accumulation=False,
+        ensemble_members=3,
+        noise_seed=42,
+    )
+    restored = forecast_request_from_dict(forecast_request_to_dict(request))
+    assert restored == request
+    assert restored.fine_lead_times == (3.0, 6.0)
+    assert restored.use_noise_accumulation is False
+    assert restored.ensemble_members == 3
+    assert restored.noise_seed == 42
+
+
+def test_forecast_event_ensemble_member_round_trip() -> None:
+    event = ForecastEvent(
+        kind="step",
+        request_id="job-ens",
+        step=1,
+        valid_time="2024-06-01T12:00:00",
+        ensemble_member=2,
+    )
+    restored = forecast_event_from_dict(forecast_event_to_dict(event))
+    assert restored == event
+    assert restored.ensemble_member == 2
+
+
 def test_forecast_command_json_round_trip() -> None:
     command = ForecastCommand(
         kind="forecast",

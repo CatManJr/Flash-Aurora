@@ -24,6 +24,7 @@ ForecastEventKind = Literal[
     "completed",
     "failed",
     "health",
+    "ready",
 ]
 
 
@@ -49,6 +50,10 @@ class ForecastRequest:
     output_mode: ForecastOutputMode = "export_paths"
     preview_var: str | None = None
     sticky_key: str | None = None
+    fine_lead_times: tuple[float, ...] | None = None
+    use_noise_accumulation: bool | None = None
+    ensemble_members: int | None = None
+    noise_seed: int | None = None
 
     def parsed_valid_time(self) -> datetime:
         if self.valid_time is None:
@@ -77,6 +82,7 @@ class ForecastEvent:
     array_name: str | None = None
     array_data_b64: str | None = None
     message: str | None = None
+    ensemble_member: int | None = None
 
     def array(self) -> np.ndarray:
         if self.array_data_b64 is None:
@@ -108,6 +114,15 @@ def _optional_str(payload: dict[str, Any], key: str) -> str | None:
     return _require_str(payload, key)
 
 
+def _optional_float_tuple(payload: dict[str, Any], key: str) -> tuple[float, ...] | None:
+    if key not in payload or payload[key] is None:
+        return None
+    raw = payload[key]
+    if not isinstance(raw, (list, tuple)):
+        raise TypeError(f"{key} must be a list of floats")
+    return tuple(float(value) for value in raw)
+
+
 def forecast_request_to_dict(request: ForecastRequest) -> dict[str, Any]:
     return {
         "protocol_version": PROTOCOL_VERSION,
@@ -125,6 +140,12 @@ def forecast_request_to_dict(request: ForecastRequest) -> dict[str, Any]:
         "output_mode": request.output_mode,
         "preview_var": request.preview_var,
         "sticky_key": request.sticky_key,
+        "fine_lead_times": (
+            None if request.fine_lead_times is None else list(request.fine_lead_times)
+        ),
+        "use_noise_accumulation": request.use_noise_accumulation,
+        "ensemble_members": request.ensemble_members,
+        "noise_seed": request.noise_seed,
     }
 
 
@@ -139,6 +160,9 @@ def forecast_request_from_dict(payload: dict[str, Any]) -> ForecastRequest:
 
     async_export = payload.get("async_export")
     overlap = payload.get("overlap")
+    use_noise_accumulation = payload.get("use_noise_accumulation")
+    ensemble_members = payload.get("ensemble_members")
+    noise_seed = payload.get("noise_seed")
     return ForecastRequest(
         request_id=_require_str(payload, "request_id"),
         preset=_require_str(payload, "preset"),
@@ -154,6 +178,12 @@ def forecast_request_from_dict(payload: dict[str, Any]) -> ForecastRequest:
         output_mode=output_mode,
         preview_var=_optional_str(payload, "preview_var"),
         sticky_key=_optional_str(payload, "sticky_key"),
+        fine_lead_times=_optional_float_tuple(payload, "fine_lead_times"),
+        use_noise_accumulation=(
+            None if use_noise_accumulation is None else bool(use_noise_accumulation)
+        ),
+        ensemble_members=None if ensemble_members is None else int(ensemble_members),
+        noise_seed=None if noise_seed is None else int(noise_seed),
     )
 
 
@@ -197,6 +227,7 @@ def forecast_event_to_dict(event: ForecastEvent) -> dict[str, Any]:
         "array_name": event.array_name,
         "array_data_b64": event.array_data_b64,
         "message": event.message,
+        "ensemble_member": event.ensemble_member,
     }
 
 
@@ -214,11 +245,13 @@ def forecast_event_from_dict(payload: dict[str, Any]) -> ForecastEvent:
         "completed",
         "failed",
         "health",
+        "ready",
     ):
         raise ValueError(f"unsupported event kind {kind!r}")
 
     step = payload.get("step")
     worker_capacity = payload.get("worker_capacity")
+    ensemble_member = payload.get("ensemble_member")
     return ForecastEvent(
         kind=kind,
         request_id=_optional_str(payload, "request_id"),
@@ -233,6 +266,7 @@ def forecast_event_from_dict(payload: dict[str, Any]) -> ForecastEvent:
         array_name=_optional_str(payload, "array_name"),
         array_data_b64=_optional_str(payload, "array_data_b64"),
         message=_optional_str(payload, "message"),
+        ensemble_member=None if ensemble_member is None else int(ensemble_member),
     )
 
 

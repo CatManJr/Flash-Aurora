@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -245,6 +246,81 @@ def test_client_health(zmq_addresses: tuple[str, str, zmq.Context], tmp_path: Pa
     health = client.health()
     assert health.kind == "health"
     assert health.worker_preset == "small_pretrained"
+
+    client.shutdown_worker()
+    thread.join(timeout=5.0)
+    client.close()
+
+
+def test_health_responsive_during_forecast(
+    zmq_addresses: tuple[str, str, zmq.Context],
+    tmp_path: Path,
+) -> None:
+    """Control plane must answer health while the compute thread is busy."""
+    command_addr, event_addr, context = zmq_addresses
+    started = threading.Event()
+    release = threading.Event()
+
+    engine = _build_mock_engine(tmp_path)
+
+    def _slow_export(*_args, **_kwargs):
+        started.set()
+        assert release.wait(timeout=5.0)
+        path = tmp_path / "prediction-000.nc"
+        path.write_text("nc")
+        return iter([path])
+
+    engine.rollout_and_export.side_effect = _slow_export
+    downloader = MagicMock()
+    downloader.ingest_request.return_value = MagicMock()
+
+    worker = ForecastWorker(
+        ForecastWorkerConfig(
+            preset="era5_pretrained",
+            asset_root=tmp_path,
+            command_addr=command_addr,
+            event_addr=event_addr,
+            poll_timeout_ms=50,
+        ),
+        engine=engine,
+        downloader=downloader,
+        context=context,
+    )
+    wait_for_bind(command_addr)
+    thread = _start_worker_thread(worker)
+
+    client = ForecastClient(
+        ForecastClientConfig(command_addr=command_addr, event_addr=event_addr, recv_timeout_ms=5000),
+        context=context,
+    )
+    request = ForecastRequest(
+        request_id="req-slow",
+        preset="era5_pretrained",
+        steps=1,
+        valid_time="2024-06-01T06:00:00",
+        export_dir=str(tmp_path / "out"),
+    )
+    client.submit(request)
+    assert started.wait(timeout=5.0)
+
+    t0 = time.perf_counter()
+    health = client.health()
+    elapsed_s = time.perf_counter() - t0
+    assert health.kind == "health"
+    assert health.message == "busy"
+    assert elapsed_s < 1.0
+    assert worker.busy
+
+    release.set()
+    # health() may have drained early job events; wait for completion only.
+    saw_completed = False
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        event = client.recv_event()
+        if event.request_id == request.request_id and event.kind == "completed":
+            saw_completed = True
+            break
+    assert saw_completed
 
     client.shutdown_worker()
     thread.join(timeout=5.0)

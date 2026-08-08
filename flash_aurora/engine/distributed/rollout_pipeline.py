@@ -3,25 +3,33 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 from flash_aurora.models.aurora.batch import Batch
 from flash_aurora.models.aurora.rollout import advance_rollout_batch, prepare_rollout_batch
+from flash_aurora.models.aurora_v1p5.rollout import _advance_batch as advance_v1p5_rollout_batch
 
 from flash_aurora.engine.distributed.batch_utils import batch_to_device
+from flash_aurora.engine.distributed.lead_routing import (
+    backbone_lead_kwargs,
+    encoder_decoder_lead_kwargs,
+    resolve_lead_times_tensor,
+    uses_variable_lead_times,
+)
+from flash_aurora.engine.distributed.pipeline import parallel_plan
 from flash_aurora.engine.runtime.cuda_memory import (
-    release_batch_gpu_storage,
     release_tensor_storage,
     trim_cuda_cache,
 )
-from flash_aurora.engine.distributed.pipeline import parallel_plan
-
-if TYPE_CHECKING:
-    from flash_aurora.models.aurora.model.aurora import Aurora
 
 
-def run_encoder_stage(model: Aurora, batch: Batch) -> tuple[Batch, torch.Tensor, tuple[int, int, int]]:
+def run_encoder_stage(
+    model: Any,
+    batch: Batch,
+    *,
+    lead_times: torch.Tensor | None = None,
+) -> tuple[Batch, torch.Tensor, tuple[int, int, int], torch.Tensor | None]:
     plan = parallel_plan(model)
     if plan is None:
         raise RuntimeError("model is not pipeline-parallel")
@@ -31,6 +39,8 @@ def run_encoder_stage(model: Aurora, batch: Batch) -> tuple[Batch, torch.Tensor,
 
     batch = batch_to_device(batch, enc_dev)
     batch, transformed_batch, patch_res = model._prepare_encoder_batch(batch)
+    lead_times_tensor = resolve_lead_times_tensor(model, batch, lead_times)
+    lead_kwargs = encoder_decoder_lead_kwargs(model, lead_times_tensor)
     with torch.inference_mode():
         with _device_context(enc_dev):
             x = run_with_encoder_decoder_routing(
@@ -38,16 +48,18 @@ def run_encoder_stage(model: Aurora, batch: Batch) -> tuple[Batch, torch.Tensor,
                 transformed_batch,
                 autocast_bf16=model.autocast_encoder_decoder,
                 use_tensor_core=model.encoder_decoder_use_tensor_core,
-                lead_time=model.timestep,
+                **lead_kwargs,
             )
-    return batch, x, patch_res
+    return batch, x, patch_res, lead_times_tensor
 
 
 def run_backbone_stage(
-    model: Aurora,
+    model: Any,
     x: torch.Tensor,
     batch: Batch,
     patch_res: tuple[int, int, int],
+    *,
+    lead_times: torch.Tensor | None = None,
 ) -> torch.Tensor:
     plan = parallel_plan(model)
     if plan is None:
@@ -57,13 +69,14 @@ def run_backbone_stage(
     bb_dev = torch.device(plan.backbone_device)
     if bb_dev != enc_dev:
         x = x.to(bb_dev, non_blocking=True)
+    lead_kwargs = backbone_lead_kwargs(model, lead_times)
     with torch.inference_mode():
         with _device_context(bb_dev):
             out = model._run_backbone(
                 x,
-                lead_time=model.timestep,
                 patch_res=patch_res,
                 rollout_step=batch.metadata.rollout_step,
+                **lead_kwargs,
             )
     if bb_dev != enc_dev and x.is_cuda:
         release_tensor_storage(x)
@@ -71,10 +84,12 @@ def run_backbone_stage(
 
 
 def run_decoder_stage(
-    model: Aurora,
+    model: Any,
     x: torch.Tensor,
     batch: Batch,
     patch_res: tuple[int, int, int],
+    *,
+    lead_times: torch.Tensor | None = None,
 ) -> Batch:
     plan = parallel_plan(model)
     if plan is None:
@@ -83,6 +98,7 @@ def run_decoder_stage(
     enc_dev = torch.device(plan.encoder_device)
     bb_dev = torch.device(plan.backbone_device)
     dec_dev = torch.device(plan.decoder_device)
+    lead_kwargs = encoder_decoder_lead_kwargs(model, lead_times)
 
     from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
@@ -97,10 +113,10 @@ def run_decoder_stage(
                 x,
                 batch,
                 patch_res=patch_res,
-                lead_time=model.timestep,
                 spatial_devices=(west_dev, east_dev),
                 autocast_bf16=model.autocast_encoder_decoder,
                 use_tensor_core=model.encoder_decoder_use_tensor_core,
+                **lead_kwargs,
             )
         else:
             if dec_dev != bb_dev:
@@ -114,8 +130,8 @@ def run_decoder_stage(
                     batch,
                     autocast_bf16=model.autocast_encoder_decoder,
                     use_tensor_core=model.encoder_decoder_use_tensor_core,
-                    lead_time=model.timestep,
                     patch_res=patch_res,
+                    **lead_kwargs,
                 )
 
     pred = model._finish_prediction(batch, pred)
@@ -135,7 +151,7 @@ def _device_context(device: torch.device):
 
 
 def distributed_rollout(
-    model: Aurora,
+    model: Any,
     batch: Batch,
     steps: int,
     *,
@@ -148,14 +164,19 @@ def distributed_rollout(
 
     enc_dev = torch.device(plan.encoder_device)
     batch = prepare_rollout_batch(model, batch)
+    v1p5 = uses_variable_lead_times(model)
 
     for step in range(steps):
-        step_batch, x_enc, patch_res = run_encoder_stage(model, batch)
-        x_bb = run_backbone_stage(model, x_enc, step_batch, patch_res)
+        step_batch, x_enc, patch_res, lead_times = run_encoder_stage(model, batch)
+        x_bb = run_backbone_stage(
+            model, x_enc, step_batch, patch_res, lead_times=lead_times
+        )
         if x_enc.is_cuda:
             release_tensor_storage(x_enc)
 
-        pred = run_decoder_stage(model, x_bb, step_batch, patch_res)
+        pred = run_decoder_stage(
+            model, x_bb, step_batch, patch_res, lead_times=lead_times
+        )
         if x_bb.is_cuda:
             release_tensor_storage(x_bb)
         yield pred
@@ -164,6 +185,11 @@ def distributed_rollout(
             on_step_export(step, pred)
 
         if step + 1 < steps:
-            batch = advance_rollout_batch(batch, pred)
+            if v1p5:
+                if hasattr(model, "apply_rollout_input_clipping"):
+                    pred = model.apply_rollout_input_clipping(pred)
+                batch = advance_v1p5_rollout_batch(batch, pred)
+            else:
+                batch = advance_rollout_batch(batch, pred)
 
     trim_cuda_cache(enc_dev)

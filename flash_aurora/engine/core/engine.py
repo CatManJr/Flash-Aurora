@@ -179,11 +179,8 @@ class AuroraEngine:
         if forward_warmup_iters is not None:
             config.forward_warmup_iters = forward_warmup_iters
         if distributed is not None:
-            if is_v1p5_model_class(config.variant.model_class):
-                raise ValueError(
-                    "Pipeline-parallel distributed rollout is not supported for Aurora 1.5 yet."
-                )
             config.distributed = distributed
+            # CUDA graphs and GpuGuard are single-device paths.
             config.cuda_graph = False
             config.gpu_guard = False
         engine = cls(config, presets=registry)

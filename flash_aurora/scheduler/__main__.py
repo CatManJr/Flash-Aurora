@@ -50,6 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--distributed-force", action="store_true")
     parser.add_argument("--poll-timeout-ms", type=int, default=1000)
+    parser.add_argument(
+        "--preload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Call engine.load() and emit ready before accepting jobs",
+    )
+    parser.add_argument("--preload-rollout-steps", type=int, default=1)
     return parser
 
 
@@ -82,12 +89,15 @@ def main() -> None:
         distributed_max_vram_gib=args.distributed_max_vram_gib,
         distributed_force=args.distributed_force,
         poll_timeout_ms=args.poll_timeout_ms,
+        preload=args.preload,
+        preload_rollout_steps=args.preload_rollout_steps,
     )
     worker = ForecastWorker(config)
     install_signal_handlers(worker)
     print(
         f"[worker] id={worker.worker_id} preset={config.preset} device={worker.device} "
-        f"capacity={config.capacity} command={config.command_addr} event={config.event_addr}",
+        f"capacity={config.capacity} preload={config.preload} "
+        f"command={worker.command_addr} event={worker.event_addr}",
         flush=True,
     )
     try:

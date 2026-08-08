@@ -88,12 +88,57 @@ class ForecastClient:
                 return event
         raise TimeoutError("timed out waiting for health response")
 
+    def wait_for_ready(
+        self,
+        *,
+        timeout_s: float = 600.0,
+        require_model_loaded: bool = True,
+    ) -> ForecastEvent:
+        """Block until the worker reports ready (event or health).
+
+        Late-joining clients miss the startup ``ready`` PUSH, so this also polls
+        ``health`` (message ``ready`` after preload / first successful load, or
+        ``listening`` when sockets are up without preload).
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._event_socket.poll(timeout=50):
+                event = self._recv_event()
+                if event.kind == "ready":
+                    if not require_model_loaded or event.message == "ready":
+                        return event
+                # Drain unrelated events while waiting.
+                continue
+            self._send_command(ForecastCommand(kind="health"))
+            try:
+                # Temporarily tighten recv timeout for the health round-trip.
+                previous = self._event_socket.getsockopt(zmq.RCVTIMEO)
+                self._event_socket.setsockopt(zmq.RCVTIMEO, 1_000)
+                try:
+                    event = self._recv_event()
+                finally:
+                    self._event_socket.setsockopt(zmq.RCVTIMEO, previous)
+            except zmq.Again:
+                continue
+            if event.kind == "ready":
+                if not require_model_loaded or event.message == "ready":
+                    return event
+                continue
+            if event.kind == "health":
+                if event.message == "ready":
+                    return event
+                if not require_model_loaded and event.message == "listening":
+                    return event
+        raise TimeoutError("timed out waiting for worker ready")
+
     def shutdown_worker(self) -> None:
         self._send_command(ForecastCommand(kind="shutdown"))
 
     def events(self, request_id: str) -> Iterator[ForecastEvent]:
         while True:
             event = self._recv_event()
+            if event.kind in ("ready", "health"):
+                continue
             if event.request_id not in (None, request_id):
                 continue
             yield event

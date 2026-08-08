@@ -60,8 +60,7 @@ def test_model_factory_accepts_inference_precision_for_v1p5() -> None:
         for m in model.modules()
         if hasattr(m, "use_fp16_safe_attention")
     )
-    # use_lora_merged_inference remains optimized-only and is stripped.
-    assert not any(
+    assert any(
         getattr(m, "use_lora_merged_inference", False)
         for m in model.modules()
         if hasattr(m, "use_lora_merged_inference")

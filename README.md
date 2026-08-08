@@ -85,7 +85,7 @@ Left: one job per worker and preset. Right: faster workers take follow-up jobs w
 
 ### Pipeline parallelism for GPUs under $40\,\mathrm{GiB}$
 
-`DistributedConfig` places encoder, Swin backbone, and spatial decoder on two devices **inside one process** (not a multi-process `torchrun` job). The VRAM planner in `engine/distributed/plan.py` chooses the split from `ModelVariantSpec` and per-card limits; `decoder_spatial.py` can bisect the decoder west/east so peak decoder activation memory falls from about $28\,\mathrm{GiB}$ to about $14\,\mathrm{GiB}$ per card on ERA5. On $2\times$ RTX 5090, a $4$-step `rollout_and_export` run reaches about $1.3\,\mathrm{s}$/step on `era5_pretrained` and about $3.6\,\mathrm{s}$/step on `hres_0.1`, where GPU-to-CPU offload and NetCDF write dominate (export-bound). Aurora 1.5 does not yet enable this path. Placement and timing tables: [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline).
+`DistributedConfig` places encoder, Swin backbone, and spatial decoder on two devices **inside one process** (not a multi-process `torchrun` job). The VRAM planner in `engine/distributed/plan.py` chooses the split from `ModelVariantSpec` and per-card limits; `decoder_spatial.py` can bisect the decoder west/east so peak decoder activation memory falls from about $28\,\mathrm{GiB}$ to about $14\,\mathrm{GiB}$ per card on ERA5. On $2\times$ RTX 5090, a $4$-step `rollout_and_export` run reaches about $1.3\,\mathrm{s}$/step on `era5_pretrained` and about $3.6\,\mathrm{s}$/step on `hres_0.1`, where GPU-to-CPU offload and NetCDF write dominate (export-bound). Aurora 1.5 supports the same path on standard timestep AR steps (`lead_times` = model timestep hours); fine-lead substeps inside `distributed_rollout` are not wired yet. Placement and timing tables: [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline).
 
 <table width="100%">
   <tr>
@@ -185,7 +185,7 @@ Personal ECMWF accounts typically lack MARS access; see [example_wave.ipynb](doc
 
 ### Capabilities (summary)
 
-Checkpoints load from disk, with optional Hugging Face Hub download. Precision modes route Triton, CuTe, BF16, and TF32 on the legacy family and the Aurora 1.5 backbone. Two-GPU pipeline placement is available for the legacy family (not for Aurora 1.5). Data sources include CDS (including Aurora 1.5 extended surface fields), ADS, WeatherBench2, Open Data GRIB, and MARS when the account allows it. Aurora 1.5 can use hourly lead times. Optional features include background NetCDF export, overlapping initial-condition load with compute, a disk cache of prepared initial conditions, and a GPU reservation guard. CUDA graph capture is still experimental and is turned off for Aurora 1.5.
+Checkpoints load from disk, with optional Hugging Face Hub download. Precision modes route Triton, CuTe, BF16, and TF32 on the legacy family and the Aurora 1.5 backbone. Two-GPU pipeline placement works for the legacy family and for Aurora 1.5 on standard timestep AR steps (variable `fine_lead_times` inside the distributed roller is not wired yet). Data sources include CDS (including Aurora 1.5 extended surface fields), ADS, WeatherBench2, Open Data GRIB, and MARS when the account allows it. Aurora 1.5 can use hourly lead times. Optional features include background NetCDF export, overlapping initial-condition load with compute, a disk cache of prepared initial conditions, and a GPU reservation guard. CUDA graph capture remains experimental on the legacy family and is **unsupported** for Aurora 1.5 (variable `lead_times` and ensemble noise conflict with fixed-shape capture; presets force `cuda_graph=False`).
 
 API sketches and lifecycle notes: [docs/tutorial.md](docs/tutorial.md).
 
@@ -195,7 +195,7 @@ Single-process pipeline parallelism for presets that exceed one GPU. Pass `distr
 
 ### Forecast scheduler (ZMQ)
 
-Long-lived workers each own one GPU and one preset. Clients send JSON commands and receive per-step events (exported file paths, metadata only, or the last step as an array). Deployment commands and client sketches: [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment).
+Long-lived workers each own one GPU and one preset. Clients send JSON commands and receive per-step events (exported file paths, metadata only, or the last step as an array). For loopback bring-up with preload and an explicit `ready` signal, use `python -m flash_aurora.scheduler.localhost`. Deployment commands and client sketches: [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment). Comparison with vLLM’s frontend ↔ EngineCore ZMQ path: [docs/design/vllm_zmq_communication.md](docs/design/vllm_zmq_communication.md).
 
 ## Precision tiers
 
