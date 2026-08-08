@@ -7,7 +7,7 @@ Defaults benchmark ``era5_pretrained`` and ``hres_0.1``; both need at least two 
 
 Examples::
 
-    export AURORA_ASSET_ROOT=/root/autodl-tmp/aurora
+    export AURORA_ASSET_ROOT=/path/to/aurora
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_distributed_rollout.py \\
         --preset era5_pretrained --inference-precision bf16_mixed@fp32 \\
@@ -121,10 +121,6 @@ def _gpu_names() -> tuple[str, ...]:
 
 def _rollout_export_dir() -> Path:
     root = os.environ.get("AURORA_ROLLOUT_TMP")
-    if root is None:
-        autodl_tmp = Path("/root/autodl-tmp/rollout_tmp")
-        if autodl_tmp.parent.is_dir():
-            root = str(autodl_tmp)
     if root is not None:
         base = Path(root)
         base.mkdir(parents=True, exist_ok=True)

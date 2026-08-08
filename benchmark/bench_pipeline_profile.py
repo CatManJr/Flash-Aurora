@@ -6,7 +6,7 @@ transfer between stages, parameter footprint, and peak VRAM vs planner estimates
 
 Examples::
 
-    export AURORA_ASSET_ROOT=/root/autodl-tmp/aurora
+    export AURORA_ASSET_ROOT=/path/to/aurora
     export CDSAPI_KEY='<api_key>'
 
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_pipeline_profile.py \\

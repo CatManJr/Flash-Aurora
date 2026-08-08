@@ -15,6 +15,7 @@ from flash_aurora.models.aurora.model.custom_op_paths import (
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_align_binary_activations_promotes_to_bf16() -> None:
     fp32 = torch.randn(2, 4, 8, device="cuda", dtype=torch.float32)
     bf16 = torch.randn(2, 4, 8, device="cuda", dtype=torch.bfloat16)
@@ -23,6 +24,7 @@ def test_align_binary_activations_promotes_to_bf16() -> None:
     assert right.dtype == torch.bfloat16
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_can_use_cute_qkvpacked_under_autocast() -> None:
     qkv = torch.randn(4, 144, 768, device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -36,6 +38,7 @@ def test_can_use_cute_qkvpacked_under_autocast() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prepare_backbone_input_casts_to_bf16() -> None:
     from flash_aurora.models.aurora.model.custom_op_paths import prepare_backbone_input
 
@@ -69,6 +72,7 @@ def test_backbone_bf16_hybrid_routing() -> None:
     assert y.dtype == torch.bfloat16
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_backbone_bf16_routing() -> None:
     from flash_aurora.models.aurora.model.custom_op_paths import backbone_matmul_context
     from flash_aurora.models.aurora.model.swin3d import MLP

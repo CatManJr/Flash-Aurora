@@ -22,9 +22,8 @@ ensure_repo_paths()
 
 from _asset_root import default_asset_root
 
-_AUTODL_DEFAULT_ASSET_ROOT = Path("/root/autodl-tmp/aurora")
 _CHECKPOINT_NAME = "aurora-0.25-pretrained.ckpt"
-_DEFAULT_ASSET_ROOT = _AUTODL_DEFAULT_ASSET_ROOT
+_DEFAULT_ASSET_ROOT = None
 _PYTORCH_BASELINE_KEY = "pytorch_backbone_fp32_encoder_decoder_fp32"
 
 _LEGACY_NAMED_TIERS: tuple[tuple[str, str, str], ...] = (
@@ -182,8 +181,6 @@ def resolve_bench_asset_root(asset_root: Path | str | None = None) -> Path:
     env_root = resolve_asset_root()
     if env_root is not None:
         return env_root
-    if _AUTODL_DEFAULT_ASSET_ROOT.parent.exists():
-        return _AUTODL_DEFAULT_ASSET_ROOT
     return default_asset_root()
 
 

@@ -14,8 +14,9 @@ times ``forward``, and compares outputs against the PyTorch FP32 baseline.
 Examples::
 
     export CDSAPI_KEY='<api_key>'
+    export AURORA_ASSET_ROOT=/path/to/aurora
     uv run python benchmark/bench_aurora_pretrained.py \\
-        --asset-root /root/autodl-tmp/aurora
+        --asset-root \"$AURORA_ASSET_ROOT\"
 
     uv run python benchmark/bench_aurora_pretrained.py --suite legacy --warmup 1 --repeat 1
     uv run python benchmark/bench_aurora_pretrained.py --skip-download  # local cache only
@@ -68,7 +69,10 @@ def main() -> None:
         "--asset-root",
         type=Path,
         default=_DEFAULT_ASSET_ROOT,
-        help=f"Asset directory with checkpoint + era5/ cache (default: {_DEFAULT_ASSET_ROOT})",
+        help=(
+            "Asset directory with checkpoint + era5/ cache "
+            "(default: AURORA_ASSET_ROOT / legacy env aliases)"
+        ),
     )
     parser.add_argument(
         "--era5-cache",

@@ -69,13 +69,16 @@ def test_engine_load_failure_releases_gpu(tmp_path: Path, monkeypatch: pytest.Mo
     engine = AuroraEngine.from_preset("era5_pretrained", asset_root=tmp_path)
     released = False
 
-    def fail_load():
+    def fail_load(*, rollout_steps: int | None = None):
+        del rollout_steps
         raise RuntimeError("load failed")
 
     def release_gpu(*, move_model_to_cpu: bool = True) -> None:
         nonlocal released
         released = move_model_to_cpu
 
+    # Keep this test independent of host CUDA: acquire_gpu is not under test here.
+    monkeypatch.setattr(engine, "acquire_gpu", lambda *, rollout_steps=None: None)
     monkeypatch.setattr(engine, "_load_model_to_device", fail_load)
     monkeypatch.setattr(engine, "release_gpu", release_gpu)
 

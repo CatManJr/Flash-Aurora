@@ -92,7 +92,14 @@ def tiny_era5_config(levels: tuple[int, ...] = (850, 925, 1000)) -> EngineConfig
 
 def test_registry_lists_all_doc_sources() -> None:
     names = set(DEFAULT_ADAPTERS.names())
-    assert names == {"cds_era5", "wb2_hres", "grib_ifs_0.1", "cams", "wb2_wam"}
+    assert names == {
+        "cds_era5",
+        "cds_era5_v1p5",
+        "wb2_hres",
+        "grib_ifs_0.1",
+        "cams",
+        "wb2_wam",
+    }
 
 
 def test_era5_adapter_builds_notebook_layout(tmp_path: Path) -> None:

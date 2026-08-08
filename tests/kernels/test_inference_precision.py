@@ -281,6 +281,7 @@ def test_fp32_rejects_cuda_graph_enable() -> None:
         resolve_inference_config("fp32", enable_cuda_graph=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_aurora_prepare_encoder_batch_keeps_lat_lon_fp32() -> None:
     from flash_aurora.models.aurora import Batch, Metadata
     from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained

@@ -79,7 +79,7 @@ def test_ensure_era5_calls_cds_backends(tmp_path: Path) -> None:
         return paths
 
     with patch("flash_aurora.engine.ingress.download.backends.cds.download_era5_day", side_effect=fake_download):
-        result = downloader.ensure(valid_time, cache_dir=cache)
+        result = downloader.ensure(valid_time, cache_dir=cache, cds_api_key="test-key")
 
     assert result.complete
     assert set(result.paths) == {"static", "surface", "atmospheric"}
