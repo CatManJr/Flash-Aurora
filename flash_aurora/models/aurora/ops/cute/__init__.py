@@ -1,4 +1,7 @@
-"""Compatibility shim. Prefer ``flash_aurora.models.ops.cute``."""
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Compatibility shim. Prefer ``flash_aurora.models.ops.cute``.
+"""
 
 from __future__ import annotations
 

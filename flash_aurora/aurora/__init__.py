@@ -1,7 +1,9 @@
-"""Compatibility shim for ``flash_aurora.aurora``.
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
 
-Prefer ``flash_aurora.models.aurora``. This module re-exports the optimized
-Aurora package surface so existing ``from flash_aurora.aurora import ...``
+Compatibility shim for ``flash_aurora.aurora``.
+
+Import as ``flash_aurora.models.aurora``. This module re-exports the optimized
+Aurora models so existing ``from flash_aurora.aurora import ...``
 imports keep working for one release cycle.
 """
 

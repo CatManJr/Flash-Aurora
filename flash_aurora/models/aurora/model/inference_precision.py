@@ -1,4 +1,7 @@
-"""Compatibility shim. Prefer ``flash_aurora.models.inference_precision``."""
+"""Copyright (c) Catman Jr. Licensed under the MIT license.
+
+Compatibility shim. Prefer ``flash_aurora.models.inference_precision``.
+"""
 
 from __future__ import annotations
 

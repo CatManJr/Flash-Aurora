@@ -12,12 +12,12 @@ COPYRIGHT_NOTICE_CATMAN: str = '"""Copyright (c) Catman Jr. Licensed under the M
 PYTHON_FILES: list[Path] = []
 """list[Path]: Python files to scan for headers."""
 
-_root = Path(__file__).resolve().parents[2] / "flash_aurora" / "aurora"
-for path in _root.rglob("**/*.py"):
+_root = Path(__file__).resolve().parents[2] / "flash_aurora" / "models" / "aurora"
+for path in _root.rglob("*.py"):
     relative_path = path.relative_to(_root)
 
     # Ignore virtual environments and tool caches under the package tree.
-    if any(p in {".venv", "venv", "node_modules"} for p in relative_path.parts):
+    if any(p in {".venv", "venv", "node_modules", "__pycache__"} for p in relative_path.parts):
         continue
 
     # Ignore the automatically generated version file.
