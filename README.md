@@ -66,6 +66,14 @@ Precision tier details: [Precision tiers](#precision-tiers).
 
 *RTX PRO 6000 Blackwell; one `model.forward` (single rollout step) per bar; each tier in a separate process (`--isolate-tiers`). Finetuned presets merge LoRA into base weights before timing (`lora_merged`). `aurora_v1p5` is within a few percent of `era5_pretrained`; see [docs/benchmarks.md](docs/benchmarks.md).*
 
+Precision drift stays small on the recommended tiers: every variable on every preset stays within tolerance for `bf16_mixed@fp32`, `tf32@fp32`, and `fp32@fp32`, which shows that the manually tuned mixed precision inference outperformed PyTorch both in speed and numerical stability. The stacked bars below split the mean relative error versus the FP32 reference (seed 42) by variable for those tiers.
+
+<p align="center">
+  <img src="docs/image/precision_mean_rel_stacked_by_model.svg" alt="Stacked mean relative error by precision tier and preset (seed 42)" width="95%"/>
+</p>
+
+*Stacked mean relative error versus the PyTorch FP32 baseline (seed 42), one panel per preset, split by output variable. Lower bars mean closer to the FP32 reference; full tables: [docs/benchmarks.md](docs/benchmarks.md#precision-drift-seed-42-lora_merged-on-finetuned-presets).*
+
 ### Asynchronous multi-GPU serving
 
 One long-lived ZeroMQ worker owns one GPU and one model preset. A coordinator routes jobs to idle workers and streams step events to clients. This is **job-level** scheduling across heterogeneous presets, not tensor or pipeline parallelism inside one forward. Commands and client sketches: [docs/tutorial.md](docs/tutorial.md#forecast-scheduler-deployment).
@@ -110,7 +118,29 @@ cd flash-aurora
 uv sync
 ```
 
-Dependencies are listed in `pyproject.toml` and pinned in `uv.lock`. If CuTe kernels need an explicit GPU architecture, set `CUTE_DSL_ARCH` (for example `sm_89` on RTX 4090, `sm_120a` on Blackwell). API sketches: [docs/tutorial.md](docs/tutorial.md#quick-start).
+Dependencies are listed in `pyproject.toml` and pinned in `uv.lock`. The lockfile is generated against the official Python Package Index (PyPI), so it works anywhere without extra configuration. If CuTe kernels need an explicit GPU architecture, set `CUTE_DSL_ARCH` (for example `sm_89` on RTX 4090, `sm_120a` on Blackwell). API sketches: [docs/tutorial.md](docs/tutorial.md#quick-start).
+
+### Switching to a mirror index ( For Chinaese Users)
+
+PyPI is sometimes slow or unreachable from mainland China. `uv` will automatically re-resolve against whichever index you point it at, so a one-line override is enough — no lockfile edit required.
+
+Recommended for daily use: add a project-level `uv.toml` (local only, not committed):
+
+```toml
+# uv.toml
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+```
+
+or set it per-command in a shell:
+
+```bash
+export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+uv sync
+```
+
+Other mirrors that work the same way: Aliyun (`https://mirrors.aliyun.com/pypi/simple/`), Tencent (`https://mirrors.cloud.tencent.com/pypi/simple/`), USTC (`https://mirrors.ustc.edu.cn/pypi/simple/`).
+
+Note: when the configured index differs from the one recorded in `uv.lock`, `uv sync` re-resolves and rewrites `uv.lock` on your machine. That local change is expected; keep the committed lockfile on the official PyPI URLs.
 
 ## Repository layout
 
