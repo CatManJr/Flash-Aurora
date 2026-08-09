@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from flash_aurora.engine.core.redaction import sanitize_exception
 from flash_aurora.engine.ingress.download.progress import download_progress_enabled
 
-UCAR_RDA_HOST = "data.rda.ucar.edu"
+UCAR_DATA_HOSTS = frozenset({"data.gdex.ucar.edu", "data.rda.ucar.edu"})
 _DEFAULT_FETCH_RETRIES = 3
 _DEFAULT_FETCH_RETRY_DELAY_S = 2.0
 _ucar_insecure_tls: bool = False
@@ -33,7 +33,7 @@ def _require_requests():
 
 
 def _is_ucar_host(url: str) -> bool:
-    return urlparse(url).hostname == UCAR_RDA_HOST
+    return urlparse(url).hostname in UCAR_DATA_HOSTS
 
 
 def _allow_insecure_retry(url: str, *, verify: bool, exc: Exception) -> bool:
@@ -64,9 +64,10 @@ def _activate_ucar_insecure_tls() -> None:
     global _ucar_insecure_tls
     if _ucar_insecure_tls:
         return
+    host_list = ", ".join(sorted(UCAR_DATA_HOSTS))
     warnings.warn(
-        "UCAR RDA TLS certificate verification failed; continuing without "
-        f"verification for {UCAR_RDA_HOST} only in this process. "
+        "UCAR/GDEX TLS certificate verification failed; continuing without "
+        f"verification for {host_list} only in this process. "
         "Set FLASH_AURORA_SSL_VERIFY=0 to skip verification from the first request.",
         stacklevel=4,
     )
@@ -172,10 +173,11 @@ def fetch_bytes(
 ) -> bytes:
     """GET ``url`` and return the response body.
 
-    UCAR RDA (``data.rda.ucar.edu``) has intermittently shipped expired TLS certificates.
-    When verification fails for that host only, later requests in the same process skip
-    verification automatically so tutorial ingress keeps working. Set
-    ``FLASH_AURORA_SSL_VERIFY=0`` to skip TLS verification for all HTTP downloads.
+    NSF NCAR GDEX/RDA data hosts (``data.gdex.ucar.edu``, legacy ``data.rda.ucar.edu``)
+    have intermittently shipped expired TLS certificates. When verification fails for
+    those hosts only, later requests in the same process skip verification automatically
+    so tutorial ingress keeps working. Set ``FLASH_AURORA_SSL_VERIFY=0`` to skip TLS
+    verification for all HTTP downloads.
 
     Progress bars follow ``FLASH_AURORA_DOWNLOAD_PROGRESS`` (default ``auto``: on in
     terminals and Jupyter).

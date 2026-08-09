@@ -17,7 +17,8 @@ from flash_aurora.engine.ingress.download.layout import (
 )
 from flash_aurora.engine.ingress.download.paths import ensure_directory, normalize_path
 
-UCAR_RDA_BASE = "https://data.rda.ucar.edu/d113001"
+# NSF NCAR GDEX hosts d113001. The legacy data.rda.ucar.edu mirror now returns 403.
+UCAR_RDA_BASE = "https://data.gdex.ucar.edu/d113001"
 
 VAR_NUMS: dict[str, str] = {
     "2t": "167",

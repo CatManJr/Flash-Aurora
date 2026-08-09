@@ -42,7 +42,7 @@ engine.release_gpu(move_model_to_cpu=True)
 engine.close()
 ```
 
-For a fuller argument reference, see [Core API](#core-api) below. For Aurora 1.5, open [`example_aurora_v1p5.ipynb`](example_aurora_v1p5.ipynb).
+For a fuller argument reference, see [Core API](#core-api) below. For Aurora 1.5, open [`example_aurora_v1p5.ipynb`](example_aurora_v1p5.ipynb) or the [Colab notebook](https://colab.research.google.com/github/CatManJr/Flash-Aurora/blob/main/docs/example_aurora_v1p5_colab.ipynb).
 
 ## Forecast scheduler deployment
 
@@ -161,6 +161,7 @@ For incremental progress UI, call `client.submit(request)` and iterate `client.e
 | -------- | ----- |
 | [`example_era5.ipynb`](example_era5.ipynb) | Baseline in-process `era5_pretrained`; populate cache and checkpoints. |
 | [`example_aurora_v1p5.ipynb`](example_aurora_v1p5.ipynb) | Aurora 1.5: extended ERA5 IC, 6 h / hourly leads, optional ensemble, viz vs ERA5. |
+| [`example_aurora_v1p5_colab.ipynb`](example_aurora_v1p5_colab.ipynb) ([Open in Colab](https://colab.research.google.com/github/CatManJr/Flash-Aurora/blob/main/docs/example_aurora_v1p5_colab.ipynb)) | Colab-friendly Aurora 1.5 demo (`pip install flash-aurora`). |
 | [`example_hres_t0.ipynb`](example_hres_t0.ipynb) | WeatherBench2 HRES T0 finetuned preset. |
 | [`example_hres_0.1.ipynb`](example_hres_0.1.ipynb) | $0.1^{\circ}$ high-resolution Aurora (`hres_0.1`). |
 | [`example_cams.ipynb`](example_cams.ipynb) | CAMS air-pollution preset. |

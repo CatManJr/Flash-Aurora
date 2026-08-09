@@ -339,10 +339,17 @@ def test_grib_ifs_backend_downloads_when_missing(tmp_path: Path) -> None:
 
 
 def test_grib_ifs_urls_match_upstream_layout() -> None:
-    from flash_aurora.engine.ingress.download.grib_ifs import atmos_grib_url, surf_grib_url
+    from flash_aurora.engine.ingress.download.grib_ifs import (
+        UCAR_RDA_BASE,
+        atmos_grib_url,
+        surf_grib_url,
+    )
 
     date = datetime(2022, 5, 11, 6)
-    assert surf_grib_url(date, "2t").endswith("ec.oper.an.sfc.128_167_2t.regn1280sc.20220511.grb")
+    surf = surf_grib_url(date, "2t")
+    assert surf.startswith("https://data.gdex.ucar.edu/d113001/")
+    assert surf.startswith(f"{UCAR_RDA_BASE}/")
+    assert surf.endswith("ec.oper.an.sfc.128_167_2t.regn1280sc.20220511.grb")
     assert atmos_grib_url(date, "t", 6).endswith("ec.oper.an.pl.128_130_t.regn1280sc.2022051106.grb")
     assert atmos_grib_url(date, "u", 12).endswith("ec.oper.an.pl.128_131_u.regn1280uv.2022051112.grb")
 
@@ -583,7 +590,7 @@ def test_fetch_bytes_retries_without_verify_on_ucar_ssl_error(monkeypatch: pytes
     monkeypatch.setattr(requests, "get", fake_get)
     monkeypatch.setenv("FLASH_AURORA_SSL_VERIFY", "1")
 
-    with pytest.warns(UserWarning, match="UCAR RDA TLS"):
+    with pytest.warns(UserWarning, match="UCAR/GDEX TLS"):
         assert fetch_bytes(url, timeout=10, progress=False) == b"grib"
     assert calls == [True, False]
 

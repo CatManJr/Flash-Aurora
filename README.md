@@ -13,7 +13,7 @@ Companion documents:
 
 ### Extensible inference and serving: Aurora 1.5 Day-1 support
 
-New model families plug into the same Engine without rewriting the performance-critical path. In the same sense as Day-1 model support in systems such as vLLM, a modular preset / registry / adapter surface lets a new family land with shared kernels and serving, rather than a fork of the hot path. Aurora 1.5 (Microsoft Aurora release tag `v2.0.1`) is the first proof point: a side-path package beside the archived legacy family (upstream **v1.8.0**). Walkthrough: [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb).
+New model families plug into the same Engine without rewriting the performance-critical path. In the same sense as Day-1 model support in systems such as vLLM, a modular preset / registry / adapter surface lets a new family land with shared kernels and serving, rather than a fork of the hot path. Aurora 1.5 (Microsoft Aurora release tag `v2.0.1`) is the first proof point: a side-path package beside the archived legacy family (upstream **v1.8.0**). Walkthrough: [docs/example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb) · [Open in Colab](https://colab.research.google.com/github/CatManJr/Flash-Aurora/blob/main/docs/example_aurora_v1p5_colab.ipynb).
 
 The same pattern (model package, preset, adapter; reuse Engine and kernels) is how later Aurora generations or other geospatial foundation models can get Day-1 support under a compatible code adaption.
 
@@ -169,6 +169,7 @@ Note: when the configured index differs from the one recorded in `uv.lock`, `uv 
 | ------- | ----- |
 | [example_era5.ipynb](docs/example_era5.ipynb) | Baseline in-process `era5_pretrained`; populate cache and checkpoints. |
 | [example_aurora_v1p5.ipynb](docs/example_aurora_v1p5.ipynb) | Aurora 1.5: extended ERA5 IC, 6 h / hourly leads, optional ensemble. |
+| [example_aurora_v1p5_colab.ipynb](docs/example_aurora_v1p5_colab.ipynb) ([Open in Colab](https://colab.research.google.com/github/CatManJr/Flash-Aurora/blob/main/docs/example_aurora_v1p5_colab.ipynb)) | Same Aurora 1.5 walkthrough via `pip install flash-aurora` on Colab. |
 | [example_hres_t0.ipynb](docs/example_hres_t0.ipynb) | WeatherBench2 HRES T0 finetuned preset. |
 | [example_hres_0.1.ipynb](docs/example_hres_0.1.ipynb) | $0.1^{\circ}$ high-resolution Aurora (`hres_0.1`). |
 | [example_cams.ipynb](docs/example_cams.ipynb) | CAMS air-pollution preset. |
