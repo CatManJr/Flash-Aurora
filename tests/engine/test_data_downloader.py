@@ -338,6 +338,35 @@ def test_grib_ifs_backend_downloads_when_missing(tmp_path: Path) -> None:
     assert result.paths["surf_2t"].is_file()
 
 
+def test_grib_ifs_backend_survives_netcdf_layout_switch(tmp_path: Path) -> None:
+    """Real downloads materialize NetCDF and drop GRIB keys from expected_paths."""
+    config = DEFAULT_PRESETS.get("hres_0.1")
+    downloader = DataDownloader(config)
+    valid_time = datetime(2022, 5, 11, 6)
+    cache = tmp_path / "hres_0.1"
+
+    def fake_download_and_materialize(cache_dir: Path, day: str, workers: int = 1):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        for name in (
+            f"{day}-surface-level.nc",
+            f"{day}-atmospheric-00.nc",
+            f"{day}-atmospheric-06.nc",
+        ):
+            (cache_dir / name).write_bytes(b"nc")
+        return {}
+
+    with patch(
+        "flash_aurora.engine.ingress.download.backends.grib_ifs.download_ifs_analysis_day",
+        side_effect=fake_download_and_materialize,
+    ):
+        result = downloader.ensure(valid_time, cache_dir=cache)
+
+    assert result.complete
+    assert set(result.paths) == {"surface", "atmospheric_00", "atmospheric_06"}
+    assert set(result.downloaded) == {"surface", "atmospheric_00", "atmospheric_06"}
+    assert result.skipped == ()
+
+
 def test_grib_ifs_urls_match_upstream_layout() -> None:
     from flash_aurora.engine.ingress.download.grib_ifs import (
         UCAR_RDA_BASE,

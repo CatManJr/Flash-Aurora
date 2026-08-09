@@ -33,8 +33,18 @@ class DownloadBackend(Protocol):
 
 
 def _partition(keys: tuple[str, ...], before: set[str], after: dict[str, Path]) -> DownloadOutcome:
-    downloaded = tuple(key for key in keys if key not in before and after[key].is_file())
-    skipped = tuple(key for key in keys if key in before and after[key].is_file())
+    """Classify paths that appeared or were reused across an ensure() call.
+
+    Some backends change their public layout mid-flight (``grib_ifs_0.1`` starts
+    with GRIB shard keys such as ``surf_2t`` and finishes with NetCDF products
+    ``surface`` / ``atmospheric_00`` / ``atmospheric_06``). Track only keys that
+    still exist in ``after``; if none remain, fall back to the post-download layout.
+    """
+    tracked = tuple(key for key in keys if key in after)
+    if not tracked:
+        tracked = tuple(after)
+    downloaded = tuple(key for key in tracked if key not in before and after[key].is_file())
+    skipped = tuple(key for key in tracked if key in before and after[key].is_file())
     return DownloadOutcome(paths=after, downloaded=downloaded, skipped=skipped)
 
 
