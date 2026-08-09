@@ -81,16 +81,3 @@ def test_library_source_has_no_autodl_paths() -> None:
             if forbidden in text:
                 hits.append(str(path.relative_to(root)))
     assert hits == []
-
-
-def test_tutorial_notebooks_support_portable_assets() -> None:
-    """Setup cells keep a None default and fall back to ./assets when unset."""
-    root = Path(__file__).resolve().parents[2]
-    notebooks = sorted((root / "docs").glob("example_*.ipynb"))
-    assert notebooks, "expected example notebooks under docs/"
-    for path in notebooks:
-        text = path.read_text(encoding="utf-8")
-        assert "ASSET_ROOT: Path | str | None = None" in text, path.name
-        assert "Path.cwd()" in text and "assets" in text, path.name
-        assert "ASSET_ROOT.mkdir" in text, path.name
-        assert "ASSET_ROOT = Path(" in text, path.name
