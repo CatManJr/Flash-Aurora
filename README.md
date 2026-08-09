@@ -42,7 +42,7 @@ Shifted-window masks are packed once as compact `uint8` and applied inside the k
 Attention $Q$, $K$, and $V$ use layout $(B, H, N, D_h)$, where $B = B_{\mathrm{batch}} \cdot n_W$ folds batch and window index, $H$ is heads, $N$ is tokens per window, and $D_h$ is the head dimension ($D_h = 64$ here). The figure reports three ERA5 encoder shapes, $(1800, 8, 144, 64)$, $(450, 16, 144, 64)$, and $(128, 32, 144, 64)$, plus a shifted-window mask on $(1800, 8, 144, 64)$. On Blackwell (`sm_120`) unmasked speedups are about $1.07$--$1.09\times$ versus BF16 SDPA and about $1.59$--$1.60\times$ versus FP32 SDPA; the masked $(1800, 8, 144, 64)$ case reaches about $1.22\times$ (BF16) and $1.69\times$ (TF32). On RTX 4090 (`sm_89`) absolute latency is higher, with about $2.2\times$ versus FP32 SDPA (larger gaps versus default SDPA dispatch; forced memory-efficient SDPA is within a few percent of CuTe BF16). Full tables: [docs/benchmarks.md](docs/benchmarks.md#window-attention-microbenchmarks).
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/main/docs/image/window_attn_cute_vs_sdpa_blackwell.svg" alt="CuTe DSL BF16 and TF32 window attention vs PyTorch SDPA on Blackwell, unmasked and masked" width="95%"/>
+  <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/window_attn_cute_vs_sdpa_blackwell.svg" alt="CuTe DSL BF16 and TF32 window attention vs PyTorch SDPA on Blackwell, unmasked and masked" width="95%"/>
 </p>
 
 Measured on RTX PRO 6000 Blackwell (`sm_120a`). X-axis labels are $Q/K/V$ shapes $(B, H, N, D_h)$. Masked bars apply Swin shifted-window bias $-100$.
@@ -61,7 +61,7 @@ Encoder and Perceiver decoder default to `@fp32` because their errors map direct
 Precision tier details: [Precision tiers](#precision-tiers).
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/main/docs/image/e2e_latency_by_tier_all_presets.svg" alt="One-step end-to-end forward latency by precision tier with models as colors" width="95%"/>
+  <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/e2e_latency_by_tier_all_presets.svg" alt="One-step end-to-end forward latency by precision tier with models as colors" width="95%"/>
 </p>
 
 *RTX PRO 6000 Blackwell; one `model.forward` (single rollout step) per bar; each tier in a separate process (`--isolate-tiers`). Finetuned presets merge LoRA into base weights before timing (`lora_merged`). `aurora_v1p5` is within a few percent of `era5_pretrained`; see [docs/benchmarks.md](docs/benchmarks.md).*
@@ -69,7 +69,7 @@ Precision tier details: [Precision tiers](#precision-tiers).
 Precision drift stays small on the recommended tiers: every variable on every preset stays within tolerance for `bf16_mixed@fp32`, `tf32@fp32`, and `fp32@fp32`, which shows that the manually tuned mixed precision inference outperformed PyTorch both in speed and numerical stability. The stacked bars below split the mean relative error versus the FP32 reference (seed 42) by variable for those tiers.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/main/docs/image/precision_mean_rel_stacked_by_model.svg" alt="Stacked mean relative error by precision tier and preset (seed 42)" width="95%"/>
+  <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/precision_mean_rel_stacked_by_model.svg" alt="Stacked mean relative error by precision tier and preset (seed 42)" width="95%"/>
 </p>
 
 *Stacked mean relative error versus the PyTorch FP32 baseline (seed 42), one panel per preset, split by output variable. Lower bars mean closer to the FP32 reference; full tables: [docs/benchmarks.md](docs/benchmarks.md#precision-drift-seed-42-lora_merged-on-finetuned-presets).*
@@ -84,8 +84,8 @@ One long-lived ZeroMQ worker owns one GPU and one model preset. A coordinator ro
     <th width="50%" align="center">Refill while <code>hres_0.1</code> is pending</th>
   </tr>
   <tr>
-    <td width="50%" valign="top"><img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/main/docs/image/4_workers.png" width="100%"/></td>
-    <td width="50%" valign="top"><img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/main/docs/image/4_workers_refill.png" width="100%"/></td>
+    <td width="50%" valign="top"><img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/4_workers.png" width="100%"/></td>
+    <td width="50%" valign="top"><img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/4_workers_refill.png" width="100%"/></td>
   </tr>
 </table>
 
@@ -101,8 +101,8 @@ Left: one job per worker and preset. Right: faster workers take follow-up jobs w
     <th width="50%" align="center"><code>hres_0.1</code> (5090)</th>
   </tr>
   <tr>
-    <td width="50%" valign="top"><img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/main/docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu.png" width="100%"/></td>
-    <td width="50%" valign="top"><img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/main/docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu.png" width="100%"/></td>
+    <td width="50%" valign="top"><img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/distributed_rollout_utilization_5090_era5_pretrained_2gpu.png" width="100%"/></td>
+    <td width="50%" valign="top"><img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/distributed_rollout_utilization_5090_hres_0.1_2gpu.png" width="100%"/></td>
   </tr>
 </table>
 
