@@ -69,6 +69,22 @@ def test_single_device_fast_fail_on_24gib_card() -> None:
             )
 
 
+def test_single_device_hres_fits_80gib_class_card() -> None:
+    variant = DEFAULT_PRESETS.get("hres_0.1").variant
+    with patch(
+        "flash_aurora.engine.runtime.vram_preflight.cuda_memory_snapshot",
+        return_value=_snapshot(total_gib=79.3, free_gib=78.8),
+    ):
+        budget = check_single_device_vram(
+            variant,
+            preset="hres_0.1",
+            rollout_steps=1,
+            inference_precision="bf16_mixed@fp32",
+        )
+    assert budget.needed_gib == 70.0
+    assert not budget.physically_impossible
+
+
 def test_gpu_guard_fast_fail_without_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from flash_aurora.engine.runtime.gpu_guard import GpuGuardRegistry
 

@@ -73,7 +73,7 @@ def test_tf32_precision_scales_reserved_budget() -> None:
 @pytest.mark.parametrize(
     ("preset", "steps", "minimum", "maximum"),
     [
-        ("hres_0.1", 2, 82.5, 84.0),
+        ("hres_0.1", 2, 70.0, 71.0),
         ("era5_pretrained", 1, 36.0, 37.0),
         ("era5_pretrained", 2, 40.0, 41.0),
         ("small_pretrained", 1, 4.5, 5.0),
@@ -98,7 +98,7 @@ def test_hres_is_exclusive_small_is_shareable() -> None:
     hres = DEFAULT_PRESETS.get("hres_0.1").variant
     small = DEFAULT_PRESETS.get("small_pretrained").variant
     assert is_exclusive_variant(hres, rollout_steps=2)
-    assert estimate_vram_gib(hres, rollout_steps=2) >= 82.5
+    assert estimate_vram_gib(hres, rollout_steps=2) >= 70.0
     assert not is_exclusive_variant(small)
     assert estimate_vram_gib(small) < 10.0
 

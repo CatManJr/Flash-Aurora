@@ -59,14 +59,16 @@ _EXTRA_ROLLOUT_STEP_GIB_BY_CLASS: dict[str, float] = {
 # Variants above this peak reservation require exclusive GPU placement.
 _EXCLUSIVE_THRESHOLD_GIB = 28.0
 
-# Peak ``torch.cuda.max_memory_reserved`` (GiB), bf16_mixed@fp32, batch=1, one forward.
-# Measured on RTX PRO 6000; Guard budgets use *reserved* so driver-level OOM is avoided.
+# Peak VRAM budget (GiB), bf16_mixed@fp32, batch=1, one forward.
+# Prefer measured live / allocated peaks with modest headroom. An earlier
+# ``max_memory_reserved`` reading for HighRes (~82.5 GiB) over-blocked 80 GiB cards;
+# retuned to ~68 GiB observed peak + headroom so A100-80GB class GPUs can run.
 _CALIBRATED_RESERVED_1STEP_GIB: dict[str, float] = {
     "aurora-0.25-pretrained": 36.5,
     "aurora-0.25-finetuned": 36.5,
     "aurora-0.25-12h-pretrained": 36.5,
     "aurora-0.25-small-pretrained": 4.5,
-    "aurora-0.1-finetuned": 82.5,
+    "aurora-0.1-finetuned": 70.0,
     # Same backbone as 0.25° finetuned; wave surf channels add a small reserved bump.
     "aurora-0.25-wave": 38.0,
     # Lower resolution than 0.25°; conservative estimate until profiled.
