@@ -31,6 +31,16 @@ MODEL_COLORS = {
     "tc_tracking": "#5C7A86",
 }
 
+# Microsoft Aurora names from docs/models.md (not Flash-Aurora preset tokens).
+MODEL_DISPLAY = {
+    "era5_pretrained": "Aurora 0.25° Pretrained",
+    "aurora_v1p5": "Aurora 1.5",
+    "hres_t0_finetuned": "Aurora 0.25° Fine-Tuned",
+    "hres_0.1": "Aurora 0.1° Fine-Tuned",
+    "cams": "Aurora 0.4° Air Pollution",
+    "tc_tracking": "Aurora 0.25° Fine-Tuned (TC)",
+}
+
 # X-axis: five custom tiers + two PyTorch baselines.
 TIER_LABELS = [
     "bf16_mixed\n@fp32",
@@ -224,7 +234,7 @@ def plot_e2e_latency_by_tier() -> None:
             x + offset,
             vals,
             width * 0.92,
-            label=name,
+            label=MODEL_DISPLAY[name],
             color=MODEL_COLORS[name],
             edgecolor="white",
             linewidth=0.4,
@@ -268,7 +278,7 @@ def plot_e2e_latency_by_tier() -> None:
         ncol=3,
         loc="upper center",
         bbox_to_anchor=(0.5, -0.20),
-        fontsize=12,
+        fontsize=10,
     )
     fig.tight_layout()
     _save(fig, "e2e_latency_by_tier_all_presets")

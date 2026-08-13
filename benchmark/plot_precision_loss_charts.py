@@ -63,6 +63,16 @@ MODEL_COLORS = {
     "tc_tracking": C_SLATE_DARK,
 }
 
+# Microsoft Aurora names from docs/models.md (not Flash-Aurora preset tokens).
+MODEL_DISPLAY = {
+    "era5_pretrained": "Aurora 0.25° Pretrained",
+    "aurora_v1p5": "Aurora 1.5",
+    "hres_t0_finetuned": "Aurora 0.25° Fine-Tuned",
+    "hres_0.1": "Aurora 0.1° Fine-Tuned",
+    "cams": "Aurora 0.4° Air Pollution",
+    "tc_tracking": "Aurora 0.25° Fine-Tuned (TC)",
+}
+
 # High-contrast categorical colors (still in the teal / terracotta / slate family,
 # plus a few cooler/warmer accents so adjacent stack segments stay readable).
 VAR_COLORS = [
@@ -193,7 +203,7 @@ def plot_stacked_by_model() -> None:
 
         ax.set_xticks(x)
         ax.set_xticklabels(TIER_LABELS, fontsize=8)
-        ax.set_title(model, fontsize=12, pad=8, color=MODEL_COLORS[model])
+        ax.set_title(MODEL_DISPLAY[model], fontsize=11, pad=8, color=MODEL_COLORS[model])
         ax.set_ylabel("mean relative error")
         ax.ticklabel_format(axis="y", style="sci", scilimits=(-2, -2))
 
@@ -259,7 +269,7 @@ def plot_stacked_bf16_mixed() -> None:
         bottoms += heights
 
     ax.set_xticks(x)
-    ax.set_xticklabels(MODELS, rotation=15, ha="right", fontsize=10)
+    ax.set_xticklabels([MODEL_DISPLAY[m] for m in MODELS], rotation=18, ha="right", fontsize=9)
     ax.set_ylabel("Stacked mean relative error")
     ax.set_title(
         "bf16_mixed@fp32: stacked per-variable mean_rel vs FP32 baseline (seed 42)",
