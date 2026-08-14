@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flash-aurora"
-version = "0.1.3"
-description = "High-performance Aurora inference (model + engine)"
+version = "0.1.4"
+description = "Efficient inference and serving for Microsoft Aurora, an Earth system AI model."
 readme = "README.md"
 license = "MIT"
 license-files = [
