@@ -4,7 +4,7 @@
 
 Inference and serving for [Microsoft Aurora](https://github.com/microsoft/aurora) and other geospatial foundation models. A request takes an analysis cube in and writes NetCDF or GeoTIFF out. The tensors keep a lat/lon layout, so the engine uses shape-specialized kernels, named mixed precision (`bf16_mixed@fp32` by default), and a job-level GPU scheduler rather than an LLM serving loop.
 
-[Walkthrough slides](https://catmanjr.github.io/Flash-Aurora-walkthrough/) · [Tutorial](docs/tutorial.md)
+[Walkthrough slides](https://catmanjr.github.io/Flash-Aurora-walkthrough/) · [Tutorial](docs/tutorial.md) · [Benchmark tables](docs/benchmarks.md)
 
 ## Install
 
