@@ -31,7 +31,6 @@ from bench_indepth_eval import (  # noqa: E402
 
 import torch
 
-ASSET = Path("/root/autodl-tmp/aurora")
 OUT = _BENCH_DIR / "indepth_eval_fillin.json"
 
 
@@ -41,6 +40,7 @@ def compile_after_load(model) -> None:
 
 def main() -> None:
     device = torch.device("cuda")
+    asset = default_asset_root()
     payload: dict = {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "gpu": torch.cuda.get_device_name(device),
@@ -48,8 +48,8 @@ def main() -> None:
     }
 
     print("=== one-step mean relative error both ICs ===", flush=True)
-    batch, config = load_preset_batch("era5_pretrained", ASSET)
-    ckpt = checkpoint_path(config, ASSET)
+    batch, config = load_preset_batch("era5_pretrained", asset)
+    ckpt = checkpoint_path(config, asset)
     payload["one_step_2023"] = one_step_accuracy(
         config,
         ckpt,
@@ -58,7 +58,7 @@ def main() -> None:
         ["fp32", "bf16_mixed@fp32", "tf32@fp32", "pytorch_autocast"],
     )
     batch2, config2 = load_preset_batch(
-        "era5_pretrained", ASSET, valid_time=datetime(2026, 7, 1, 6)
+        "era5_pretrained", asset, valid_time=datetime(2026, 7, 1, 6)
     )
     payload["one_step_2026"] = one_step_accuracy(
         config2,

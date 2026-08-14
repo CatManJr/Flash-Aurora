@@ -2,7 +2,7 @@
 """In-depth benchmarks: std, kernel ablation, compiler/graph,
 stage split, VRAM, mean relative error, and a second ERA5 initial condition.
 
-    export AURORA_ASSET_ROOT=/root/autodl-tmp/aurora
+    export AURORA_ASSET_ROOT=/path/to/data/aurora
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_indepth_eval.py
 """
 

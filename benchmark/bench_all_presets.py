@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-preset mixed-precision latency, stage split, and VRAM (all presets except wave).
 
-    export AURORA_ASSET_ROOT=/root/autodl-tmp/aurora
+    export AURORA_ASSET_ROOT=/path/to/data/aurora
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_all_presets.py
 """
 

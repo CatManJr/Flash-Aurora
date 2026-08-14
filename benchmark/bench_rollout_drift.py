@@ -7,7 +7,7 @@ This is implementation fidelity under AR feedback, not WeatherBench skill.
 
 Example::
 
-    export AURORA_ASSET_ROOT=/root/autodl-tmp/aurora
+    export AURORA_ASSET_ROOT=/path/to/data/aurora
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_rollout_drift.py \\
         --presets era5_pretrained cams --steps 40
 """
