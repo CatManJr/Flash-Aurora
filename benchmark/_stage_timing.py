@@ -32,10 +32,22 @@ def _run_forward_stages_once(
     device: torch.device,
 ) -> tuple[StageTiming, Any]:
     """One forward with CUDA events between encoder, backbone, decoder, post."""
+    from flash_aurora.engine.core.model_protocol import model_uses_v1p5_rollout
     from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
 
     batch, transformed_batch, patch_res = model._prepare_encoder_batch(batch)
     rollout_step = batch.metadata.rollout_step
+    v1p5 = model_uses_v1p5_rollout(model)
+    lead_times = None
+    if v1p5:
+        example = next(iter(batch.surf_vars.values()))
+        lead_hours = model.timestep.total_seconds() / 3600.0
+        lead_times = torch.full(
+            (example.shape[0],),
+            lead_hours,
+            device=example.device,
+            dtype=example.dtype,
+        )
 
     e0 = torch.cuda.Event(enable_timing=True)
     e1 = torch.cuda.Event(enable_timing=True)
@@ -44,32 +56,60 @@ def _run_forward_stages_once(
     e4 = torch.cuda.Event(enable_timing=True)
 
     e0.record()
-    x = run_with_encoder_decoder_routing(
-        model.encoder,
-        transformed_batch,
-        autocast_bf16=model.autocast_encoder_decoder,
-        use_tensor_core=model.encoder_decoder_use_tensor_core,
-        lead_time=model.timestep,
-    )
+    if v1p5:
+        x = run_with_encoder_decoder_routing(
+            model.encoder,
+            transformed_batch,
+            autocast_bf16=model.autocast_encoder_decoder,
+            use_tensor_core=model.encoder_decoder_use_tensor_core,
+            lead_times=lead_times,
+        )
+    else:
+        x = run_with_encoder_decoder_routing(
+            model.encoder,
+            transformed_batch,
+            autocast_bf16=model.autocast_encoder_decoder,
+            use_tensor_core=model.encoder_decoder_use_tensor_core,
+            lead_time=model.timestep,
+        )
     e1.record()
 
-    x = model._run_backbone(
-        x,
-        lead_time=model.timestep,
-        patch_res=patch_res,
-        rollout_step=rollout_step,
-    )
+    if v1p5:
+        x = model._run_backbone(
+            x,
+            lead_times=lead_times,
+            patch_res=patch_res,
+            rollout_step=rollout_step,
+        )
+    else:
+        x = model._run_backbone(
+            x,
+            lead_time=model.timestep,
+            patch_res=patch_res,
+            rollout_step=rollout_step,
+        )
     e2.record()
 
-    pred = run_with_encoder_decoder_routing(
-        model.decoder,
-        x,
-        batch,
-        autocast_bf16=model.autocast_encoder_decoder,
-        use_tensor_core=model.encoder_decoder_use_tensor_core,
-        lead_time=model.timestep,
-        patch_res=patch_res,
-    )
+    if v1p5:
+        pred = run_with_encoder_decoder_routing(
+            model.decoder,
+            x,
+            batch,
+            autocast_bf16=model.autocast_encoder_decoder,
+            use_tensor_core=model.encoder_decoder_use_tensor_core,
+            lead_times=lead_times,
+            patch_res=patch_res,
+        )
+    else:
+        pred = run_with_encoder_decoder_routing(
+            model.decoder,
+            x,
+            batch,
+            autocast_bf16=model.autocast_encoder_decoder,
+            use_tensor_core=model.encoder_decoder_use_tensor_core,
+            lead_time=model.timestep,
+            patch_res=patch_res,
+        )
     e3.record()
 
     pred = model._finish_prediction(batch, pred)

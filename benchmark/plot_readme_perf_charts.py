@@ -29,12 +29,14 @@ MODEL_COLORS = {
     "hres_0.1": C_SDPA_FP32,
     "cams": "#78909C",
     "tc_tracking": "#5C7A86",
+    "aurora_v1p5_ensemble": "#8C4A2F",
 }
 
 # Microsoft Aurora names from docs/models.md (not Flash-Aurora preset tokens).
 MODEL_DISPLAY = {
     "era5_pretrained": "Aurora 0.25° Pretrained",
     "aurora_v1p5": "Aurora 1.5",
+    "aurora_v1p5_ensemble": "Aurora 1.5 Ensemble",
     "hres_t0_finetuned": "Aurora 0.25° Fine-Tuned",
     "hres_0.1": "Aurora 0.1° Fine-Tuned",
     "cams": "Aurora 0.4° Air Pollution",
@@ -53,11 +55,13 @@ TIER_LABELS = [
 ]
 
 # Forward latency (ms), isolate-tiers. Finetuned presets use lora_merged.
-# Order matches TIER_LABELS. Omits small_pretrained.
+# Order matches TIER_LABELS. Omits small_pretrained (scale).
 # aurora_v1p5 from benchmark/latency_aurora_v1p5_latest.md
+# aurora_v1p5_ensemble from benchmark/latency_aurora_v1p5_ensemble_latest.md
 MODEL_LATENCY_MS = {
     "era5_pretrained": [676.4, 676.8, 1077.5, 919.2, 1945.0, 1004.4, 2128.2],
     "aurora_v1p5": [700.8, 702.4, 1109.3, 946.0, 2005.6, 1034.5, 2185.8],
+    "aurora_v1p5_ensemble": [1004.9, 1006.6, 1411.9, 1248.7, 2450.8, 1137.1, 2535.1],
     "hres_t0_finetuned": [638.7, 638.4, 1006.3, 846.5, 1890.4, 967.7, 2061.9],
     "hres_0.1": [672.0, 672.4, 1019.9, 861.3, 1838.0, 986.2, 1994.6],
     "cams": [571.0, 571.9, 916.5, 718.3, 1562.3, 888.6, 1691.6],
@@ -226,7 +230,7 @@ def plot_e2e_latency_by_tier() -> None:
     width = 0.78 / n_models
     baseline_tier_index = n_tiers - 1
 
-    fig, ax = plt.subplots(figsize=(12.5, 5.6))
+    fig, ax = plt.subplots(figsize=(13.2, 5.8))
     for i, name in enumerate(models):
         offset = (i - (n_models - 1) / 2.0) * width
         vals = MODEL_LATENCY_MS[name]
@@ -275,10 +279,10 @@ def plot_e2e_latency_by_tier() -> None:
     )
     ax.legend(
         frameon=False,
-        ncol=3,
+        ncol=4,
         loc="upper center",
-        bbox_to_anchor=(0.5, -0.20),
-        fontsize=10,
+        bbox_to_anchor=(0.5, -0.22),
+        fontsize=9,
     )
     fig.tight_layout()
     _save(fig, "e2e_latency_by_tier_all_presets")

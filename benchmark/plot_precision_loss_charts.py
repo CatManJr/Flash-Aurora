@@ -21,6 +21,7 @@ WALK_DIR = Path(r"D:\Courses\capstone\Flash-Aurora-walkthrough\figures")
 
 PRECISION_SHARED = ROOT / "benchmark" / "precision_all_seed42.md"
 PRECISION_V1P5 = ROOT / "benchmark" / "precision_aurora_v1p5_latest.md"
+PRECISION_ENSEMBLE = ROOT / "benchmark" / "precision_aurora_v1p5_ensemble_latest.md"
 
 # Window-attention palette anchors
 C_TEAL = "#0D7377"
@@ -47,16 +48,20 @@ TIER_LABELS = [
 
 MODELS = [
     "era5_pretrained",
+    "small_pretrained",
     "aurora_v1p5",
+    "aurora_v1p5_ensemble",
     "hres_t0_finetuned",
+    "tc_tracking",
     "hres_0.1",
     "cams",
-    "tc_tracking",
 ]
 
 MODEL_COLORS = {
     "era5_pretrained": C_TEAL,
+    "small_pretrained": "#0F766E",
     "aurora_v1p5": C_TEAL_LIGHT,
+    "aurora_v1p5_ensemble": "#8C4A2F",
     "hres_t0_finetuned": C_TERRACOTTA,
     "hres_0.1": C_SLATE,
     "cams": "#78909C",
@@ -66,7 +71,9 @@ MODEL_COLORS = {
 # Microsoft Aurora names from docs/models.md (not Flash-Aurora preset tokens).
 MODEL_DISPLAY = {
     "era5_pretrained": "Aurora 0.25° Pretrained",
+    "small_pretrained": "Aurora 0.25° Small",
     "aurora_v1p5": "Aurora 1.5",
+    "aurora_v1p5_ensemble": "Aurora 1.5 Ensemble",
     "hres_t0_finetuned": "Aurora 0.25° Fine-Tuned",
     "hres_0.1": "Aurora 0.1° Fine-Tuned",
     "cams": "Aurora 0.4° Air Pollution",
@@ -161,9 +168,15 @@ def _parse_section(text: str, heading: str) -> tuple[list[str], dict[str, dict[s
 def load_all() -> dict[str, tuple[list[str], dict[str, dict[str, float]]]]:
     shared = PRECISION_SHARED.read_text(encoding="utf-8")
     v1 = PRECISION_V1P5.read_text(encoding="utf-8")
+    ens = PRECISION_ENSEMBLE.read_text(encoding="utf-8")
     out: dict[str, tuple[list[str], dict[str, dict[str, float]]]] = {}
     for name in MODELS:
-        src = v1 if name == "aurora_v1p5" else shared
+        if name == "aurora_v1p5":
+            src = v1
+        elif name == "aurora_v1p5_ensemble":
+            src = ens
+        else:
+            src = shared
         out[name] = _parse_section(src, name)
     return out
 
@@ -179,7 +192,7 @@ def _var_colors(n: int) -> list[str]:
 
 def plot_stacked_by_model() -> None:
     data = load_all()
-    fig, axes = plt.subplots(2, 3, figsize=(15.0, 9.4), sharey=False)
+    fig, axes = plt.subplots(2, 4, figsize=(16.4, 8.6), sharey=False)
     axes_flat = axes.ravel()
 
     for ax, model in zip(axes_flat, MODELS):
@@ -228,7 +241,7 @@ def plot_stacked_by_model() -> None:
     )
     fig.tight_layout(rect=(0, 0.02, 1, 0.96))
     # Extra vertical gap so row-1 legends do not cover row-2 titles/bars.
-    fig.subplots_adjust(hspace=0.92, wspace=0.28)
+    fig.subplots_adjust(hspace=0.98, wspace=0.32)
     _save(fig, "precision_mean_rel_stacked_by_model")
 
 
@@ -245,7 +258,7 @@ def plot_stacked_bf16_mixed() -> None:
     colors = _var_colors(len(all_vars))
     var_color = {v: colors[i] for i, v in enumerate(all_vars)}
 
-    fig, ax = plt.subplots(figsize=(12.5, 6.2))
+    fig, ax = plt.subplots(figsize=(14.0, 6.4))
     x = np.arange(len(MODELS))
     bottoms = np.zeros(len(MODELS))
 

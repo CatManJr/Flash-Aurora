@@ -135,6 +135,22 @@ Generated 2026-07-14 (`../benchmark/latency_aurora_v1p5_latest.md`); same machin
 | PyTorch FP32 ref  | 2185.8       | base                |
 
 
+##### `aurora_v1p5_ensemble` ($721 \times 1440$)
+
+Generated 2026-08-14 (`../benchmark/latency_aurora_v1p5_ensemble_latest.md`); isolate-tiers. Stochastic noise in the Ensemble checkpoint raises both mixed and FP32 latency, so the vs-FP32 ratio drops to $2.52\times$.
+
+
+| Tier              | forward (ms) | vs PyTorch FP32 ref |
+| ----------------- | ------------ | ------------------- |
+| `bf16_mixed@fp32` | 1004.9       | 2.52x               |
+| `bf16_mixed@tf32` | 1006.6       | 2.52x               |
+| `tf32@fp32`       | 1411.9       | 1.80x               |
+| `tf32@tf32`       | 1248.7       | 2.03x               |
+| `fp32@fp32`       | 2450.8       | 1.03x               |
+| PyTorch autocast  | 1137.1       | 2.23x               |
+| PyTorch FP32 ref  | 2535.1       | base                |
+
+
 ##### `small_pretrained` ($400 \times 800$)
 
 
@@ -295,6 +311,37 @@ Custom tiers run first in one cold-start and the PyTorch FP32 reference is timed
 
 Recommended production tiers are `bf16_mixed@fp32` or `bf16_mixed@tf32` for weather presets with `lora_merged`. For CAMS, use `lora_merged` with `bf16_mixed@`* for speed, or `tf32@fp32` when strict `pm10` tolerance is required.
 
+### In-depth benchmarks
+
+Isolate-tiers (warmup 2, repeat 5, one subprocess per tier) remains the headline **vs-FP32** and **vs-autocast** snapshot. A second harness, `../benchmark/bench_indepth_eval.py`, reports per-iteration CUDA-event mean$\pm$std ($n=12$), a CuTe-off row, CUDA-graph capture, encoder/backbone/decoder splits, one-forward VRAM, mean relative error on a second ERA5 initial condition (2026-07-01), and closed-loop drift via `../benchmark/bench_rollout_drift.py`.
+
+Machine-readable reports: `../benchmark/indepth_eval_latest.md`, `../benchmark/indepth_eval_latest.json`, `../benchmark/rollout_drift_latest.md`.
+
+**Do not mix harnesses.** Same-process autocast is $849.9\pm0.36$ ms versus isolate autocast $1004$ ms (cuDNN autotune leakage). Same-process unfused stage totals around $1137$ ms are likewise deflated; the isolated unfused split is encoder $90.3$ ms, backbone $1807.3$ ms ($83.5\%$), decoder $266.1$ ms. Custom-tier absolute latency is stable: `bf16_mixed@fp32` is $680.2\pm0.27$ ms (p95 $680.6$ ms) in the $n=12$ suite versus $676$ ms isolate.
+
+**`fp32@fp32` is not CuTe.** `kernel_profile_for_backbone(FP32)` selects `fast_fp32` (Triton layout and AdaLN, `use_cute_window_attn=False`). Measured `fast_fp32` $2003.5\pm6.41$ ms versus `fp32@fp32` $2010.4\pm6.28$ ms. On the production mixed path, disabling CuTe (SDPA fallback) is $809.1\pm0.37$ ms versus $680.2\pm0.27$ ms ($1.19\times$). CUDA-graph backbone capture is $680.2\pm0.29$ ms at $26.9$ GiB: no latency win, $+0.6$ GiB. `compile_backbone=True` before `load_checkpoint` remaps keys to `backbone._orig_mod.*`. Compiling **after** load: unfused FP32 $995.7\pm0.47$ ms, autocast $768.1\pm0.25$ ms (Dynamo `recompile_limit` on `shift_size`), mixed $676.4\pm0.17$ ms (no win; custom kernels graph-break). Production mixed is $1.46\times$ versus compiled FP32 and $1.13\times$ versus this autocast+compile measurement; isolate $1.49\times$ versus **eager** autocast remains the comparison to PyTorch mixed precision without compile.
+
+Mean relative error $\bar{e}_v=\mathrm{mean}(|y-\hat{y}|)/\mathrm{mean}(|\hat{y}|)$ versus the unfused FP32 twin (seed 42), not WeatherBench2:
+
+| IC | tier | 2t | 10u | 10v | msl |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 2023-01-01 | `bf16_mixed@fp32` | 3.85e-5 | 8.27e-4 | 1.01e-3 | 5.67e-6 |
+| 2023-01-01 | `tf32@fp32` | 1.02e-5 | 3.62e-4 | 4.53e-4 | 1.84e-6 |
+| 2023-01-01 | autocast | 4.36e-5 | 1.42e-3 | 1.80e-3 | 7.40e-6 |
+| 2026-07-01 | `bf16_mixed@fp32` | 3.92e-5 | 8.25e-4 | 9.63e-4 | 5.53e-6 |
+| 2026-07-01 | `tf32@fp32` | 3.05e-6 | 1.60e-4 | 2.01e-4 | 7.37e-7 |
+| 2026-07-01 | autocast | 4.40e-5 | 1.39e-3 | 1.70e-3 | 7.41e-6 |
+
+One-step weather channels pass the golden mean-rel test on both dates ($0/9$ fail). On `era5_pretrained`, `bf16_mixed@fp32` stays within those tolerances through step 12 ($72$ h) and first fails on winds at step 13. `tf32@fp32` first fails at step 17. Autocast first fails at step 8. On CAMS, `tf32@fp32` passes all 22 variables through $96$ h. Peak one-forward VRAM at `bf16_mixed@fp32` is $26.6$ GiB (`era5_pretrained`), $24.3$ (`aurora_v1p5`), $27.7$ (`hres_t0_finetuned`), $33.4$ (`hres_0.1`), $24.0$ (`cams`). A 40-step ERA5 rollout stays at $26.6$ GiB for FP32, mixed, TF32, and autocast.
+
+```bash
+export AURORA_ASSET_ROOT=/path/to/aurora
+export CUTE_DSL_ARCH=sm_120a
+uv run --python 3.12 python benchmark/bench_indepth_eval.py
+uv run --python 3.12 python benchmark/bench_rollout_drift.py \
+  --presets era5_pretrained cams --steps 40 --cams-steps 16
+```
+
 ### Official per-variable tolerances
 
 Benchmarks compare each tier to the PyTorch FP32 reference using the mean relative error
@@ -348,6 +395,21 @@ Generated 2026-07-14 (`../benchmark/precision_aurora_v1p5_latest.md`). Table sho
 
 
 Recommended tiers pass **31/31** variables. `bf16@fp32` fails `mcc`, `hcc`, `scaled_tp_1h`, `scaled_sf_1h` (excluded from latency tables). PyTorch autocast fails `hcc`, `scaled_tp_1h`, `scaled_sf_1h`.
+
+#### `aurora_v1p5_ensemble` ($721 \times 1440$, 31 vars)
+
+Generated 2026-08-14 (`../benchmark/precision_aurora_v1p5_ensemble_latest.md`). Stochastic Ensemble. Core meteorology still passes on mixed; the two scaled precipitation/snow fields do not.
+
+
+| Tier              | `2t`     | `10u`    | `10v`    | `msl`    | pass  |
+| ----------------- | -------- | -------- | -------- | -------- | ----- |
+| `bf16_mixed@fp32` | 2.89e-05 | 1.63e-03 | 2.12e-03 | 5.68e-06 | 29/31 |
+| `tf32@fp32`       | 1.15e-05 | 6.85e-04 | 9.16e-04 | 2.35e-06 | 31/31 |
+| `fp32@fp32`       | 1.12e-05 | 6.46e-04 | 8.69e-04 | 2.24e-06 | 31/31 |
+| PyTorch autocast  | 4.02e-05 | 2.68e-03 | 3.50e-03 | 9.04e-06 | 26/31 |
+
+
+`bf16_mixed@fp32` fails `scaled_tp_1h` ($7.39\times10^{-3}$) and `scaled_sf_1h` ($6.19\times10^{-3}$). Autocast additionally fails `lcc`, `mcc`, `hcc`. `tf32@fp32` is the numerically conservative path for Ensemble.
 
 #### `small_pretrained` ($400 \times 800$, 8 vars)
 
