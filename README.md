@@ -2,13 +2,14 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21860697.svg)](https://doi.org/10.5281/zenodo.21860697)
 
-Flash-Aurora is an inference and serving engine for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model, with the same stack intended to host further geospatial foundation models. It provides shape-specialized Triton and CuTe DSL kernels, named mixed-precision routing (`inference_precision`), data ingress, checkpoint loading, autoregressive rollout, NetCDF/GeoTIFF export, and a ZeroMQ scheduler to deploy asynchronized service on a GPU cluster.
+Flash-Aurora is an inference and serving engine for the [Microsoft Aurora](https://github.com/microsoft/aurora) Earth-system foundation model, with the same stack intended to host further geospatial foundation models. GFM requests move analysis cubes in and forecast fields out, and the tensors keep a fixed lat/lon layout rather than a token sequence. The engine therefore provides shape-specialized Triton and CuTe DSL kernels, named mixed-precision routing (`inference_precision`), data ingress, checkpoint loading, autoregressive rollout, NetCDF/GeoTIFF (including ROI) export, and a ZeroMQ scheduler to deploy asynchronized service on a GPU cluster.
 
 ### [A walk through slides deck](https://catmanjr.github.io/Flash-Aurora-walkthrough/)
 
 Companion documents:
 - [docs/tutorial.md](docs/tutorial.md): install steps, Engine and scheduler API examples, notebook index.
 - [docs/benchmarks.md](docs/benchmarks.md): full latency, numerical-error, window-attention, and multi-GPU rollout tables.
+- [docs/design/gfm_inference_serving.md](docs/design/gfm_inference_serving.md): GFM versus LLM paradigm (high-intensity I/O, spatially structured tensors), research questions, and comparison table.
 - [Examples](#examples): linked walkthrough notebooks for each preset, ROI export, and the ZMQ scheduler.
 
 ## Highlights
@@ -253,7 +254,7 @@ Flash-Aurora replaces PyTorch SDPA on Swin windows with CuTe DSL kernels under `
 
 ## Benchmarks (summary)
 
-End-to-end figures mean a **single** `model.forward` (one rollout step), measured on NVIDIA RTX PRO 6000 Blackwell, PyTorch $2.12.1+\mathrm{cu}130$, CUDA $13.0$, and `CUTE_DSL_ARCH=sm_120a`. Each timing run warms up twice, then averages five measured forwards. **Each precision tier runs in its own process** (`--isolate-tiers`) so cuDNN autotune from an earlier tier cannot deflate a later baseline. The `wave` preset is omitted (needs MARS). Full BF16 backbone tiers (`bf16@*`) are left out of the latency charts: they are no faster than `bf16_mixed@*` and show larger numerical drift. Multi-step rollout timings live under the distributed section of [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline). Regenerate the figures with `uv run python benchmark/plot_readme_perf_charts.py`.
+End-to-end figures mean a **single** `model.forward` (one rollout step), measured on NVIDIA RTX PRO 6000 Blackwell, PyTorch $2.12.1+\mathrm{cu}130$, CUDA $13.0$, and `CUTE_DSL_ARCH=sm_120a`. Each timing run warms up twice, then averages five measured forwards. **Each precision tier runs in its own process** (`--isolate-tiers`) so cuDNN autotune from an earlier tier cannot deflate a later baseline. The `wave` preset is omitted (needs MARS). Full BF16 backbone tiers (`bf16@*`) are left out of the latency charts: they are no faster than `bf16_mixed@*` and show larger numerical drift. Multi-step rollout timings live under the distributed section of [docs/benchmarks.md](docs/benchmarks.md#distributed-pipeline). Regenerate the figures with `uv run python benchmark/plot_latency.py`.
 
 **`aurora_v1p5` numerical check** (seed $42$, baseline `pytorch_backbone_fp32_encoder_decoder_fp32`): recommended tiers (`bf16_mixed@*`, `tf32@*`, `fp32@fp32`) pass all $31$ output variables against the published per-variable tolerances $\tau_v$; `bf16@fp32` and plain PyTorch autocast fail on some extended surface fields.
 

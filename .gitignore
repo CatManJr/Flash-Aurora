@@ -38,6 +38,9 @@ output/
 *.qdstrm
 *.qdrep
 
+# drafts
+docs/design
+
 # benchmark/profiling run artifacts
 benchmark/results/
 profiling/graphs/
@@ -47,4 +50,6 @@ profiling/*.png
 profiling/*.md
 */*.log
 
+# IDEs
 .vscode/settings.json
+.cursor
