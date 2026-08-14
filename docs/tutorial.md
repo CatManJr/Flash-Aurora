@@ -1,6 +1,6 @@
 # Flash-Aurora tutorials and API sketches
 
-This page collects CLI and Python API sketches for running Flash-Aurora in process and via the ZeroMQ forecast scheduler. Interactive walkthroughs live in the notebooks under this directory (see [Tutorial notebooks](#tutorial-notebooks)). Conceptual architecture, presets, and precision-tier design remain in the [project README](../README.md). Full latency and drift tables are in [benchmarks.md](benchmarks.md).
+This page collects CLI and Python API sketches for running Flash-Aurora in process and via the ZeroMQ forecast scheduler. Interactive walkthroughs live in the notebooks under this directory (see [Tutorial notebooks](#tutorial-notebooks)). The [project README](../README.md) is the short product overview.
 
 ## Quick start
 
@@ -45,9 +45,6 @@ engine.close()
 For a fuller argument reference, see [Core API](#core-api) below. For Aurora 1.5, open [`example_aurora_v1p5.ipynb`](example_aurora_v1p5.ipynb) or the [Colab notebook](https://colab.research.google.com/github/CatManJr/Flash-Aurora/blob/main/docs/example_aurora_v1p5_colab.ipynb).
 
 ## Forecast scheduler deployment
-
-For how this ZMQ layout compares to vLLM's frontend ↔ EngineCore path, see
-[design/vllm_zmq_communication.md](design/vllm_zmq_communication.md).
 
 ### Localhost loopback (ready + optional preload)
 
