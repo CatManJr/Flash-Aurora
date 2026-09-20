@@ -3,14 +3,17 @@
 This file includes modifications and original contributions by Catman Jr.;
 those portions are licensed under the MIT License (see LICENSE).
 
-FP32-I/O window attention with TF32 QK and BF16 PV (CuTeDSL, SM80+).
+FP32-I/O window attention with 1xTF32 QK and PV (CuTeDSL, SM80+).
 
-Inputs, accumulators and outputs are FP32, but the matmuls are approximate: QK
-runs a single TF32 MMA (10-bit mantissa) and the whole PV stage runs in BF16
-(8-bit mantissa) because ``ldmatrix.trans`` is 16-bit only, so both P and V are
-downcast.  The softmax also uses fast ``exp2``/``log2`` on the single-KV-tile
-path.  BF16 PV, not TF32 QK, is the accuracy floor of this kernel.  Direct O
-epilogue to gmem; uint8 Swin mask read directly from gmem (L2-resident).
+Inputs, accumulators and outputs are FP32; both matmuls run a single TF32 MMA
+(``mma.sync.m16n8k8.tf32.tf32.f32``, 11-bit significand), mirroring how
+:mod:`._kernel_bf16` keeps QK and PV at one precision.  V stays FP32 in smem
+(same layout as :mod:`._kernel_tf32x3`'s) since there is no BF16 downcast to
+exploit; the PV MMA's ``m16n8k8`` A-layout does not coincide with ``m16n8``'s
+C-layout, so P goes through the same cross-lane relayout as the 3xTF32 kernel
+(see :func:`~._cute_local.relayout_acc_to_frgA_tf32`), just without the hi/lo
+split.  Direct O epilogue to gmem; uint8 Swin mask read directly from gmem
+(L2-resident).
 
 References:
 - flash-attn ``flash_attn/cute/flash_fwd.py`` (Tri Dao) - FMHA mainloop / masking layout.
@@ -31,14 +34,14 @@ try:
 
     import cutlass
     import cutlass.cute as cute
-    from cutlass import BFloat16, Constexpr, Float32, TFloat32, Int32
+    from cutlass import Constexpr, Float32, TFloat32, Int32
     from cutlass.cute.nvgpu import cpasync, warp
     from cutlass.cutlass_dsl import BaseDSL
 
     import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
     from cutlass.cute.atom import make_atom
     from cutlass.cute.core import _pack_shape
-    from cutlass.cute.nvgpu.warp.mma import MmaF16BF16Op, MmaF16BF16Trait
+    from cutlass.cute.nvgpu.warp.mma import MmaF16BF16Trait
 
     from quack import layout_utils
 
@@ -51,6 +54,7 @@ try:
         make_tiled_copy_A,
         make_tiled_copy_B,
         predicate_k,
+        relayout_acc_to_frgA_tf32,
         to_cute_tensor,
     )
     from ._window_softmax import (
@@ -59,7 +63,7 @@ try:
         apply_partial_kv_mask,
         apply_swin_mask_u8_gmem,
     )
-    from ._smem_utils import _choose_tile_n_tf32_bf16pv
+    from ._smem_utils import _choose_tile_n_fp32qkv
 
     @_dataclass(frozen=True)
     class MmaTF32Op(warp.WarpMmaOp):
@@ -84,17 +88,17 @@ try:
             pass
 
     _CUTE_AVAILABLE = True
-    _tf32_bf16pv_compile_cache: dict = {}
-    _tf32_bf16pv_qkvpacked_compile_cache: dict = {}
+    _tf32_compile_cache: dict = {}
+    _tf32_qkvpacked_compile_cache: dict = {}
 
 except ImportError:
     _CUTE_AVAILABLE = False
-    _tf32_bf16pv_compile_cache = {}
-    _tf32_bf16pv_qkvpacked_compile_cache = {}
+    _tf32_compile_cache = {}
+    _tf32_qkvpacked_compile_cache = {}
 
 
-class WindowAttnFwdTF32BF16PV:
-    """Forward-only FP32-I/O window attention, TF32 QK + BF16 PV, for SM80+."""
+class WindowAttnFwdTF32:
+    """Forward-only FP32 window attention with 1xTF32 QK and PV, for SM80+."""
 
     _NUM_THREADS: int = 128
 
@@ -110,7 +114,7 @@ class WindowAttnFwdTF32BF16PV:
         assert _CUTE_AVAILABLE, "CuTeDSL / cutlass / quack not found"
 
         if tile_n is None:
-            tile_n = _choose_tile_n_tf32_bf16pv(seq_len, head_dim=head_dim, tile_m=tile_m)
+            tile_n = _choose_tile_n_fp32qkv(seq_len, head_dim=head_dim, tile_m=tile_m)
 
         self.head_dim = head_dim
         self.seq_len = seq_len
@@ -143,7 +147,7 @@ class WindowAttnFwdTF32BF16PV:
         mQ_t, mK_t, mO_t = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=_tr)) for t in (mQ, mK, mO)
         ]
-        # V in gmem is BF16 (host cast); PV MMA uses m16n8k16 on swizzled smem like BF16 FA.
+        # V stays FP32 end to end: the PV MMA is TF32, so there is no downcast to fuse.
         mV_t = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=_tr))
 
         N = mQ.shape[2]
@@ -153,7 +157,7 @@ class WindowAttnFwdTF32BF16PV:
 
         num_stages = self.num_stages
         sQK_atom = get_smem_layout_atom(Float32, self.tile_hdim)
-        sV_atom = get_smem_layout_atom(BFloat16, self.tile_hdim)
+        sV_atom = sQK_atom
 
         sQ_layout = cute.tile_to_shape(sQK_atom, (self.tile_m, self.tile_hdim), (0, 1))
         sK_layout = cute.tile_to_shape(
@@ -164,64 +168,42 @@ class WindowAttnFwdTF32BF16PV:
         )
         sO_layout = cute.tile_to_shape(sQK_atom, (self.tile_m, self.tile_hdim), (0, 1))
 
-        _mma_op_qk = MmaTF32Op()
-        _mma_op_pv = warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))
+        # QK and PV share one MMA op, mirroring the BF16 kernel.  The K permutation
+        # must stay at 8 because TF32 has no k16 shape.
+        _mma_op = MmaTF32Op()
         num_warps = self.num_threads // 32
         tiled_mma_qk = cute.make_tiled_mma(
-            _mma_op_qk, (num_warps, 1, 1), permutation_mnk=(num_warps * 16, 16, 8)
+            _mma_op, (num_warps, 1, 1), permutation_mnk=(num_warps * 16, 16, 8)
         )
         tiled_mma_pv = cute.make_tiled_mma(
-            _mma_op_pv, (num_warps, 1, 1), permutation_mnk=(num_warps * 16, 16, 16)
+            _mma_op, (num_warps, 1, 1), permutation_mnk=(num_warps * 16, 16, 8)
         )
 
         _bits_f32 = 128
         _elems_f32 = _bits_f32 // Float32.width
-        _bits_bf16 = 128
-        _elems_bf16 = _bits_bf16 // BFloat16.width
         atom_async_f32 = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             Float32,
             num_bits_per_copy=_bits_f32,
-        )
-        atom_async_bf16 = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            BFloat16,
-            num_bits_per_copy=_bits_bf16,
         )
         atom_store = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=_bits_f32
         )
 
         _sQK_dim1 = sQK_atom.outer.shape[1] // _elems_f32
-        _sV_dim1 = sV_atom.outer.shape[1] // _elems_bf16
         vQK = cute.make_layout((1, _elems_f32))
-        vV = cute.make_layout((1, _elems_bf16))
 
         def _tv(dim1):
             return cute.make_ordered_layout((self.num_threads // dim1, dim1), order=(1, 0))
 
         gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_async_f32, _tv(_sQK_dim1), vQK)
         gmem_tiled_copy_K = cute.make_tiled_copy_tv(atom_async_f32, _tv(_sQK_dim1), vQK)
-        gmem_tiled_copy_V = cute.make_tiled_copy_tv(atom_async_bf16, _tv(_sV_dim1), vV)
+        gmem_tiled_copy_V = cute.make_tiled_copy_tv(atom_async_f32, _tv(_sQK_dim1), vQK)
         gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_store, _tv(_sQK_dim1), vQK)
-
-        # Single-pass: V enters the kernel as FP32 and is converted to BF16 during the
-        # gmem->smem load (fuses away the host-side v.to(bfloat16) cast - ~27% of the
-        # TF32 path for large Bwin).  Uses the SAME TV as the BF16 smem store copy so
-        # the per-thread element mapping matches; the load is a plain (non-async) LDG
-        # since cp.async cannot convert dtypes.  Multi-pass keeps the host cast +
-        # cp.async prefetch path (gmem_tiled_copy_V_in is unused there).
-        if cutlass.const_expr(self.single_kv_tile):
-            atom_v_in_f32 = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=_bits_bf16 * 2
-            )
-            gmem_tiled_copy_V_in = cute.make_tiled_copy_tv(atom_v_in_f32, _tv(_sV_dim1), vV)
-        else:
-            gmem_tiled_copy_V_in = gmem_tiled_copy_V
 
         sQ_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(sQ_layout)], 1024]
         sK_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(sK_layout)], 1024]
-        sV_struct = cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(sV_layout)], 1024]
+        sV_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(sV_layout)], 1024]
 
         @cute.struct
         class SharedStorage:
@@ -245,7 +227,6 @@ class WindowAttnFwdTF32BF16PV:
             gmem_tiled_copy_Q,
             gmem_tiled_copy_K,
             gmem_tiled_copy_V,
-            gmem_tiled_copy_V_in,
             gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
@@ -275,7 +256,6 @@ class WindowAttnFwdTF32BF16PV:
         gmem_tiled_copy_Q: cute.TiledCopy,
         gmem_tiled_copy_K: cute.TiledCopy,
         gmem_tiled_copy_V: cute.TiledCopy,
-        gmem_tiled_copy_V_in: cute.TiledCopy,
         gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
@@ -314,12 +294,7 @@ class WindowAttnFwdTF32BF16PV:
         tKsK = gmem_thr_copy_K.partition_D(sK)
         tKgK = gmem_thr_copy_K.partition_S(gK)
         tVsV = gmem_thr_copy_V.partition_D(sV)
-        # Single-pass: gV is FP32, partitioned with the matching FP32 input copy so
-        # tVgV (fp32 gmem) and tVsV (bf16 smem) share the same per-thread element map.
-        if cutlass.const_expr(self.single_kv_tile):
-            tVgV = gmem_tiled_copy_V_in.get_slice(tidx).partition_S(gV)
-        else:
-            tVgV = gmem_thr_copy_V.partition_S(gV)
+        tVgV = gmem_thr_copy_V.partition_S(gV)
 
         thr_mma_qk = tiled_mma_qk.get_slice(tidx)
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
@@ -336,8 +311,13 @@ class WindowAttnFwdTF32BF16PV:
         smem_cp_QK = cute.make_copy_atom(
             warp.LdMatrix8x16x8bOp(transpose=False, num_matrices=4), TFloat32
         )
+        # ``ldmatrix.trans`` only transposes 16-bit elements, so an FP32 V cannot use
+        # it: the two halves of a float would land in different rows.  Reading the
+        # transposed view element-wise is correct for any element width; see
+        # ``_kernel_tf32x3.py`` for the ablation showing this stage costs ~1% of
+        # runtime, so a wider copy would not be worth the extra smem redesign.
         smem_cp_V = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), BFloat16
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=Float32.width
         )
         smem_thr_cp_Q = make_tiled_copy_A(smem_cp_QK, tiled_mma_qk).get_slice(tidx)
         smem_thr_cp_K = make_tiled_copy_B(smem_cp_QK, tiled_mma_qk).get_slice(tidx)
@@ -389,18 +369,17 @@ class WindowAttnFwdTF32BF16PV:
             seqlen=seqlen,
             need_predicates=True,
         )
-        if cutlass.const_expr(not self.single_kv_tile):
-            self._load_V(
-                gmem_tiled_copy_V,
-                tVgV,
-                tVsV,
-                tVcV,
-                t0VcV,
-                tVpV,
-                n_block=0,
-                seqlen=seqlen,
-                smem_stage=0,
-            )
+        self._load_V(
+            gmem_tiled_copy_V,
+            tVgV,
+            tVsV,
+            tVcV,
+            t0VcV,
+            tVpV,
+            n_block=0,
+            seqlen=seqlen,
+            smem_stage=0,
+        )
         cute.arch.cp_async_commit_group()
 
         cute.arch.cp_async_wait_group(1)
@@ -475,26 +454,17 @@ class WindowAttnFwdTF32BF16PV:
                 )
 
         row_scale = softmax.online_softmax(
-            acc_S, is_first=True, use_fastmath=self.single_kv_tile
+            acc_S, is_first=True, use_fastmath=True
         )
 
-        if cutlass.const_expr(self.single_kv_tile):
-            # Convert-on-load: FP32 V (gmem) -> registers -> BF16 -> BF16 smem.  This
-            # fuses the host-side v.to(bfloat16) cast into the kernel.  No cp.async
-            # (it cannot convert dtypes); Q/K cp.async groups are already drained, so
-            # a single sync_threads makes the BF16 V visible before the PV LdMatrix.
-            # Single-pass => tile_n == seqlen (no partial-n tile); requires aligned
-            # head_dim (not check_hdim_oob), which the dispatch guarantees.
-            tVrV_f32 = cute.make_rmem_tensor_like(tVgV[None, None, None, 0], Float32)
-            cute.autovec_copy(tVgV[None, None, None, 0], tVrV_f32)
-            tVrV_bf16 = cute.make_rmem_tensor_like(tVrV_f32, BFloat16)
-            tVrV_bf16.store(tVrV_f32.load().to(BFloat16))
-            cute.autovec_copy(tVrV_bf16, tVsV[None, None, None, 0])
-            cute.arch.sync_threads()
-
-        acc_S_bf16 = cute.make_rmem_tensor_like(acc_S, BFloat16)
-        acc_S_bf16.store(acc_S.load().to(BFloat16))
-        tOrP = layout_utils.reshape_acc_to_frgA(acc_S_bf16)
+        # ``m16n8k16``'s A layout coincides with ``m16n8``'s C layout, which is why
+        # the BF16 kernel can hand its accumulator straight to the PV MMA.  TF32 has
+        # no k16 shape; under ``m16n8k8`` the layouts diverge across lanes, so P goes
+        # through the same cross-lane relayout the 3xTF32 kernel uses.  The recast is
+        # a bit reinterpretation, not a conversion: ``cute.gemm`` takes TF32 operands
+        # as ``i32`` or ``tf32`` but demands A and B agree, and V's fragment comes out
+        # of ``make_fragment_B`` as ``i32``, the same as the QK pair.
+        tOrP = cute.recast_tensor(relayout_acc_to_frgA_tf32(acc_S, tidx), dtype=Int32)
 
         gemm_rs(
             tiled_mma_pv,
@@ -504,8 +474,6 @@ class WindowAttnFwdTF32BF16PV:
             tOsVt[None, None, None, 0],
             smem_thr_cp_V,
         )
-        if cutlass.const_expr(self.single_kv_tile):
-            cute.arch.sync_threads()
 
         if cutlass.const_expr(not self.single_kv_tile):
             for n_tile in cutlass.range(n_block_max - 1, unroll=1):
@@ -570,13 +538,13 @@ class WindowAttnFwdTF32BF16PV:
                         )
 
                 row_scale = softmax.online_softmax(
-                    acc_S, is_first=False, use_fastmath=self.single_kv_tile
+                    acc_S, is_first=False, use_fastmath=True
                 )
                 softmax.rescale_O(acc_O, row_scale)
 
-                acc_S_bf16 = cute.make_rmem_tensor_like(acc_S, BFloat16)
-                acc_S_bf16.store(acc_S.load().to(BFloat16))
-                tOrP = layout_utils.reshape_acc_to_frgA(acc_S_bf16)
+                tOrP = cute.recast_tensor(
+                    relayout_acc_to_frgA_tf32(acc_S, tidx), dtype=Int32
+                )
 
                 gemm_rs(
                     tiled_mma_pv,
@@ -587,7 +555,11 @@ class WindowAttnFwdTF32BF16PV:
                     smem_thr_cp_V,
                 )
 
-        final_row_scale = softmax.finalize(use_fastmath=self.single_kv_tile)
+        # ``ex2.approx`` and ``rcp.approx`` are both accurate to ~2^-22, well below
+        # this kernel's ~2^-11 TF32 floor, so fastmath costs no measurable accuracy
+        # here; kept off for the reciprocal anyway since it is one op per row and
+        # the exact form was measured (in the 3xTF32 kernel) at ~1% cost.
+        final_row_scale = softmax.finalize(use_fastmath=True, use_fast_rcp=False)
         softmax.rescale_O(acc_O, final_row_scale)
 
         rO = cute.make_rmem_tensor_like(acc_O, Float32)
@@ -689,7 +661,7 @@ class WindowAttnFwdTF32BF16PV:
                     )
 
 
-def _get_or_compile_tf32_bf16pv(
+def _get_or_compile_tf32(
     head_dim: int,
     seq_len: int,
     has_bias: bool,
@@ -702,11 +674,11 @@ def _get_or_compile_tf32_bf16pv(
     bias_or_none: Optional[torch.Tensor],
 ):
     single_kv = tile_n >= seq_len
-    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "tf32_bf16pv")
-    if compile_key in _tf32_bf16pv_compile_cache:
-        return _tf32_bf16pv_compile_cache[compile_key]
+    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "tf32")
+    if compile_key in _tf32_compile_cache:
+        return _tf32_compile_cache[compile_key]
 
-    kernel_obj = WindowAttnFwdTF32BF16PV(
+    kernel_obj = WindowAttnFwdTF32(
         head_dim=head_dim,
         seq_len=seq_len,
         has_bias=has_bias,
@@ -732,11 +704,11 @@ def _get_or_compile_tf32_bf16pv(
         stream,
         options="--enable-tvm-ffi",
     )
-    _tf32_bf16pv_compile_cache[compile_key] = compiled
+    _tf32_compile_cache[compile_key] = compiled
     return compiled
 
 
-def _get_or_compile_tf32_bf16pv_qkvpacked(
+def _get_or_compile_tf32_qkvpacked(
     head_dim: int,
     seq_len: int,
     has_bias: bool,
@@ -749,16 +721,16 @@ def _get_or_compile_tf32_bf16pv_qkvpacked(
     bias_or_none: Optional[torch.Tensor],
     output_layout: str = "bhnd",
 ):
-    """Compile TF32 kernel for non-contiguous Q/K/V views derived from packed qkv."""
+    """Compile 1xTF32 kernel for non-contiguous Q/K/V views derived from packed qkv."""
     single_kv = tile_n >= seq_len
     compile_key = (
         head_dim, seq_len, has_bias, tile_m, tile_n, single_kv,
-        output_layout, "tf32_bf16pv_qkvpacked",
+        output_layout, "tf32_qkvpacked",
     )
-    if compile_key in _tf32_bf16pv_qkvpacked_compile_cache:
-        return _tf32_bf16pv_qkvpacked_compile_cache[compile_key]
+    if compile_key in _tf32_qkvpacked_compile_cache:
+        return _tf32_qkvpacked_compile_cache[compile_key]
 
-    kernel_obj = WindowAttnFwdTF32BF16PV(
+    kernel_obj = WindowAttnFwdTF32(
         head_dim=head_dim,
         seq_len=seq_len,
         has_bias=has_bias,
@@ -784,5 +756,5 @@ def _get_or_compile_tf32_bf16pv_qkvpacked(
         stream,
         options="--enable-tvm-ffi",
     )
-    _tf32_bf16pv_qkvpacked_compile_cache[compile_key] = compiled
+    _tf32_qkvpacked_compile_cache[compile_key] = compiled
     return compiled

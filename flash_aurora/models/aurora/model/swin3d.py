@@ -133,7 +133,7 @@ class WindowAttention(nn.Module):
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
         cute_window_attn_dtype: torch.dtype = torch.float32,
-        cute_window_attn_tf32_mode: str = "bf16pv",
+        cute_window_attn_tf32_mode: str = "tf32",
     ) -> None:
         """Initialise.
 
@@ -198,13 +198,12 @@ class WindowAttention(nn.Module):
         """Which CuTe kernel serves FP32 window attention.
 
         Both kernels take FP32 tensors, so ``cute_window_attn_dtype`` cannot tell
-        them apart and the choice rides on its own axis.
+        them apart and the choice rides on its own axis: ``cute_window_attn_tf32_mode``
+        holds the exact ``WinAttnPrecision`` value ("tf32" or "tf32x3").
         """
         from flash_aurora.models.ops.cute import WinAttnPrecision
 
-        if self.cute_window_attn_tf32_mode == "x3":
-            return WinAttnPrecision.TF32X3
-        return WinAttnPrecision.TF32_BF16PV
+        return WinAttnPrecision(self.cute_window_attn_tf32_mode)
 
     def _state_token(self, linear: nn.Linear, lora: LoRARollout, step: int) -> tuple[int, int, int, int, int]:
         layer = lora.layer_for_step(step)
@@ -640,7 +639,7 @@ class Swin3DTransformerBlock(nn.Module):
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
         cute_window_attn_dtype: torch.dtype = torch.float32,
-        cute_window_attn_tf32_mode: str = "bf16pv",
+        cute_window_attn_tf32_mode: str = "tf32",
     ) -> None:
         """Initialise.
 
@@ -963,7 +962,7 @@ class BasicLayer3D(nn.Module):
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
         cute_window_attn_dtype: torch.dtype = torch.float32,
-        cute_window_attn_tf32_mode: str = "bf16pv",
+        cute_window_attn_tf32_mode: str = "tf32",
     ) -> None:
         """Initialise.
 
@@ -1120,7 +1119,7 @@ class Swin3DTransformerBackbone(nn.Module):
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
         cute_window_attn_dtype: torch.dtype = torch.float32,
-        cute_window_attn_tf32_mode: str = "bf16pv",
+        cute_window_attn_tf32_mode: str = "tf32",
         workspace_pool: Optional[InferenceWorkspacePool] = None,
     ) -> None:
         """Initialise.

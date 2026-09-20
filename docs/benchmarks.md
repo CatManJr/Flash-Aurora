@@ -8,7 +8,7 @@ This page collects the full latency, precision-drift, and window-attention micro
 
 ## Window attention microbenchmarks
 
-Measured with `../benchmark/bench_window_attn.py` (trimmed mean of 200 runs per shape). Kernel tensors use layout $(B, H, N, D_h)$: $B$ is the folded window batch ($B = B_{\mathrm{batch}} \cdot n_W$), $H$ is the head count, and $N$ is tokens per window ($N=144$ for window size $(2,6,12)$ on the default $0.25^{\circ}$ encoder). Tables below write $B$ as $B_{\mathrm{win}}$. SDPA baselines use PyTorch `scaled_dot_product_attention` with the same dtype as the CuTe path (BF16 for `BF16_MIXED`, FP32 for `TF32_BF16PV`).
+Measured with `../benchmark/bench_window_attn.py` (trimmed mean of 200 runs per shape). Kernel tensors use layout $(B, H, N, D_h)$: $B$ is the folded window batch ($B = B_{\mathrm{batch}} \cdot n_W$), $H$ is the head count, and $N$ is tokens per window ($N=144$ for window size $(2,6,12)$ on the default $0.25^{\circ}$ encoder). Tables below write $B$ as $B_{\mathrm{win}}$. SDPA baselines use PyTorch `scaled_dot_product_attention` with the same dtype as the CuTe path (BF16 for `BF16_MIXED`, FP32 for `TF32`).
 
 ### NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120a)
 

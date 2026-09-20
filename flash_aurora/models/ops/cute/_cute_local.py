@@ -263,6 +263,14 @@ def relayout_acc_to_frgA_tf32(acc: cute.Tensor, tidx: Int32) -> cute.Tensor:
 
     Both shuffles run in uniform control flow because the source lane and the
     destination lane can have different parities, so a full warp mask is required.
+
+    The result carries ``acc``'s own dtype (FP32).  ``cute.gemm`` accepts TF32
+    operands as either ``tf32`` or ``i32`` but requires A and B to agree, and
+    ``make_fragment_A``/``make_fragment_B`` both hand back ``i32`` - the raw
+    32-bit register view.  A caller feeding this straight into a single MMA
+    therefore has to ``cute.recast_tensor(..., Int32)`` first; the 3xTF32 caller
+    does not, because :func:`split_tf32_hi_lo` rebuilds both operands as
+    ``TFloat32`` anyway.
     """
     lane = tidx % 32
     src_lo = (lane & ~Int32(3)) | ((lane & Int32(3)) >> 1)

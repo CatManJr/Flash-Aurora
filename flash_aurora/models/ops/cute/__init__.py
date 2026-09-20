@@ -5,8 +5,9 @@ those portions are licensed under the MIT License (see LICENSE).
 
 CuTe DSL-based ops for Aurora window attention.
 
-Both precision modes are served by CuTeDSL kernels in this package: BF16 mixed by
-``_kernel_bf16.py`` and FP32-I/O (TF32 QK, BF16 PV) by ``_kernel_tf32_bf16pv.py``.
+All three precision modes are served by CuTeDSL kernels in this package: BF16
+mixed by ``_kernel_bf16.py``, 1xTF32 by ``_kernel_tf32.py``, and 3xTF32 by
+``_kernel_tf32x3.py``.  Each keeps QK and PV at the same precision.
 See submodules for flash-attn / CUTLASS reference notes.
 """
 

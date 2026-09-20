@@ -98,36 +98,19 @@ def _choose_tile_n(
     return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
 
 
-def _tf32_bf16pv_smem_bytes(
-    tile_n: int,
-    head_dim: int,
-    tile_m: int = 64,
-    num_stages: int = 1,
-    *,
-    include_mask_tile: bool = True,
-) -> int:
-    """Bytes for the TF32-QK / BF16-PV kernel SMEM: FP32 ``sQ``/``sK``, BF16 ``sV``.
-
-    ``include_mask_tile`` is ignored (uint8 Swin mask is read from gmem).
-    """
-    del include_mask_tile
-    return (
-        tile_m * head_dim * 4
-        + tile_n * head_dim * 4 * num_stages
-        + tile_n * head_dim * 2 * num_stages
-    )
-
-
-def _tf32x3_smem_bytes(
+def _fp32qkv_smem_bytes(
     tile_n: int,
     head_dim: int,
     tile_m: int = 64,
     num_stages: int = 1,
 ) -> int:
-    """Bytes for the 3xTF32 kernel SMEM: FP32 ``sQ``, ``sK`` and ``sV``.
+    """Bytes for SMEM shared by the 1xTF32 and 3xTF32 kernels: FP32 ``sQ``, ``sK``, ``sV``.
 
-    V is FP32 here rather than BF16, since the PV MMA is TF32 and there is no
-    downcast to exploit.
+    Both kernels keep Q, K and V as FP32 in smem - the PV MMA is TF32 either way,
+    so there is no BF16 downcast to exploit for V - and issuing one MMA per k-step
+    versus three does not change the memory layout.  One formula, one tile chooser,
+    shared by :class:`~._kernel_tf32.WindowAttnFwdTF32` and
+    :class:`~._kernel_tf32x3.WindowAttnFwdTF32x3`.
     """
     return (
         tile_m * head_dim * 4
@@ -136,23 +119,23 @@ def _tf32x3_smem_bytes(
     )
 
 
-def _choose_tile_n_tf32x3(
+def _choose_tile_n_fp32qkv(
     seq_len: int,
     head_dim: int = 64,
     tile_m: int = 64,
     smem_budget_bytes: Optional[int] = None,
 ) -> int:
-    """Choose tile_n for the 3xTF32 kernel (FP32 Q/K/V).
+    """Choose tile_n for the 1xTF32 and 3xTF32 kernels (FP32 Q/K/V).
 
-    SMEM layout (matches ``WindowAttnFwdTF32x3``)::
+    SMEM layout::
 
         sQ : tile_m  x head_dim x 4B
         sK : tile_n  x head_dim x 4B x num_stages
         sV : tile_n  x head_dim x 4B x num_stages
 
-    The FP32 V costs twice what the BF16-PV kernel's V does, so a given budget
-    admits a smaller tile_n; at ``head_dim=64`` this is why ``tile_m=128`` no
-    longer keeps ``seq_len=144`` in a single pass.
+    FP32 V costs twice what a BF16 V would, so a given budget admits a smaller
+    tile_n; at ``head_dim=64`` this is why ``tile_m=128`` does not keep
+    ``seq_len=144`` in a single pass for either kernel.
     """
     if smem_budget_bytes is None:
         smem_budget_bytes = _get_smem_budget_bytes()
@@ -160,44 +143,6 @@ def _choose_tile_n_tf32x3(
     sQ_bytes = tile_m * head_dim * 4
     kv_single = head_dim * 8
     kv_stream = head_dim * 16
-
-    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // kv_single
-    max_tile_n_full = max((max_tile_n_full // 16) * 16, 16)
-
-    if seq_len <= max_tile_n_full:
-        capped = min(seq_len, max_tile_n_full)
-        return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
-
-    half_budget = smem_budget_bytes // 2
-    max_tile_n_half = max((half_budget - sQ_bytes) // kv_stream, 0)
-    max_tile_n_half = max((max_tile_n_half // 16) * 16, 16)
-    capped = min(seq_len, max_tile_n_half)
-    return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
-
-
-def _choose_tile_n_tf32_bf16pv(
-    seq_len: int,
-    head_dim: int = 64,
-    tile_m: int = 64,
-    smem_budget_bytes: Optional[int] = None,
-) -> int:
-    """Choose tile_n for TF32_BF16PV (FP32 Q/K + BF16 V).
-
-    SMEM layout (matches ``WindowAttnFwdTF32BF16PV``)::
-
-        sQ : tile_m  x head_dim x 4B
-        sK : tile_n  x head_dim x 4B x num_stages
-        sV : tile_n  x head_dim x 2B x num_stages
-
-    Single-pass uses ``num_stages=1``; streaming uses ``num_stages=2`` (K/V
-    double-buffer) with half the SMEM budget for occupancy, same as BF16.
-    """
-    if smem_budget_bytes is None:
-        smem_budget_bytes = _get_smem_budget_bytes()
-
-    sQ_bytes = tile_m * head_dim * 4
-    kv_single = head_dim * 6
-    kv_stream = head_dim * 12
 
     max_tile_n_full = (smem_budget_bytes - sQ_bytes) // kv_single
     max_tile_n_full = max((max_tile_n_full // 16) * 16, 16)

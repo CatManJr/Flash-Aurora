@@ -5,7 +5,7 @@ those portions are licensed under the MIT License (see LICENSE).
 
 Window attention forward via CuTeDSL kernels (SM80+ MMA; SM120 TMA stream when available).
 
-Kernels: ``_kernel_bf16.py`` / ``_kernel_tf32_bf16pv.py``. Tile sizes: ``_smem_utils.py``.
+Kernels: ``_kernel_bf16.py`` / ``_kernel_tf32.py`` / ``_kernel_tf32x3.py``. Tile sizes: ``_smem_utils.py``.
 
 References:
 - flash-attn ``flash_attn/cute/interface.py`` - dispatch / compile-cache patterns (Tri Dao).
@@ -20,10 +20,8 @@ import torch
 from ._smem_utils import (  # noqa: F401
     _get_smem_budget_bytes,
     _choose_tile_n,
-    _choose_tile_n_tf32_bf16pv,
-    _choose_tile_n_tf32x3,
-    _tf32_bf16pv_smem_bytes,
-    _tf32x3_smem_bytes,
+    _choose_tile_n_fp32qkv,
+    _fp32qkv_smem_bytes,
 )
 from ._window_softmax import swin_attn_mask_u8
 
@@ -34,9 +32,9 @@ try:
         _get_or_compile_bf16_stream,
         _get_or_compile_bf16_qkvpacked,
     )
-    from ._kernel_tf32_bf16pv import (
-        _get_or_compile_tf32_bf16pv,
-        _get_or_compile_tf32_bf16pv_qkvpacked,
+    from ._kernel_tf32 import (
+        _get_or_compile_tf32,
+        _get_or_compile_tf32_qkvpacked,
     )
     from ._kernel_tf32x3 import (
         _get_or_compile_tf32x3,
@@ -55,22 +53,23 @@ except ImportError:
 class WinAttnPrecision(Enum):
     """Precision mode for :func:`window_attn_fwd_cute`.
 
+    Each mode keeps QK and PV at the same precision level, like a matched pair:
+
     ``BF16_MIXED``
-        BF16 I/O, FP32 accumulators - SM80 ``mma.sync.m16n8k16.bf16.bf16.f32``.
-    ``TF32_BF16PV``
-        FP32 I/O and accumulators, but approximate matmuls: QK is a single TF32
-        MMA (``mma.sync.m16n8k8.tf32.tf32.f32``) and PV runs in BF16, which is
-        the accuracy floor of this mode.
+        BF16 QK and PV, FP32 accumulators - SM80 ``mma.sync.m16n8k16.bf16.bf16.f32``.
+    ``TF32``
+        FP32 I/O and accumulators, both matmuls a single TF32 MMA
+        (``mma.sync.m16n8k8.tf32.tf32.f32``, ~11-bit significand).
     ``TF32X3``
-        FP32 I/O with both matmuls emulated by three TF32 MMAs (CUTLASS 3xTF32),
+        FP32 I/O, both matmuls emulated by three TF32 MMAs each (CUTLASS 3xTF32),
         plus exact softmax; roughly 22 significand bits.
 
-    Ordered by accuracy: ``BF16_MIXED`` < ``TF32_BF16PV`` < ``TF32X3``.
+    Ordered by accuracy: ``BF16_MIXED`` < ``TF32`` < ``TF32X3``.
     """
 
-    BF16_MIXED  = "bf16_mixed"
-    TF32_BF16PV = "tf32_bf16pv"
-    TF32X3      = "tf32x3"
+    BF16_MIXED = "bf16_mixed"
+    TF32       = "tf32"
+    TF32X3     = "tf32x3"
 
 
 # ---------------------------------------------------------------------------
@@ -136,17 +135,13 @@ def _best_tile_m(
 ) -> int:
     """Optimal tile_m for single-pass N=144 on sm_120a (from a tile sweep).
 
-    BF16   -> 64 always (tile_m=128 is ~2.2x slower when masked).
-    TF32   -> 64 when masked (Swin SW-MSA blocks); 128 when unmasked (W-MSA blocks).
-    TF32X3 -> 64 always: its V is FP32 rather than BF16, and at head_dim=64 a
-    tile_m of 128 leaves room for only tile_n=128, which would drop N=144 out of
-    the single-pass path.
+    BF16 -> 64 always (tile_m=128 is ~2.2x slower when masked).
+    TF32 and TF32X3 -> 64 always: both keep Q, K and V as FP32 in smem, and at
+    head_dim=64 a tile_m of 128 leaves room for only tile_n=128, which would
+    drop N=144 out of the single-pass path regardless of MMA pass count.
     """
-    if precision == WinAttnPrecision.TF32X3:
-        return 64
-    if is_bf16:
-        return 64
-    return 64 if has_bias else 128
+    del is_bf16, has_bias, precision  # kept for call-site stability; always 64 now
+    return 64
 
 
 def _bf16_tile_n(seq_len: int, head_dim: int, tile_m: int, tile_n: Optional[int]) -> int:
@@ -179,8 +174,8 @@ def window_attn_fwd_cute(
     q, k, v:
         Shape ``(Bwin, H, N, Dh)`` where ``Bwin = B * nW``.
         Dtype must match ``precision``:
-        * ``BF16_MIXED``    -> ``torch.bfloat16``
-        * ``TF32_BF16PV`` -> ``torch.float32``
+        * ``BF16_MIXED``     -> ``torch.bfloat16``
+        * ``TF32`` / ``TF32X3`` -> ``torch.float32``
     bias:
         Optional shifted-window attention mask, shape ``(nW, N, N)``,
         dtype ``torch.float32``.  ``None`` means no mask.
@@ -192,7 +187,7 @@ def window_attn_fwd_cute(
         GEMM tile sizes for the CuTeDSL kernel.
     """
     _require_cute_available()
-    if precision in (WinAttnPrecision.TF32_BF16PV, WinAttnPrecision.TF32X3):
+    if precision in (WinAttnPrecision.TF32, WinAttnPrecision.TF32X3):
         assert q.dtype == torch.float32, f"{precision.name} requires float32 tensors"
     else:
         assert q.dtype == torch.bfloat16, "BF16_MIXED requires bfloat16 tensors"
@@ -223,29 +218,16 @@ def window_attn_fwd_cute(
     scale_log2 = Float32(math.log2(math.e) * scale_qk)
     has_bias = bias is not None
 
+    # TF32 and TF32X3 both keep V in FP32 throughout: the PV MMA is TF32 either
+    # way, so unlike the BF16 kernel there is no host-side cast to fuse or make.
     v_run = v
-    if precision == WinAttnPrecision.TF32X3:
-        # V stays FP32: the PV MMA is TF32, so there is no host-side cast to make.
-        _tile_n = tile_n if tile_n is not None else _choose_tile_n_tf32x3(N, head_dim=Dh, tile_m=tile_m)
-        fn = _get_or_compile_tf32x3(
+    if precision in (WinAttnPrecision.TF32, WinAttnPrecision.TF32X3):
+        _tile_n = tile_n if tile_n is not None else _choose_tile_n_fp32qkv(N, head_dim=Dh, tile_m=tile_m)
+        compile_fn = _get_or_compile_tf32x3 if precision == WinAttnPrecision.TF32X3 else _get_or_compile_tf32
+        fn = compile_fn(
             head_dim=Dh, seq_len=N, has_bias=has_bias,
             tile_m=tile_m, tile_n=_tile_n,
             q=q, k=k, v=v, o=out, bias_or_none=mask_u8,
-        )
-    elif precision == WinAttnPrecision.TF32_BF16PV:
-        _tile_n = tile_n if tile_n is not None else _choose_tile_n_tf32_bf16pv(N, head_dim=Dh, tile_m=tile_m)
-        # PV smem uses BF16 + 8x8x16b transpose (ldmatrix.trans is 16-bit only).
-        # Single-pass (+ aligned head_dim): pass V as FP32 and let the kernel convert
-        # to BF16 during the gmem->smem load, fusing away this full-tensor cast.
-        # Multi-pass: keep the host cast (cp.async V prefetch path stays intact).
-        if _tile_n >= N and Dh % 16 == 0:
-            v_run = v
-        else:
-            v_run = v.to(torch.bfloat16)
-        fn = _get_or_compile_tf32_bf16pv(
-            head_dim=Dh, seq_len=N, has_bias=has_bias,
-            tile_m=tile_m, tile_n=_tile_n,
-            q=q, k=k, v=v_run, o=out, bias_or_none=mask_u8,
         )
     else:
         _tile_n = _bf16_tile_n(N, head_dim=Dh, tile_m=tile_m, tile_n=tile_n)
@@ -283,7 +265,7 @@ def window_attn_fwd_cute_qkvpacked(
     tile_m: Optional[int] = None,
     tile_n: Optional[int] = None,
     output_layout: str = "bhnd",
-    fp32_precision: WinAttnPrecision = WinAttnPrecision.TF32_BF16PV,
+    fp32_precision: WinAttnPrecision = WinAttnPrecision.TF32,
 ) -> torch.Tensor:
     """CuTe attention reading Q/K/V directly from packed ``qkv``.
 
@@ -361,38 +343,25 @@ def window_attn_fwd_cute_qkvpacked(
                 scale_qk=scale_qk, precision=WinAttnPrecision.BF16_MIXED,
                 tile_m=tile_m, tile_n=_tile_n,
             )
-    elif fp32_precision == WinAttnPrecision.TF32X3:
-        _tile_n = tile_n if tile_n is not None else _choose_tile_n_tf32x3(N, head_dim=Dh, tile_m=tile_m)
+    else:
+        # TF32 and TF32X3 both keep V in FP32: same tile chooser, no host-side cast.
+        _tile_n = tile_n if tile_n is not None else _choose_tile_n_fp32qkv(N, head_dim=Dh, tile_m=tile_m)
         if _tile_n < N:
             return window_attn_fwd_cute(
                 q.contiguous(), k.contiguous(), v.contiguous(), bias=bias,
-                scale_qk=scale_qk, precision=WinAttnPrecision.TF32X3,
+                scale_qk=scale_qk, precision=fp32_precision,
                 tile_m=tile_m, tile_n=_tile_n,
             )
         v_run = v
-        fn = _get_or_compile_tf32x3_qkvpacked(
+        compile_fn = (
+            _get_or_compile_tf32x3_qkvpacked
+            if fp32_precision == WinAttnPrecision.TF32X3
+            else _get_or_compile_tf32_qkvpacked
+        )
+        fn = compile_fn(
             head_dim=Dh, seq_len=N, has_bias=has_bias,
             tile_m=tile_m, tile_n=_tile_n,
             q=q, k=k, v=v, o=out_kernel, bias_or_none=mask_u8,
-            output_layout=output_layout,
-        )
-    else:
-        _tile_n = tile_n if tile_n is not None else _choose_tile_n_tf32_bf16pv(N, head_dim=Dh, tile_m=tile_m)
-        if _tile_n < N:
-            return window_attn_fwd_cute(
-                q.contiguous(), k.contiguous(), v.contiguous(), bias=bias,
-                scale_qk=scale_qk, precision=WinAttnPrecision.TF32_BF16PV,
-                tile_m=tile_m, tile_n=_tile_n,
-            )
-        if Dh % 16 == 0:
-            v_compile, v_run = v, v
-        else:
-            v_compile = v.to(torch.bfloat16)
-            v_run = v_compile
-        fn = _get_or_compile_tf32_bf16pv_qkvpacked(
-            head_dim=Dh, seq_len=N, has_bias=has_bias,
-            tile_m=tile_m, tile_n=_tile_n,
-            q=q, k=k, v=v_compile, o=out_kernel, bias_or_none=mask_u8,
             output_layout=output_layout,
         )
 
@@ -413,13 +382,13 @@ def window_attn_dispatch(
     scale_qk: Optional[float] = None,
     tile_m: int = 64,
     tile_n: Optional[int] = None,
-    fp32_precision: WinAttnPrecision = WinAttnPrecision.TF32_BF16PV,
+    fp32_precision: WinAttnPrecision = WinAttnPrecision.TF32,
 ) -> torch.Tensor:
     """Run window attention via CuTeDSL (CUDA; arch from current GPU or ``CUTE_DSL_ARCH``).
 
     Thin wrapper around :func:`window_attn_fwd_cute` that picks precision from
     ``q.dtype``: ``bfloat16`` -> ``BF16_MIXED``, ``float32`` -> ``fp32_precision``
-    (either ``TF32_BF16PV`` or ``TF32X3``, since dtype alone cannot tell them apart).
+    (either ``TF32`` or ``TF32X3``, since dtype alone cannot tell them apart).
     """
     if scale_qk is None:
         scale_qk = 1.0 / math.sqrt(q.shape[-1])

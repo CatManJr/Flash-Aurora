@@ -4,7 +4,7 @@ Pytest coverage for aurora.ops.cute window attention.
 
 Test matrix
 -----------
-TF32_BF16PV          - vs PyTorch SDPA (TF32 matmul when applicable).
+TF32                 - vs PyTorch SDPA (TF32 matmul when applicable).
 TF32X3               - vs strict FP32, at a ~1000x tighter tolerance.
 BF16_MIXED           - vs PyTorch SDPA at BF16 I/O.
 window_attn_dispatch - CuTeDSL wrapper (dtype to precision).
@@ -31,10 +31,8 @@ from flash_aurora.models.ops.cute.window_attn_fwd import (
     _CUTE_AVAILABLE,
     _expand_bias_for_sdpa,
     _choose_tile_n,
-    _choose_tile_n_tf32_bf16pv,
-    _choose_tile_n_tf32x3,
-    _tf32_bf16pv_smem_bytes,
-    _tf32x3_smem_bytes,
+    _choose_tile_n_fp32qkv,
+    _fp32qkv_smem_bytes,
     _get_smem_budget_bytes,
     WinAttnPrecision,
     window_attn_dispatch,
@@ -152,16 +150,16 @@ EXTRA_SHAPES = [
 
 
 # ===========================================================================
-# TF32_BF16PV path  (CuTeDSL TF32 kernel)
+# TF32 path  (CuTeDSL 1xTF32 kernel)
 # ===========================================================================
 
 @requires_cute
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_tf32_bf16pv_close_to_strict_reference(has_bias: bool) -> None:
-    """TF32_BF16PV output must be numerically close to strict-FP32 reference.
+def test_tf32_close_to_strict_reference(has_bias: bool) -> None:
+    """TF32 output must be numerically close to strict-FP32 reference.
 
-    TF32 truncates the mantissa to 10 bits during multiply, so results differ
-    from exact FP32 by up to ~1e-3 relative error.
+    Both matmuls truncate the mantissa to ~11 bits during multiply, so results
+    differ from exact FP32 by up to ~1e-3 relative error.
     """
     Bwin, H, N, Dh, nW = 6, 8, 144, 64, 3
     q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
@@ -171,7 +169,7 @@ def test_tf32_bf16pv_close_to_strict_reference(has_bias: bool) -> None:
     with torch.no_grad():
         ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=False)
         out = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32
         )
 
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
@@ -187,7 +185,7 @@ def test_tf32_aurora_shapes(Bwin: int, H: int, N: int, Dh: int, nW: int) -> None
     with torch.no_grad():
         ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=False)
         out = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32
         )
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
 
@@ -197,7 +195,7 @@ def test_tf32_output_shape_dtype() -> None:
     Bwin, H, N, Dh = 4, 8, 64, 64
     q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
     with torch.no_grad():
-        out = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_BF16PV)
+        out = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32)
     assert out.shape == (Bwin, H, N, Dh)
     assert out.dtype == torch.float32
 
@@ -245,7 +243,7 @@ def test_tf32x3_aurora_shapes(Bwin: int, H: int, N: int, Dh: int, nW: int) -> No
 
 @requires_cute
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_tf32x3_beats_tf32_bf16pv_by_two_orders(has_bias: bool) -> None:
+def test_tf32x3_beats_tf32_by_two_orders(has_bias: bool) -> None:
     """The whole point of the kernel: it must actually be far more accurate.
 
     Guards against a silent fallback to single-MMA behaviour, which would still
@@ -259,13 +257,13 @@ def test_tf32x3_beats_tf32_bf16pv_by_two_orders(has_bias: bool) -> None:
     with torch.no_grad():
         ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=False)
         errors = {}
-        for precision in (WinAttnPrecision.TF32_BF16PV, WinAttnPrecision.TF32X3):
+        for precision in (WinAttnPrecision.TF32, WinAttnPrecision.TF32X3):
             out = window_attn_fwd_cute(
                 q, k, v, bias, scale_qk=scale, precision=precision
             )
             errors[precision] = (out - ref).abs().mean().item()
 
-    assert errors[WinAttnPrecision.TF32X3] * 100 < errors[WinAttnPrecision.TF32_BF16PV]
+    assert errors[WinAttnPrecision.TF32X3] * 100 < errors[WinAttnPrecision.TF32]
 
 
 @requires_cute
@@ -315,29 +313,31 @@ def test_tf32x3_qkvpacked_matches_unpacked(output_layout: str) -> None:
 
 
 @requires_cute
-def test_tf32x3_smem_fits_budget() -> None:
+def test_fp32qkv_smem_fits_budget() -> None:
     """FP32 V doubles V's SMEM, so the tile chooser must still fit the budget.
 
-    Streaming tiles also aim at half the budget so two CTAs fit per SM, but that
-    is an occupancy target rather than a hard limit: below a certain budget the
-    16-element tile floor wins and only the real budget has to hold.
+    Shared by the 1xTF32 and 3xTF32 kernels: same memory layout, different MMA
+    pass count.  Streaming tiles also aim at half the budget so two CTAs fit per
+    SM, but that is an occupancy target rather than a hard limit: below a certain
+    budget the 16-element tile floor wins and only the real budget has to hold.
     """
     for budget in (99 * 1024, 164 * 1024, 48 * 1024):
         for N in (144, 288, 576):
-            tile_n = _choose_tile_n_tf32x3(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
+            tile_n = _choose_tile_n_fp32qkv(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
             stages = 1 if tile_n >= N else 2
             assert tile_n >= 16
-            assert _tf32x3_smem_bytes(tile_n, 64, num_stages=stages) <= budget
+            assert _fp32qkv_smem_bytes(tile_n, 64, num_stages=stages) <= budget
             if tile_n > 16:
                 limit = budget if tile_n >= N else budget // 2
-                assert _tf32x3_smem_bytes(tile_n, 64, num_stages=stages) <= limit
+                assert _fp32qkv_smem_bytes(tile_n, 64, num_stages=stages) <= limit
 
 
 @requires_cute
-def test_tf32x3_single_pass_at_production_shape() -> None:
-    """N=144, Dh=64 must stay single-pass, which is why tile_m is pinned to 64."""
-    assert _choose_tile_n_tf32x3(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024) >= 144
-    assert _choose_tile_n_tf32x3(144, head_dim=64, tile_m=128, smem_budget_bytes=99 * 1024) < 144
+def test_fp32qkv_single_pass_at_production_shape() -> None:
+    """N=144, Dh=64 must stay single-pass, which is why tile_m is pinned to 64
+    for both the 1xTF32 and 3xTF32 kernels."""
+    assert _choose_tile_n_fp32qkv(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024) >= 144
+    assert _choose_tile_n_fp32qkv(144, head_dim=64, tile_m=128, smem_budget_bytes=99 * 1024) < 144
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +366,7 @@ def test_tf32_swin_mask_large_activations(activation_scale: float) -> None:
     with torch.no_grad():
         ref = _sdpa_reference(q, k, v, bias, scale, allow_tf32=True)
         out = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32
         )
 
     max_err = (out - ref).abs().max().item()
@@ -434,8 +434,8 @@ def test_tf32_is_deterministic() -> None:
     Bwin, H, N, Dh = 4, 8, 64, 64
     q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
     with torch.no_grad():
-        out1 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_BF16PV)
-        out2 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_BF16PV)
+        out1 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32)
+        out2 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32)
     torch.testing.assert_close(out1, out2, rtol=0, atol=0)
 
 
@@ -567,7 +567,7 @@ def test_tf32_qkvpacked_matches_regular_cute(has_bias: bool) -> None:
 
     with torch.no_grad():
         regular = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32
         )
         packed = window_attn_fwd_cute_qkvpacked(
             qkv, H, bias=bias, scale_qk=scale
@@ -593,7 +593,7 @@ def test_tf32_qkvpacked_bnc_output_matches_regular_cute(has_bias: bool) -> None:
 
     with torch.no_grad():
         regular = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32
         )
         packed_bnc = window_attn_fwd_cute_qkvpacked(
             qkv, H, bias=bias, scale_qk=scale, output_layout="bnc"
@@ -627,7 +627,7 @@ def test_dispatch_matches_fwd_cute() -> None:
     with torch.no_grad():
         via_dispatch = window_attn_dispatch(q, k, v)
         via_cute = window_attn_fwd_cute(
-            q, k, v, precision=WinAttnPrecision.TF32_BF16PV
+            q, k, v, precision=WinAttnPrecision.TF32
         )
     torch.testing.assert_close(via_dispatch, via_cute, rtol=0, atol=0)
 
@@ -678,12 +678,12 @@ def test_expand_bias_for_sdpa_general_Bwin() -> None:
 # ===========================================================================
 
 def test_tf32_dtype_guard() -> None:
-    """TF32_BF16PV must reject non-float32 tensors."""
+    """TF32 must reject non-float32 tensors."""
     q, k, v = (torch.randn(2, 4, 16, 16) for _ in range(3))
     with pytest.raises(AssertionError, match="float32"):
         window_attn_fwd_cute(
             q.bfloat16(), k.bfloat16(), v.bfloat16(),
-            precision=WinAttnPrecision.TF32_BF16PV,
+            precision=WinAttnPrecision.TF32,
         )
 
 
@@ -764,42 +764,42 @@ class TestChooseTileN:
             cap = budget if stages == 1 else budget // 2
             assert smem <= cap, f"SMEM {smem} > cap {cap} for N={N}"
 
-    # ----- TF32 _choose_tile_n_tf32_bf16pv -----
+    # ----- _choose_tile_n_fp32qkv (shared by the 1xTF32 and 3xTF32 kernels) -----
 
-    def test_tf32_n144_single_pass_99kb(self) -> None:
+    def test_fp32qkv_n144_single_pass_99kb(self) -> None:
         """N=144 must select tile_n=144 (single-pass) on 99 KB device."""
-        tile_n = _choose_tile_n_tf32_bf16pv(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
-        # sQ=16KB, sK+sV=144x64x(4+2)B=54KB -> 70KB < 99KB
+        tile_n = _choose_tile_n_fp32qkv(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+        # sQ=16KB, sK+sV=144x64x(4+4)B=72KB -> 88KB < 99KB
         assert tile_n == 144
-        assert _tf32_bf16pv_smem_bytes(tile_n, 64, num_stages=1) <= 99 * 1024
+        assert _fp32qkv_smem_bytes(tile_n, 64, num_stages=1) <= 99 * 1024
 
-    def test_tf32_n288_streams_99kb_hybrid(self) -> None:
-        """N=288 must stream on 99 KB; 2-stage hybrid SMEM fits half budget."""
-        tile_n = _choose_tile_n_tf32_bf16pv(288, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+    def test_fp32qkv_n288_streams_99kb(self) -> None:
+        """N=288 must stream on 99 KB; 2-stage SMEM fits half budget."""
+        tile_n = _choose_tile_n_fp32qkv(288, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
         assert tile_n < 288
         assert tile_n == 32
-        assert _tf32_bf16pv_smem_bytes(tile_n, 64, num_stages=2) <= 99 * 1024 // 2
+        assert _fp32qkv_smem_bytes(tile_n, 64, num_stages=2) <= 99 * 1024 // 2
 
-    def test_tf32_n144_streaming_on_48kb(self) -> None:
-        """N=144 must stream on a 48 KB device (70 KB single-pass > 48 KB budget)."""
-        tile_n = _choose_tile_n_tf32_bf16pv(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
+    def test_fp32qkv_n144_streaming_on_48kb(self) -> None:
+        """N=144 must stream on a 48 KB device (88 KB single-pass > 48 KB budget)."""
+        tile_n = _choose_tile_n_fp32qkv(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
         assert tile_n < 144
-        assert _tf32_bf16pv_smem_bytes(tile_n, 64, num_stages=2) <= 48 * 1024
+        assert _fp32qkv_smem_bytes(tile_n, 64, num_stages=2) <= 48 * 1024
 
-    def test_tf32_tile_n_aligned_to_8(self) -> None:
+    def test_fp32qkv_tile_n_aligned_to_8(self) -> None:
         for N in (100, 144, 200, 288):
-            tile_n = _choose_tile_n_tf32_bf16pv(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+            tile_n = _choose_tile_n_fp32qkv(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
             assert tile_n % 8 == 0
 
-    def test_tf32_tile_n_never_exceeds_seq_len(self) -> None:
+    def test_fp32qkv_tile_n_never_exceeds_seq_len(self) -> None:
         """tile_n must be <= seq_len (no over-allocation into undefined K/V rows)."""
         budget = 99 * 1024
         for N in (8, 32, 64, 144, 288):
-            tile_n = _choose_tile_n_tf32_bf16pv(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
+            tile_n = _choose_tile_n_fp32qkv(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
             assert tile_n <= N, f"tile_n={tile_n} > N={N}"
             stages = 1 if tile_n >= N else 2
             limit = budget if stages == 1 else budget // 2
-            smem = _tf32_bf16pv_smem_bytes(tile_n, 64, num_stages=stages)
+            smem = _fp32qkv_smem_bytes(tile_n, 64, num_stages=stages)
             assert smem <= limit, f"SMEM {smem} > limit {limit} for N={N}"
 
     # ----- _get_smem_budget_bytes -----

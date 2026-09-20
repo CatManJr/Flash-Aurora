@@ -69,7 +69,7 @@ try:
         apply_partial_kv_mask,
         apply_swin_mask_u8_gmem,
     )
-    from ._smem_utils import _choose_tile_n_tf32x3
+    from ._smem_utils import _choose_tile_n_fp32qkv
 
     @_dataclass(frozen=True)
     class MmaTF32Op(warp.WarpMmaOp):
@@ -120,7 +120,7 @@ class WindowAttnFwdTF32x3:
         assert _CUTE_AVAILABLE, "CuTeDSL / cutlass / quack not found"
 
         if tile_n is None:
-            tile_n = _choose_tile_n_tf32x3(seq_len, head_dim=head_dim, tile_m=tile_m)
+            tile_n = _choose_tile_n_fp32qkv(seq_len, head_dim=head_dim, tile_m=tile_m)
 
         self.head_dim = head_dim
         self.seq_len = seq_len

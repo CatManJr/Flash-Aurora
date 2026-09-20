@@ -208,7 +208,7 @@ def check_accuracy_batch(
         r_tf = _check_one_shape(
             Bwin, H, N, Dh,
             masked=masked,
-            precision=WinAttnPrecision.TF32_BF16PV,
+            precision=WinAttnPrecision.TF32,
             dtype=torch.float32,
             rtol=rtol_tf32,
             atol=atol_tf32,
@@ -256,8 +256,8 @@ def run_checkpoint_coverage() -> bool:
         modes = (
             ("bf16", False, WinAttnPrecision.BF16_MIXED, torch.bfloat16, 2e-2, 2e-2),
             ("+mask", True, WinAttnPrecision.BF16_MIXED, torch.bfloat16, 2e-2, 2e-2),
-            ("tf32", False, WinAttnPrecision.TF32_BF16PV, torch.float32, 1e-3, 1e-3),
-            ("+mask", True, WinAttnPrecision.TF32_BF16PV, torch.float32, 1e-3, 1e-3),
+            ("tf32", False, WinAttnPrecision.TF32, torch.float32, 1e-3, 1e-3),
+            ("+mask", True, WinAttnPrecision.TF32, torch.float32, 1e-3, 1e-3),
             ("tf32x3", False, WinAttnPrecision.TF32X3, torch.float32, 1e-5, 1e-5),
             ("+mask", True, WinAttnPrecision.TF32X3, torch.float32, 1e-5, 1e-5),
         )
@@ -495,7 +495,7 @@ def main() -> None:
             SHAPES_MICRO,
             title="No mask — micro shapes (TF32 CuTe vs FP32 SDPA)",
             dtype=torch.float32,
-            cute_precision=WinAttnPrecision.TF32_BF16PV,
+            cute_precision=WinAttnPrecision.TF32,
             baseline_col="sdpa_ms",
             make_baseline=sdpa_fp32,
         )
@@ -513,7 +513,7 @@ def main() -> None:
             SHAPES_ALL,
             title="No mask — all checkpoint shapes (TF32; SDPA is true FP32 matmul)",
             dtype=torch.float32,
-            cute_precision=WinAttnPrecision.TF32_BF16PV,
+            cute_precision=WinAttnPrecision.TF32,
             baseline_col="sdpa_ms",
             make_baseline=sdpa_fp32,
         )
@@ -543,7 +543,7 @@ def main() -> None:
             SHAPES_ALL,
             title="Masked — TF32 CuTe vs FP32 SDPA + attn_mask",
             dtype=torch.float32,
-            cute_precision=WinAttnPrecision.TF32_BF16PV,
+            cute_precision=WinAttnPrecision.TF32,
             baseline_col="sdpa_ms",
             make_baseline=sdpa_fp32,
             bias=bias144,

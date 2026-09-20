@@ -272,7 +272,7 @@ class Aurora(torch.nn.Module):
             autocast_dtype = torch.bfloat16
         else:
             window_attn_compute_dtype_name = "float32"
-            window_attn_tf32_mode = "bf16pv"
+            window_attn_tf32_mode = "tf32"
             autocast_encoder_decoder = False
             encoder_decoder_use_tensor_core = False
 

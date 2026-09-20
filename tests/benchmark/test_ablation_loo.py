@@ -150,7 +150,7 @@ def test_tf32x3_row_precision_resolves() -> None:
 
     cfg = resolve_inference_config(get_row("tf32x3_attention").precision)
     assert cfg is not None
-    assert cfg.window_attn_tf32_mode == "x3"
+    assert cfg.window_attn_tf32_mode == "tf32x3"
     assert cfg.use_cute_window_attn is True
 
 

@@ -36,8 +36,10 @@ KernelProfile = Literal[
 ]
 
 # Which CuTe kernel serves FP32 window attention.  ``window_attn_compute_dtype``
-# cannot distinguish them, since both take FP32 tensors.
-WindowAttnTF32Mode = Literal["bf16pv", "x3"]
+# cannot distinguish them, since both take FP32 tensors.  Values mirror
+# ``WinAttnPrecision``'s own ``.value`` strings ("tf32" / "tf32x3") so the
+# swin3d.py routing is a straight ``WinAttnPrecision(mode)`` lookup.
+WindowAttnTF32Mode = Literal["tf32", "tf32x3"]
 
 
 class BackboneMatmulLevel(str, Enum):
@@ -112,7 +114,7 @@ class _KernelProfileSpec:
     use_triton_perceiver_ln_fusion: bool
     cuda_graph_scope: CudaGraphScope
     cuda_graph_recommended: bool
-    window_attn_tf32_mode: WindowAttnTF32Mode = "bf16pv"
+    window_attn_tf32_mode: WindowAttnTF32Mode = "tf32"
 
 
 _KERNEL_PROFILES: dict[KernelProfile, _KernelProfileSpec] = {
@@ -156,7 +158,7 @@ _KERNEL_PROFILES: dict[KernelProfile, _KernelProfileSpec] = {
         autocast_backbone=False,
         backbone_compute_dtype="float32",
         window_attn_compute_dtype="float32",
-        window_attn_tf32_mode="x3",
+        window_attn_tf32_mode="tf32x3",
         use_triton_layout=True,
         use_triton_adaln=True,
         use_triton_mlp=False,
@@ -260,7 +262,7 @@ class AuroraInferenceConfig:
     autocast_encoder_decoder: bool
     cuda_graph_scope: CudaGraphScope
     cuda_graph_recommended: bool
-    window_attn_tf32_mode: WindowAttnTF32Mode = "bf16pv"
+    window_attn_tf32_mode: WindowAttnTF32Mode = "tf32"
 
     def validate(self) -> None:
         if self.use_triton_perceiver_ln_fusion:
@@ -309,11 +311,11 @@ class AuroraInferenceConfig:
                 f"backbone_matmul_level={self.backbone_matmul_level.value} requires "
                 "backbone_matmul_tf32=True."
             )
-        if (self.window_attn_tf32_mode == "x3") != (
+        if (self.window_attn_tf32_mode == "tf32x3") != (
             self.kernel_profile == "tf32x3_backbone"
         ):
             raise ValueError(
-                "window_attn_tf32_mode='x3' and kernel_profile='tf32x3_backbone' must agree."
+                "window_attn_tf32_mode='tf32x3' and kernel_profile='tf32x3_backbone' must agree."
             )
         if self.backbone_matmul_level == BackboneMatmulLevel.FP32 and (
             self.backbone_matmul_bf16 or self.backbone_matmul_tf32
@@ -504,7 +506,10 @@ def describe_inference_config(cfg: AuroraInferenceConfig) -> str:
     else:
         parts.append("PyTorch Swin (no Triton/CuTe)")
     if prof.use_cute_window_attn:
-        mode = "3xTF32" if prof.window_attn_tf32_mode == "x3" else prof.window_attn_compute_dtype
+        if prof.window_attn_compute_dtype == "float32":
+            mode = "3xTF32" if prof.window_attn_tf32_mode == "tf32x3" else "1xTF32"
+        else:
+            mode = prof.window_attn_compute_dtype
         parts.append(f"CuTe window attention ({mode})")
     elif cfg.kernel_profile != "baseline":
         parts.append("PyTorch window SDPA")
