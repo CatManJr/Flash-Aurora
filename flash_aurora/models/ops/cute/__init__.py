@@ -5,8 +5,8 @@ those portions are licensed under the MIT License (see LICENSE).
 
 CuTe DSL-based ops for Aurora window attention.
 
-BF16 mixed precision uses the CuTeDSL kernel in this package.
-FP32 (strict / TF32) is delegated to torch SDPA or PyTorch fallbacks.
+Both precision modes are served by CuTeDSL kernels in this package: BF16 mixed by
+``_kernel_bf16.py`` and FP32-I/O (TF32 QK, BF16 PV) by ``_kernel_tf32_bf16pv.py``.
 See submodules for flash-attn / CUTLASS reference notes.
 """
 

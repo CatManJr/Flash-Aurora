@@ -4,8 +4,8 @@ Pytest coverage for aurora.ops.cute window attention.
 
 Test matrix
 -----------
-TF32_ACC_FP32  - vs PyTorch SDPA (TF32 matmul when applicable).
-BF16_MIXED     - vs PyTorch SDPA at BF16 I/O.
+TF32_BF16PV          - vs PyTorch SDPA (TF32 matmul when applicable).
+BF16_MIXED           - vs PyTorch SDPA at BF16 I/O.
 window_attn_dispatch - CuTeDSL wrapper (dtype to precision).
 
 Shape coverage
@@ -30,8 +30,8 @@ from flash_aurora.models.ops.cute.window_attn_fwd import (
     _CUTE_AVAILABLE,
     _expand_bias_for_sdpa,
     _choose_tile_n,
-    _choose_tile_n_tf32,
-    _tf32_hybrid_smem_bytes,
+    _choose_tile_n_tf32_bf16pv,
+    _tf32_bf16pv_smem_bytes,
     _get_smem_budget_bytes,
     WinAttnPrecision,
     window_attn_dispatch,
@@ -149,13 +149,13 @@ EXTRA_SHAPES = [
 
 
 # ===========================================================================
-# TF32_ACC_FP32 path  (CuTeDSL TF32 kernel)
+# TF32_BF16PV path  (CuTeDSL TF32 kernel)
 # ===========================================================================
 
 @requires_cute
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_tf32_acc_fp32_close_to_strict_reference(has_bias: bool) -> None:
-    """TF32_ACC_FP32 output must be numerically close to strict-FP32 reference.
+def test_tf32_bf16pv_close_to_strict_reference(has_bias: bool) -> None:
+    """TF32_BF16PV output must be numerically close to strict-FP32 reference.
 
     TF32 truncates the mantissa to 10 bits during multiply, so results differ
     from exact FP32 by up to ~1e-3 relative error.
@@ -168,7 +168,7 @@ def test_tf32_acc_fp32_close_to_strict_reference(has_bias: bool) -> None:
     with torch.no_grad():
         ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=False)
         out = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
         )
 
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
@@ -184,7 +184,7 @@ def test_tf32_aurora_shapes(Bwin: int, H: int, N: int, Dh: int, nW: int) -> None
     with torch.no_grad():
         ref = _fp32_sdpa_reference(q, k, v, bias, scale, allow_tf32=False)
         out = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
         )
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
 
@@ -194,7 +194,7 @@ def test_tf32_output_shape_dtype() -> None:
     Bwin, H, N, Dh = 4, 8, 64, 64
     q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
     with torch.no_grad():
-        out = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32)
+        out = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_BF16PV)
     assert out.shape == (Bwin, H, N, Dh)
     assert out.dtype == torch.float32
 
@@ -225,7 +225,7 @@ def test_tf32_swin_mask_large_activations(activation_scale: float) -> None:
     with torch.no_grad():
         ref = _sdpa_reference(q, k, v, bias, scale, allow_tf32=True)
         out = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
         )
 
     max_err = (out - ref).abs().max().item()
@@ -293,8 +293,8 @@ def test_tf32_is_deterministic() -> None:
     Bwin, H, N, Dh = 4, 8, 64, 64
     q, k, v = _make_qkv(Bwin, H, N, Dh, torch.float32, "cuda")
     with torch.no_grad():
-        out1 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32)
-        out2 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32)
+        out1 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_BF16PV)
+        out2 = window_attn_fwd_cute(q, k, v, precision=WinAttnPrecision.TF32_BF16PV)
     torch.testing.assert_close(out1, out2, rtol=0, atol=0)
 
 
@@ -426,7 +426,7 @@ def test_tf32_qkvpacked_matches_regular_cute(has_bias: bool) -> None:
 
     with torch.no_grad():
         regular = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
         )
         packed = window_attn_fwd_cute_qkvpacked(
             qkv, H, bias=bias, scale_qk=scale
@@ -452,7 +452,7 @@ def test_tf32_qkvpacked_bnc_output_matches_regular_cute(has_bias: bool) -> None:
 
     with torch.no_grad():
         regular = window_attn_fwd_cute(
-            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_ACC_FP32
+            q, k, v, bias, scale_qk=scale, precision=WinAttnPrecision.TF32_BF16PV
         )
         packed_bnc = window_attn_fwd_cute_qkvpacked(
             qkv, H, bias=bias, scale_qk=scale, output_layout="bnc"
@@ -486,7 +486,7 @@ def test_dispatch_matches_fwd_cute() -> None:
     with torch.no_grad():
         via_dispatch = window_attn_dispatch(q, k, v)
         via_cute = window_attn_fwd_cute(
-            q, k, v, precision=WinAttnPrecision.TF32_ACC_FP32
+            q, k, v, precision=WinAttnPrecision.TF32_BF16PV
         )
     torch.testing.assert_close(via_dispatch, via_cute, rtol=0, atol=0)
 
@@ -537,12 +537,12 @@ def test_expand_bias_for_sdpa_general_Bwin() -> None:
 # ===========================================================================
 
 def test_tf32_dtype_guard() -> None:
-    """TF32_ACC_FP32 must reject non-float32 tensors."""
+    """TF32_BF16PV must reject non-float32 tensors."""
     q, k, v = (torch.randn(2, 4, 16, 16) for _ in range(3))
     with pytest.raises(AssertionError, match="float32"):
         window_attn_fwd_cute(
             q.bfloat16(), k.bfloat16(), v.bfloat16(),
-            precision=WinAttnPrecision.TF32_ACC_FP32,
+            precision=WinAttnPrecision.TF32_BF16PV,
         )
 
 
@@ -623,42 +623,42 @@ class TestChooseTileN:
             cap = budget if stages == 1 else budget // 2
             assert smem <= cap, f"SMEM {smem} > cap {cap} for N={N}"
 
-    # ----- TF32 _choose_tile_n_tf32 -----
+    # ----- TF32 _choose_tile_n_tf32_bf16pv -----
 
     def test_tf32_n144_single_pass_99kb(self) -> None:
         """N=144 must select tile_n=144 (single-pass) on 99 KB device."""
-        tile_n = _choose_tile_n_tf32(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+        tile_n = _choose_tile_n_tf32_bf16pv(144, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
         # sQ=16KB, sK+sV=144x64x(4+2)B=54KB -> 70KB < 99KB
         assert tile_n == 144
-        assert _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=1) <= 99 * 1024
+        assert _tf32_bf16pv_smem_bytes(tile_n, 64, num_stages=1) <= 99 * 1024
 
     def test_tf32_n288_streams_99kb_hybrid(self) -> None:
         """N=288 must stream on 99 KB; 2-stage hybrid SMEM fits half budget."""
-        tile_n = _choose_tile_n_tf32(288, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+        tile_n = _choose_tile_n_tf32_bf16pv(288, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
         assert tile_n < 288
         assert tile_n == 32
-        assert _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=2) <= 99 * 1024 // 2
+        assert _tf32_bf16pv_smem_bytes(tile_n, 64, num_stages=2) <= 99 * 1024 // 2
 
     def test_tf32_n144_streaming_on_48kb(self) -> None:
         """N=144 must stream on a 48 KB device (70 KB single-pass > 48 KB budget)."""
-        tile_n = _choose_tile_n_tf32(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
+        tile_n = _choose_tile_n_tf32_bf16pv(144, head_dim=64, tile_m=64, smem_budget_bytes=48 * 1024)
         assert tile_n < 144
-        assert _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=2) <= 48 * 1024
+        assert _tf32_bf16pv_smem_bytes(tile_n, 64, num_stages=2) <= 48 * 1024
 
     def test_tf32_tile_n_aligned_to_8(self) -> None:
         for N in (100, 144, 200, 288):
-            tile_n = _choose_tile_n_tf32(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
+            tile_n = _choose_tile_n_tf32_bf16pv(N, head_dim=64, tile_m=64, smem_budget_bytes=99 * 1024)
             assert tile_n % 8 == 0
 
     def test_tf32_tile_n_never_exceeds_seq_len(self) -> None:
         """tile_n must be <= seq_len (no over-allocation into undefined K/V rows)."""
         budget = 99 * 1024
         for N in (8, 32, 64, 144, 288):
-            tile_n = _choose_tile_n_tf32(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
+            tile_n = _choose_tile_n_tf32_bf16pv(N, head_dim=64, tile_m=64, smem_budget_bytes=budget)
             assert tile_n <= N, f"tile_n={tile_n} > N={N}"
             stages = 1 if tile_n >= N else 2
             limit = budget if stages == 1 else budget // 2
-            smem = _tf32_hybrid_smem_bytes(tile_n, 64, num_stages=stages)
+            smem = _tf32_bf16pv_smem_bytes(tile_n, 64, num_stages=stages)
             assert smem <= limit, f"SMEM {smem} > limit {limit} for N={N}"
 
     # ----- _get_smem_budget_bytes -----

@@ -358,7 +358,7 @@ class WindowAttention(nn.Module):
                 precision = (
                     WinAttnPrecision.BF16_MIXED
                     if q.dtype == torch.bfloat16
-                    else WinAttnPrecision.TF32_ACC_FP32
+                    else WinAttnPrecision.TF32_BF16PV
                 )
                 # Bias kept as float32: the CuTeDSL kernel takes FP32 bias.
                 bias = None

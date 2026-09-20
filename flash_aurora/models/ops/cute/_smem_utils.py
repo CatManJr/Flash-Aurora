@@ -98,7 +98,7 @@ def _choose_tile_n(
     return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
 
 
-def _tf32_hybrid_smem_bytes(
+def _tf32_bf16pv_smem_bytes(
     tile_n: int,
     head_dim: int,
     tile_m: int = 64,
@@ -106,7 +106,7 @@ def _tf32_hybrid_smem_bytes(
     *,
     include_mask_tile: bool = True,
 ) -> int:
-    """Bytes for TF32 hybrid kernel SMEM: FP32 ``sQ``/``sK``, BF16 ``sV``.
+    """Bytes for the TF32-QK / BF16-PV kernel SMEM: FP32 ``sQ``/``sK``, BF16 ``sV``.
 
     ``include_mask_tile`` is ignored (uint8 Swin mask is read from gmem).
     """
@@ -118,15 +118,15 @@ def _tf32_hybrid_smem_bytes(
     )
 
 
-def _choose_tile_n_tf32(
+def _choose_tile_n_tf32_bf16pv(
     seq_len: int,
     head_dim: int = 64,
     tile_m: int = 64,
     smem_budget_bytes: Optional[int] = None,
 ) -> int:
-    """Choose tile_n for TF32_ACC_FP32 (hybrid FP32 Q/K + BF16 V).
+    """Choose tile_n for TF32_BF16PV (FP32 Q/K + BF16 V).
 
-    SMEM layout (matches ``WindowAttnFwdTF32``)::
+    SMEM layout (matches ``WindowAttnFwdTF32BF16PV``)::
 
         sQ : tile_m  x head_dim x 4B
         sK : tile_n  x head_dim x 4B x num_stages

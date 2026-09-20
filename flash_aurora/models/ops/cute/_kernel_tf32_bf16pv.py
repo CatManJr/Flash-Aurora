@@ -3,10 +3,14 @@
 This file includes modifications and original contributions by Catman Jr.;
 those portions are licensed under the MIT License (see LICENSE).
 
-TF32 window attention (CuTeDSL, SM80+).
+FP32-I/O window attention with TF32 QK and BF16 PV (CuTeDSL, SM80+).
 
-TF32 QK MMA; FP32 softmax; BF16 V in smem. Direct O epilogue to gmem.
-uint8 Swin mask read directly from gmem (L2-resident).
+Inputs, accumulators and outputs are FP32, but the matmuls are approximate: QK
+runs a single TF32 MMA (10-bit mantissa) and the whole PV stage runs in BF16
+(8-bit mantissa) because ``ldmatrix.trans`` is 16-bit only, so both P and V are
+downcast.  The softmax also uses fast ``exp2``/``log2`` on the single-KV-tile
+path.  BF16 PV, not TF32 QK, is the accuracy floor of this kernel.  Direct O
+epilogue to gmem; uint8 Swin mask read directly from gmem (L2-resident).
 
 References:
 - flash-attn ``flash_attn/cute/flash_fwd.py`` (Tri Dao) - FMHA mainloop / masking layout.
@@ -55,7 +59,7 @@ try:
         apply_partial_kv_mask,
         apply_swin_mask_u8_gmem,
     )
-    from ._smem_utils import _choose_tile_n_tf32
+    from ._smem_utils import _choose_tile_n_tf32_bf16pv
 
     @_dataclass(frozen=True)
     class MmaTF32Op(warp.WarpMmaOp):
@@ -80,17 +84,17 @@ try:
             pass
 
     _CUTE_AVAILABLE = True
-    _tf32_compile_cache: dict = {}
-    _tf32_qkvpacked_compile_cache: dict = {}
+    _tf32_bf16pv_compile_cache: dict = {}
+    _tf32_bf16pv_qkvpacked_compile_cache: dict = {}
 
 except ImportError:
     _CUTE_AVAILABLE = False
-    _tf32_compile_cache = {}
-    _tf32_qkvpacked_compile_cache = {}
+    _tf32_bf16pv_compile_cache = {}
+    _tf32_bf16pv_qkvpacked_compile_cache = {}
 
 
-class WindowAttnFwdTF32:
-    """Forward-only TF32 window attention for SM80+."""
+class WindowAttnFwdTF32BF16PV:
+    """Forward-only FP32-I/O window attention, TF32 QK + BF16 PV, for SM80+."""
 
     _NUM_THREADS: int = 128
 
@@ -106,7 +110,7 @@ class WindowAttnFwdTF32:
         assert _CUTE_AVAILABLE, "CuTeDSL / cutlass / quack not found"
 
         if tile_n is None:
-            tile_n = _choose_tile_n_tf32(seq_len, head_dim=head_dim, tile_m=tile_m)
+            tile_n = _choose_tile_n_tf32_bf16pv(seq_len, head_dim=head_dim, tile_m=tile_m)
 
         self.head_dim = head_dim
         self.seq_len = seq_len
@@ -685,7 +689,7 @@ class WindowAttnFwdTF32:
                     )
 
 
-def _get_or_compile_tf32(
+def _get_or_compile_tf32_bf16pv(
     head_dim: int,
     seq_len: int,
     has_bias: bool,
@@ -698,11 +702,11 @@ def _get_or_compile_tf32(
     bias_or_none: Optional[torch.Tensor],
 ):
     single_kv = tile_n >= seq_len
-    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "tf32_hybrid")
-    if compile_key in _tf32_compile_cache:
-        return _tf32_compile_cache[compile_key]
+    compile_key = (head_dim, seq_len, has_bias, tile_m, tile_n, single_kv, "tf32_bf16pv")
+    if compile_key in _tf32_bf16pv_compile_cache:
+        return _tf32_bf16pv_compile_cache[compile_key]
 
-    kernel_obj = WindowAttnFwdTF32(
+    kernel_obj = WindowAttnFwdTF32BF16PV(
         head_dim=head_dim,
         seq_len=seq_len,
         has_bias=has_bias,
@@ -728,11 +732,11 @@ def _get_or_compile_tf32(
         stream,
         options="--enable-tvm-ffi",
     )
-    _tf32_compile_cache[compile_key] = compiled
+    _tf32_bf16pv_compile_cache[compile_key] = compiled
     return compiled
 
 
-def _get_or_compile_tf32_qkvpacked(
+def _get_or_compile_tf32_bf16pv_qkvpacked(
     head_dim: int,
     seq_len: int,
     has_bias: bool,
@@ -749,12 +753,12 @@ def _get_or_compile_tf32_qkvpacked(
     single_kv = tile_n >= seq_len
     compile_key = (
         head_dim, seq_len, has_bias, tile_m, tile_n, single_kv,
-        output_layout, "tf32_qkvpacked",
+        output_layout, "tf32_bf16pv_qkvpacked",
     )
-    if compile_key in _tf32_qkvpacked_compile_cache:
-        return _tf32_qkvpacked_compile_cache[compile_key]
+    if compile_key in _tf32_bf16pv_qkvpacked_compile_cache:
+        return _tf32_bf16pv_qkvpacked_compile_cache[compile_key]
 
-    kernel_obj = WindowAttnFwdTF32(
+    kernel_obj = WindowAttnFwdTF32BF16PV(
         head_dim=head_dim,
         seq_len=seq_len,
         has_bias=has_bias,
@@ -780,5 +784,5 @@ def _get_or_compile_tf32_qkvpacked(
         stream,
         options="--enable-tvm-ffi",
     )
-    _tf32_qkvpacked_compile_cache[compile_key] = compiled
+    _tf32_bf16pv_qkvpacked_compile_cache[compile_key] = compiled
     return compiled
