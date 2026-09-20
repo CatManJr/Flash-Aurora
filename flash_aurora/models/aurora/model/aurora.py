@@ -254,6 +254,7 @@ class Aurora(torch.nn.Module):
             autocast = preset_kwargs["autocast"]
             backbone_compute_dtype_name = preset_kwargs["backbone_compute_dtype"]
             window_attn_compute_dtype_name = preset_kwargs["window_attn_compute_dtype"]
+            window_attn_tf32_mode = preset_kwargs["window_attn_tf32_mode"]
             use_triton_layout = preset_kwargs["use_triton_layout"]
             use_triton_adaln = preset_kwargs["use_triton_adaln"]
             use_triton_mlp = preset_kwargs["use_triton_mlp"]
@@ -264,6 +265,7 @@ class Aurora(torch.nn.Module):
         else:
             backbone_compute_dtype_name = "float32"
             window_attn_compute_dtype_name = "float32"
+            window_attn_tf32_mode = "bf16pv"
             autocast_encoder_decoder = False
             encoder_decoder_use_tensor_core = False
 
@@ -275,6 +277,8 @@ class Aurora(torch.nn.Module):
         from flash_aurora.models.aurora.model.custom_op_paths import backbone_dtype_from_name
 
         self.cute_window_attn_dtype = backbone_dtype_from_name(window_attn_compute_dtype_name)
+        # FP32 window attention has two kernels, so dtype alone cannot select one.
+        self.cute_window_attn_tf32_mode = window_attn_tf32_mode
 
         self.surf_vars = surf_vars
         self.atmos_vars = atmos_vars

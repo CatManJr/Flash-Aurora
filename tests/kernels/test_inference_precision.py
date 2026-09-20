@@ -172,6 +172,39 @@ def test_custom_ops_cannot_combine_with_autocast() -> None:
         cfg.validate()
 
 
+def test_tf32x3_preset_routes_to_x3_kernel() -> None:
+    cfg = resolve_inference_config("tf32x3")
+    assert cfg is not None
+    assert cfg.kernel_profile == "tf32x3_backbone"
+    assert cfg.backbone_matmul_level == BackboneMatmulLevel.TF32X3
+    assert cfg.use_cute_window_attn is True
+    assert cfg.window_attn_compute_dtype == "float32"
+    assert cfg.window_attn_tf32_mode == "x3"
+    assert cfg.backbone_matmul_tf32 is True
+    assert cfg.backbone_matmul_bf16 is False
+
+
+def test_tf32_preset_keeps_bf16pv_kernel() -> None:
+    """tf32 and tf32x3 share a dtype, so only the mode distinguishes them."""
+    cfg = resolve_inference_config("tf32")
+    assert cfg is not None
+    assert cfg.window_attn_compute_dtype == "float32"
+    assert cfg.window_attn_tf32_mode == "bf16pv"
+
+
+def test_tf32x3_mode_must_match_kernel_profile() -> None:
+    cfg = build_inference_config(
+        precision=AuroraInferencePrecision.TF32X3,
+        kernel_profile="tf32x3_backbone",
+        backbone_matmul_level=BackboneMatmulLevel.TF32X3,
+        encoder_decoder_matmul_level=EncoderDecoderMatmulLevel.TF32,
+    )
+    cfg.validate()
+    object.__setattr__(cfg, "window_attn_tf32_mode", "bf16pv")
+    with pytest.raises(ValueError, match="must agree"):
+        cfg.validate()
+
+
 def test_apply_inference_config_expands_constructor_kwargs() -> None:
     assert apply_inference_config("fast_fp32") == {
         "autocast": False,
@@ -179,6 +212,7 @@ def test_apply_inference_config_expands_constructor_kwargs() -> None:
         "backbone_matmul_bf16": False,
         "backbone_matmul_tf32": False,
         "window_attn_compute_dtype": "float32",
+        "window_attn_tf32_mode": "bf16pv",
         "use_triton_layout": True,
         "use_triton_adaln": True,
         "use_triton_mlp": False,

@@ -232,7 +232,15 @@ class WindowOnlineSoftmax:
         self,
         final_scale: Float32 = 1.0,
         use_fastmath: cutlass.Constexpr[bool] = True,
+        use_fast_rcp: cutlass.Constexpr[bool] = True,
     ) -> cute.Tensor:
+        """Normalise the accumulated rows.
+
+        ``use_fast_rcp`` is independent of ``use_fastmath``: the reciprocal of the
+        row sum goes through ``rcp.approx`` regardless of how ``exp2``/``log2``
+        were evaluated, so a kernel aiming for FP32-grade output has to turn both
+        off.
+        """
         row_sum, row_max = self.row_sum, self.row_max
         scale_log2 = self.scale_log2
         rs = row_sum.load()
@@ -249,9 +257,11 @@ class WindowOnlineSoftmax:
 
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
-            row_scale[r] = (
-                cute.arch.rcp_approx(row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)
-            ) * final_scale
+            row_sum_safe = row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0
+            if cutlass.const_expr(use_fast_rcp):
+                row_scale[r] = cute.arch.rcp_approx(row_sum_safe) * final_scale
+            else:
+                row_scale[r] = (1.0 / row_sum_safe) * final_scale
             row_sum_cur = row_sum[r]
             row_sum[r] = (
                 (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=use_fastmath))

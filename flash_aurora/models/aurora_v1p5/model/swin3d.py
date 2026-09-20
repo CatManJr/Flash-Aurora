@@ -134,6 +134,7 @@ class WindowAttention(nn.Module):
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
         cute_window_attn_dtype: torch.dtype = torch.float32,
+        cute_window_attn_tf32_mode: str = "bf16pv",
     ) -> None:
         """Initialise.
 
@@ -171,6 +172,7 @@ class WindowAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.use_cute_window_attn = use_cute_window_attn
         self.cute_window_attn_dtype = cute_window_attn_dtype
+        self.cute_window_attn_tf32_mode = cute_window_attn_tf32_mode
 
         self.attn_drop = attn_drop
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -193,6 +195,18 @@ class WindowAttention(nn.Module):
         else:
             self.lora_proj = lambda *args, **kwargs: 0  # type: ignore
             self.lora_qkv = lambda *args, **kwargs: 0  # type: ignore
+
+    def _cute_fp32_precision(self):
+        """Which CuTe kernel serves FP32 window attention.
+
+        Both kernels take FP32 tensors, so ``cute_window_attn_dtype`` cannot tell
+        them apart and the choice rides on its own axis.
+        """
+        from flash_aurora.models.ops.cute import WinAttnPrecision
+
+        if self.cute_window_attn_tf32_mode == "x3":
+            return WinAttnPrecision.TF32X3
+        return WinAttnPrecision.TF32_BF16PV
 
     def _state_token(self, linear: nn.Linear, lora: LoRARollout, step: int) -> tuple[int, int, int, int, int]:
         layer = lora.layer_for_step(step)
@@ -344,6 +358,7 @@ class WindowAttention(nn.Module):
                 self.num_heads,
                 bias=bias,
                 output_layout="bnc",
+                fp32_precision=self._cute_fp32_precision(),
             )
         else:
             qkv = rearrange(qkv, "B N (qkv H D) -> qkv B H N D", H=self.num_heads, qkv=3)
@@ -360,7 +375,7 @@ class WindowAttention(nn.Module):
                 precision = (
                     WinAttnPrecision.BF16_MIXED
                     if q.dtype == torch.bfloat16
-                    else WinAttnPrecision.TF32_BF16PV
+                    else self._cute_fp32_precision()
                 )
                 # Bias kept as float32: the CuTeDSL kernel takes FP32 bias.
                 bias = None
@@ -633,6 +648,7 @@ class Swin3DTransformerBlock(nn.Module):
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
         cute_window_attn_dtype: torch.dtype = torch.float32,
+        cute_window_attn_tf32_mode: str = "bf16pv",
     ) -> None:
         """Initialise.
 
@@ -696,6 +712,7 @@ class Swin3DTransformerBlock(nn.Module):
             use_lora_merged_inference=use_lora_merged_inference,
             use_cute_window_attn=use_cute_window_attn,
             cute_window_attn_dtype=cute_window_attn_dtype,
+            cute_window_attn_tf32_mode=cute_window_attn_tf32_mode,
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -967,6 +984,7 @@ class BasicLayer3D(nn.Module):
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
         cute_window_attn_dtype: torch.dtype = torch.float32,
+        cute_window_attn_tf32_mode: str = "bf16pv",
     ) -> None:
         """Initialise.
 
@@ -1036,6 +1054,7 @@ class BasicLayer3D(nn.Module):
                     use_lora_merged_inference=use_lora_merged_inference,
                     use_cute_window_attn=use_cute_window_attn,
                     cute_window_attn_dtype=cute_window_attn_dtype,
+                    cute_window_attn_tf32_mode=cute_window_attn_tf32_mode,
                 )
                 for i in range(depth)
             ]
@@ -1122,6 +1141,7 @@ class Swin3DTransformerBackbone(nn.Module):
         use_lora_merged_inference: bool = False,
         use_cute_window_attn: bool = False,
         cute_window_attn_dtype: torch.dtype = torch.float32,
+        cute_window_attn_tf32_mode: str = "bf16pv",
         workspace_pool: Optional[InferenceWorkspacePool] = None,
         stochastic: bool = False,
         use_updated_lead_time_embedding: bool = False,
@@ -1231,6 +1251,7 @@ class Swin3DTransformerBackbone(nn.Module):
                 use_lora_merged_inference=use_lora_merged_inference,
                 use_cute_window_attn=use_cute_window_attn,
                 cute_window_attn_dtype=cute_window_attn_dtype,
+                cute_window_attn_tf32_mode=cute_window_attn_tf32_mode,
             )
             self.encoder_layers.append(layer)
             if self.stochastic and downsample is not None:
@@ -1261,6 +1282,7 @@ class Swin3DTransformerBackbone(nn.Module):
                 use_lora_merged_inference=use_lora_merged_inference,
                 use_cute_window_attn=use_cute_window_attn,
                 cute_window_attn_dtype=cute_window_attn_dtype,
+                cute_window_attn_tf32_mode=cute_window_attn_tf32_mode,
             )
             self.decoder_layers.append(layer)
 

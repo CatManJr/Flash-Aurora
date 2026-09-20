@@ -118,6 +118,63 @@ def _tf32_bf16pv_smem_bytes(
     )
 
 
+def _tf32x3_smem_bytes(
+    tile_n: int,
+    head_dim: int,
+    tile_m: int = 64,
+    num_stages: int = 1,
+) -> int:
+    """Bytes for the 3xTF32 kernel SMEM: FP32 ``sQ``, ``sK`` and ``sV``.
+
+    V is FP32 here rather than BF16, since the PV MMA is TF32 and there is no
+    downcast to exploit.
+    """
+    return (
+        tile_m * head_dim * 4
+        + tile_n * head_dim * 4 * num_stages
+        + tile_n * head_dim * 4 * num_stages
+    )
+
+
+def _choose_tile_n_tf32x3(
+    seq_len: int,
+    head_dim: int = 64,
+    tile_m: int = 64,
+    smem_budget_bytes: Optional[int] = None,
+) -> int:
+    """Choose tile_n for the 3xTF32 kernel (FP32 Q/K/V).
+
+    SMEM layout (matches ``WindowAttnFwdTF32x3``)::
+
+        sQ : tile_m  x head_dim x 4B
+        sK : tile_n  x head_dim x 4B x num_stages
+        sV : tile_n  x head_dim x 4B x num_stages
+
+    The FP32 V costs twice what the BF16-PV kernel's V does, so a given budget
+    admits a smaller tile_n; at ``head_dim=64`` this is why ``tile_m=128`` no
+    longer keeps ``seq_len=144`` in a single pass.
+    """
+    if smem_budget_bytes is None:
+        smem_budget_bytes = _get_smem_budget_bytes()
+
+    sQ_bytes = tile_m * head_dim * 4
+    kv_single = head_dim * 8
+    kv_stream = head_dim * 16
+
+    max_tile_n_full = (smem_budget_bytes - sQ_bytes) // kv_single
+    max_tile_n_full = max((max_tile_n_full // 16) * 16, 16)
+
+    if seq_len <= max_tile_n_full:
+        capped = min(seq_len, max_tile_n_full)
+        return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
+
+    half_budget = smem_budget_bytes // 2
+    max_tile_n_half = max((half_budget - sQ_bytes) // kv_stream, 0)
+    max_tile_n_half = max((max_tile_n_half // 16) * 16, 16)
+    capped = min(seq_len, max_tile_n_half)
+    return max(16, (capped // 16) * 16) if capped >= 16 else max(capped, 8)
+
+
 def _choose_tile_n_tf32_bf16pv(
     seq_len: int,
     head_dim: int = 64,

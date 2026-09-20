@@ -136,6 +136,24 @@ def test_no_bf16_routing_uses_tf32_fused_precision() -> None:
     assert row.disable_cute is False
 
 
+def test_tf32x3_row_keeps_fused_path() -> None:
+    """The 3xTF32 row swaps only the attention kernel, not the fused Swin path."""
+    row = get_row("tf32x3_attention")
+    assert row.precision == "tf32x3@fp32"
+    assert row.disable_layout is False
+    assert row.disable_adaln is False
+    assert row.disable_cute is False
+
+
+def test_tf32x3_row_precision_resolves() -> None:
+    from flash_aurora.models.inference_precision import resolve_inference_config
+
+    cfg = resolve_inference_config(get_row("tf32x3_attention").precision)
+    assert cfg is not None
+    assert cfg.window_attn_tf32_mode == "x3"
+    assert cfg.use_cute_window_attn is True
+
+
 def test_intervals_overlap() -> None:
     assert intervals_overlap(10.0, 1.0, 10.5, 1.0) is True
     assert intervals_overlap(10.0, 0.1, 20.0, 0.1) is False

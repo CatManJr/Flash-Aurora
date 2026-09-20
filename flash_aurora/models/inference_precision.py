@@ -31,7 +31,13 @@ from enum import Enum
 from typing import Literal
 
 BackboneComputeDtype = Literal["float32", "bfloat16"]
-KernelProfile = Literal["baseline", "fast_fp32", "tf32_backbone", "bf16_mixed_backbone"]
+KernelProfile = Literal[
+    "baseline", "fast_fp32", "tf32_backbone", "tf32x3_backbone", "bf16_mixed_backbone"
+]
+
+# Which CuTe kernel serves FP32 window attention.  ``window_attn_compute_dtype``
+# cannot distinguish them, since both take FP32 tensors.
+WindowAttnTF32Mode = Literal["bf16pv", "x3"]
 
 
 class BackboneMatmulLevel(str, Enum):
@@ -39,6 +45,7 @@ class BackboneMatmulLevel(str, Enum):
 
     FP32 = "fp32"
     TF32 = "tf32"
+    TF32X3 = "tf32x3"
     BF16_MIXED = "bf16_mixed"
     BF16 = "bf16"
 
@@ -57,6 +64,7 @@ class AuroraInferencePrecision(str, Enum):
     PYTORCH_AUTOCAST = "pytorch_autocast"
     FAST_FP32 = "fast_fp32"
     TF32 = "tf32"
+    TF32X3 = "tf32x3"
     BF16_MIXED = "bf16_mixed"
     BF16 = "bf16"
 
@@ -66,16 +74,19 @@ CudaGraphScope = Literal["off", "backbone", "full_gpu"]
 _BACKBONE_LEVEL_TO_KERNEL: dict[BackboneMatmulLevel, KernelProfile] = {
     BackboneMatmulLevel.FP32: "fast_fp32",
     BackboneMatmulLevel.TF32: "tf32_backbone",
+    BackboneMatmulLevel.TF32X3: "tf32x3_backbone",
     BackboneMatmulLevel.BF16_MIXED: "bf16_mixed_backbone",
     BackboneMatmulLevel.BF16: "bf16_mixed_backbone",
 }
+
+_TF32_BACKBONE_LEVELS = (BackboneMatmulLevel.TF32, BackboneMatmulLevel.TF32X3)
 
 
 def backbone_matmul_flags(level: BackboneMatmulLevel) -> tuple[bool, bool]:
     """Return ``(backbone_matmul_bf16, backbone_matmul_tf32)``."""
     if level == BackboneMatmulLevel.FP32:
         return False, False
-    if level == BackboneMatmulLevel.TF32:
+    if level in _TF32_BACKBONE_LEVELS:
         return False, True
     if level == BackboneMatmulLevel.BF16_MIXED:
         return True, True
@@ -101,6 +112,7 @@ class _KernelProfileSpec:
     use_triton_perceiver_ln_fusion: bool
     cuda_graph_scope: CudaGraphScope
     cuda_graph_recommended: bool
+    window_attn_tf32_mode: WindowAttnTF32Mode = "bf16pv"
 
 
 _KERNEL_PROFILES: dict[KernelProfile, _KernelProfileSpec] = {
@@ -132,6 +144,19 @@ _KERNEL_PROFILES: dict[KernelProfile, _KernelProfileSpec] = {
         autocast_backbone=False,
         backbone_compute_dtype="float32",
         window_attn_compute_dtype="float32",
+        use_triton_layout=True,
+        use_triton_adaln=True,
+        use_triton_mlp=False,
+        use_cute_window_attn=True,
+        use_triton_perceiver_ln_fusion=False,
+        cuda_graph_scope="backbone",
+        cuda_graph_recommended=True,
+    ),
+    "tf32x3_backbone": _KernelProfileSpec(
+        autocast_backbone=False,
+        backbone_compute_dtype="float32",
+        window_attn_compute_dtype="float32",
+        window_attn_tf32_mode="x3",
         use_triton_layout=True,
         use_triton_adaln=True,
         use_triton_mlp=False,
@@ -185,6 +210,11 @@ _PRESET_GRID: dict[AuroraInferencePrecision, _PresetGridCell] = {
         BackboneMatmulLevel.TF32,
         EncoderDecoderMatmulLevel.TF32,
     ),
+    AuroraInferencePrecision.TF32X3: _PresetGridCell(
+        "tf32x3_backbone",
+        BackboneMatmulLevel.TF32X3,
+        EncoderDecoderMatmulLevel.TF32,
+    ),
     AuroraInferencePrecision.BF16_MIXED: _PresetGridCell(
         "bf16_mixed_backbone",
         BackboneMatmulLevel.BF16_MIXED,
@@ -230,6 +260,7 @@ class AuroraInferenceConfig:
     autocast_encoder_decoder: bool
     cuda_graph_scope: CudaGraphScope
     cuda_graph_recommended: bool
+    window_attn_tf32_mode: WindowAttnTF32Mode = "bf16pv"
 
     def validate(self) -> None:
         if self.use_triton_perceiver_ln_fusion:
@@ -273,8 +304,17 @@ class AuroraInferenceConfig:
                 raise ValueError("bf16/bf16_mixed backbone requires kernel_profile=bf16_mixed_backbone.")
             if self.window_attn_compute_dtype != "bfloat16":
                 raise ValueError("bf16 backbone requires CuTe BF16 window attention.")
-        if self.backbone_matmul_level == BackboneMatmulLevel.TF32 and not self.backbone_matmul_tf32:
-            raise ValueError("backbone_matmul_level=tf32 requires backbone_matmul_tf32=True.")
+        if self.backbone_matmul_level in _TF32_BACKBONE_LEVELS and not self.backbone_matmul_tf32:
+            raise ValueError(
+                f"backbone_matmul_level={self.backbone_matmul_level.value} requires "
+                "backbone_matmul_tf32=True."
+            )
+        if (self.window_attn_tf32_mode == "x3") != (
+            self.kernel_profile == "tf32x3_backbone"
+        ):
+            raise ValueError(
+                "window_attn_tf32_mode='x3' and kernel_profile='tf32x3_backbone' must agree."
+            )
         if self.backbone_matmul_level == BackboneMatmulLevel.FP32 and (
             self.backbone_matmul_bf16 or self.backbone_matmul_tf32
         ):
@@ -293,9 +333,14 @@ class AuroraInferenceConfig:
                 raise ValueError("fast_fp32 profile must not enable CuTe window attention.")
             if self.use_triton_mlp:
                 raise ValueError("fast_fp32 profile must use PyTorch GELU (use_triton_mlp=False).")
-        if self.kernel_profile == "tf32_backbone":
+        if self.kernel_profile in ("tf32_backbone", "tf32x3_backbone"):
             if not self.use_cute_window_attn or self.window_attn_compute_dtype != "float32":
-                raise ValueError("tf32_backbone profile requires CuTe TF32 window attention.")
+                raise ValueError(
+                    f"{self.kernel_profile} profile requires CuTe FP32 window attention."
+                )
+        if self.kernel_profile == "tf32x3_backbone":
+            if self.backbone_matmul_level != BackboneMatmulLevel.TF32X3:
+                raise ValueError("tf32x3_backbone profile requires backbone_matmul_level=tf32x3.")
         if self.kernel_profile == "bf16_mixed_backbone":
             if not self.use_cute_window_attn or self.window_attn_compute_dtype != "bfloat16":
                 raise ValueError("bf16_mixed_backbone profile requires CuTe BF16 window attention.")
@@ -421,6 +466,11 @@ def describe_backbone_matmul_level(level: BackboneMatmulLevel) -> str:
         return "backbone matmul FP32 (strict, no TF32/BF16 hooks)"
     if level == BackboneMatmulLevel.TF32:
         return "backbone matmul TF32 tensor cores"
+    if level == BackboneMatmulLevel.TF32X3:
+        return (
+            "backbone matmul TF32 tensor cores; window attention emulates FP32 with "
+            "3xTF32 on both matmuls"
+        )
     if level == BackboneMatmulLevel.BF16_MIXED:
         return "backbone matmul hybrid: BF16 attention QKV/proj + BF16 MLP; TF32 elsewhere"
     return (
@@ -454,7 +504,8 @@ def describe_inference_config(cfg: AuroraInferenceConfig) -> str:
     else:
         parts.append("PyTorch Swin (no Triton/CuTe)")
     if prof.use_cute_window_attn:
-        parts.append(f"CuTe window attention ({prof.window_attn_compute_dtype})")
+        mode = "3xTF32" if prof.window_attn_tf32_mode == "x3" else prof.window_attn_compute_dtype
+        parts.append(f"CuTe window attention ({mode})")
     elif cfg.kernel_profile != "baseline":
         parts.append("PyTorch window SDPA")
     parts.append(f"backbone activations {prof.backbone_compute_dtype}")
@@ -503,6 +554,7 @@ def build_inference_config(
         backbone_matmul_bf16=bb_bf16,
         backbone_matmul_tf32=bb_tf32,
         window_attn_compute_dtype=prof.window_attn_compute_dtype,
+        window_attn_tf32_mode=prof.window_attn_tf32_mode,
         use_triton_layout=prof.use_triton_layout,
         use_triton_adaln=prof.use_triton_adaln,
         use_triton_mlp=prof.use_triton_mlp,
@@ -648,7 +700,9 @@ def expand_precision_combos(
 
 
 # Default 4x2 custom matmul grid (Triton/CuTe Swin + native Perceiver).
-DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS: tuple[str, ...] = ("fp32", "tf32", "bf16_mixed", "bf16")
+DEFAULT_CUSTOM_COMBO_BACKBONE_LEVELS: tuple[str, ...] = (
+    "fp32", "tf32x3", "tf32", "bf16_mixed", "bf16",
+)
 DEFAULT_CUSTOM_COMBO_ENCODER_DECODER_LEVELS: tuple[str, ...] = ("fp32", "tf32")
 
 
@@ -677,6 +731,7 @@ def apply_inference_config(
         "backbone_matmul_bf16": cfg.backbone_matmul_bf16,
         "backbone_matmul_tf32": cfg.backbone_matmul_tf32,
         "window_attn_compute_dtype": cfg.window_attn_compute_dtype,
+        "window_attn_tf32_mode": cfg.window_attn_tf32_mode,
         "use_triton_layout": cfg.use_triton_layout,
         "use_triton_adaln": cfg.use_triton_adaln,
         "use_triton_mlp": cfg.use_triton_mlp,

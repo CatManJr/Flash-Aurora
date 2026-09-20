@@ -30,6 +30,7 @@ from bench_indepth_eval import (  # noqa: E402
 PRODUCTION_PRECISION = "bf16_mixed@fp32"
 FP32_PRECISION = "fp32"
 TF32_FUSED_PRECISION = "tf32@fp32"
+TF32X3_FUSED_PRECISION = "tf32x3@fp32"
 AUTOCAST_PRECISION = "pytorch_autocast"
 COMPILE_EXTRA_WARMUP = 8
 DEFAULT_WARMUP = 3
@@ -81,6 +82,12 @@ LOO_ROWS: tuple[LooRow, ...] = (
         row_id="no_bf16_routing",
         precision=TF32_FUSED_PRECISION,
         mechanism="BF16 mixed-precision routing",
+    ),
+    LooRow(
+        row_id="tf32x3_attention",
+        precision=TF32X3_FUSED_PRECISION,
+        mechanism="3xTF32 window attention at FP32-grade accuracy",
+        kind=KIND_BASELINE,
     ),
     LooRow(
         row_id="unfused_fp32",

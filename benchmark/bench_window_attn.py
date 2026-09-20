@@ -187,12 +187,14 @@ def check_accuracy_batch(
     atol_bf16: float = 2e-2,
     rtol_tf32: float = 1e-3,
     atol_tf32: float = 1e-3,
-) -> tuple[bool, float, float]:
-    """Return (all_pass, worst_bf16_err, worst_tf32_err)."""
-    worst_bf, worst_tf = 0.0, 0.0
+    rtol_tf32x3: float = 1e-5,
+    atol_tf32x3: float = 1e-5,
+) -> tuple[bool, float, float, float]:
+    """Return (all_pass, worst_bf16_err, worst_tf32_err, worst_tf32x3_err)."""
+    worst_bf, worst_tf, worst_x3 = 0.0, 0.0, 0.0
     all_ok = True
     if not _CUTE_AVAILABLE:
-        return True, 0.0, 0.0
+        return True, 0.0, 0.0, 0.0
 
     for Bwin, H, N, Dh, _ in shapes:
         r_bf = _check_one_shape(
@@ -211,10 +213,19 @@ def check_accuracy_batch(
             rtol=rtol_tf32,
             atol=atol_tf32,
         )
+        r_x3 = _check_one_shape(
+            Bwin, H, N, Dh,
+            masked=masked,
+            precision=WinAttnPrecision.TF32X3,
+            dtype=torch.float32,
+            rtol=rtol_tf32x3,
+            atol=atol_tf32x3,
+        )
         worst_bf = max(worst_bf, r_bf.max_abs)
         worst_tf = max(worst_tf, r_tf.max_abs)
-        all_ok = all_ok and r_bf.ok and r_tf.ok
-    return all_ok, worst_bf, worst_tf
+        worst_x3 = max(worst_x3, r_x3.max_abs)
+        all_ok = all_ok and r_bf.ok and r_tf.ok and r_x3.ok
+    return all_ok, worst_bf, worst_tf, worst_x3
 
 
 def run_checkpoint_coverage() -> bool:
@@ -227,9 +238,9 @@ def run_checkpoint_coverage() -> bool:
     )
     print(
         f"{'shape':<32} {'tile_m/n':>10} {'bf16':>5} {'+mask':>6} "
-        f"{'tf32':>5} {'+mask':>6} {'max_abs':>10}  checkpoints"
+        f"{'tf32':>5} {'+mask':>6} {'tf32x3':>7} {'+mask':>6} {'max_abs':>10}  checkpoints"
     )
-    print("-" * 110)
+    print("-" * 125)
 
     all_ok = True
     if not _CUTE_AVAILABLE:
@@ -247,6 +258,8 @@ def run_checkpoint_coverage() -> bool:
             ("+mask", True, WinAttnPrecision.BF16_MIXED, torch.bfloat16, 2e-2, 2e-2),
             ("tf32", False, WinAttnPrecision.TF32_BF16PV, torch.float32, 1e-3, 1e-3),
             ("+mask", True, WinAttnPrecision.TF32_BF16PV, torch.float32, 1e-3, 1e-3),
+            ("tf32x3", False, WinAttnPrecision.TF32X3, torch.float32, 1e-5, 1e-5),
+            ("+mask", True, WinAttnPrecision.TF32X3, torch.float32, 1e-5, 1e-5),
         )
         cells: list[str] = []
         worst = 0.0
@@ -444,15 +457,15 @@ def main() -> None:
     coverage_ok = run_checkpoint_coverage()
 
     acc_shapes = SHAPES_MICRO + SHAPES_ALL
-    ok_nomask, wbf, wtf = check_accuracy_batch(acc_shapes, masked=False)
-    ok_mask, wbf_m, wtf_m = check_accuracy_batch(SHAPES_ALL, masked=True)
+    ok_nomask, wbf, wtf, wx3 = check_accuracy_batch(acc_shapes, masked=False)
+    ok_mask, wbf_m, wtf_m, wx3_m = check_accuracy_batch(SHAPES_ALL, masked=True)
     tag = lambda ok: "PASS" if ok else "FAIL"
     print(
         f"\nAccuracy vs FP32 SDPA (micro + all checkpoints): "
         f"nomask {tag(ok_nomask)} "
-        f"(max_abs BF16={wbf:.2e} TF32={wtf:.2e}) | "
+        f"(max_abs BF16={wbf:.2e} TF32={wtf:.2e} TF32X3={wx3:.2e}) | "
         f"masked -100 {tag(ok_mask)} "
-        f"(max_abs BF16={wbf_m:.2e} TF32={wtf_m:.2e})"
+        f"(max_abs BF16={wbf_m:.2e} TF32={wtf_m:.2e} TF32X3={wx3_m:.2e})"
     )
     if not coverage_ok:
         print("WARNING: checkpoint coverage reported failures above.")
@@ -504,6 +517,14 @@ def main() -> None:
             baseline_col="sdpa_ms",
             make_baseline=sdpa_fp32,
         )
+        run_perf_table(
+            SHAPES_ALL,
+            title="No mask — all checkpoint shapes (3xTF32; ~1000x tighter than TF32)",
+            dtype=torch.float32,
+            cute_precision=WinAttnPrecision.TF32X3,
+            baseline_col="sdpa_ms",
+            make_baseline=sdpa_fp32,
+        )
 
     # --- Masked Swin bias -100 (all checkpoint shapes) ---
     print("\nMasked Swin bias -100 (all checkpoint shapes, nW=1)")
@@ -523,6 +544,15 @@ def main() -> None:
             title="Masked — TF32 CuTe vs FP32 SDPA + attn_mask",
             dtype=torch.float32,
             cute_precision=WinAttnPrecision.TF32_BF16PV,
+            baseline_col="sdpa_ms",
+            make_baseline=sdpa_fp32,
+            bias=bias144,
+        )
+        run_perf_table(
+            SHAPES_ALL,
+            title="Masked — 3xTF32 CuTe vs FP32 SDPA + attn_mask",
+            dtype=torch.float32,
+            cute_precision=WinAttnPrecision.TF32X3,
             baseline_col="sdpa_ms",
             make_baseline=sdpa_fp32,
             bias=bias144,
