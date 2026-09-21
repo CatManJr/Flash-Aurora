@@ -113,15 +113,15 @@ def _forward_decoder_slice(
     use_tensor_core: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from flash_aurora.models.aurora.model.custom_op_paths import (
-        backbone_tf32_matmul_context,
         encoder_decoder_autocast,
+        encoder_decoder_matmul_context,
     )
 
     c_levels, h_patches, w_patches = patch_res
     batch_size = x.shape[0]
 
     with encoder_decoder_autocast(enabled=autocast_bf16):
-        with backbone_tf32_matmul_context(enabled=use_tensor_core):
+        with encoder_decoder_matmul_context(use_tensor_core=use_tensor_core):
             x = rearrange(
                 x,
                 "B (C H W) D -> B (H W) C D",

@@ -417,6 +417,44 @@ def test_encoder_decoder_routing_enables_tf32_flags() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_encoder_decoder_fp32_routing_is_ieee_fp32() -> None:
+    from flash_aurora.models.aurora.model.custom_op_paths import run_with_encoder_decoder_routing
+
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    def _noop() -> None:
+        assert torch.get_float32_matmul_precision() == "highest"
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+
+    with torch.inference_mode():
+        run_with_encoder_decoder_routing(_noop, use_tensor_core=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mixed_backbone_context_does_not_leak_tf32_into_perceiver() -> None:
+    from flash_aurora.models.aurora.model.custom_op_paths import (
+        backbone_bf16_mixed_matmul_context,
+        encoder_decoder_fp32_matmul_context,
+    )
+
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    with backbone_bf16_mixed_matmul_context(enabled=True):
+        assert torch.get_float32_matmul_precision() == "high"
+        assert torch.backends.cuda.matmul.allow_tf32 is True
+    assert torch.get_float32_matmul_precision() == "highest"
+    assert torch.backends.cuda.matmul.allow_tf32 is False
+    assert torch.backends.cudnn.allow_tf32 is False
+    with encoder_decoder_fp32_matmul_context():
+        assert torch.get_float32_matmul_precision() == "highest"
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fast_fp32_backbone_matches_fp32_pytorch_path() -> None:
     """Triton layout+AdaLN with PyTorch GELU should match pure PyTorch backbone."""
     from datetime import timedelta

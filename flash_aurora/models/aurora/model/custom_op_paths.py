@@ -148,6 +148,35 @@ def run_with_encoder_decoder_autocast(
     )
 
 
+@contextmanager
+def encoder_decoder_fp32_matmul_context() -> Iterator[None]:
+    """Strict IEEE FP32 Perceiver matmuls: no TF32 tensor cores."""
+    prev_precision = torch.get_float32_matmul_precision()
+    prev_cuda_tf32 = torch.backends.cuda.matmul.allow_tf32
+    prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    torch.set_float32_matmul_precision("highest")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prev_precision)
+        torch.backends.cuda.matmul.allow_tf32 = prev_cuda_tf32
+        torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+
+@contextmanager
+def encoder_decoder_matmul_context(*, use_tensor_core: bool) -> Iterator[None]:
+    """Perceiver encoder/decoder matmul: TF32 tensor cores or naive IEEE FP32."""
+    if use_tensor_core:
+        with backbone_tf32_matmul_context(enabled=True):
+            yield
+        return
+    with encoder_decoder_fp32_matmul_context():
+        yield
+
+
 def run_with_encoder_decoder_routing(
     fn: Callable[..., _T],
     *args: Any,
@@ -155,9 +184,13 @@ def run_with_encoder_decoder_routing(
     use_tensor_core: bool = False,
     **kwargs: Any,
 ) -> _T:
-    """Encoder/decoder forward with optional BF16 autocast and/or TF32 ``F.linear`` matmul."""
+    """Encoder/decoder forward with optional BF16 autocast and/or TF32 ``F.linear`` matmul.
+
+    ``use_tensor_core=False`` forces IEEE FP32 (``highest``, TF32 flags off). It is not
+    a no-op: leftover backbone TF32 flags must not reach the Perceiver.
+    """
     with encoder_decoder_autocast(enabled=autocast_bf16):
-        with backbone_tf32_matmul_context(enabled=use_tensor_core):
+        with encoder_decoder_matmul_context(use_tensor_core=use_tensor_core):
             return fn(*args, **kwargs)
 
 
@@ -200,6 +233,9 @@ def backbone_bf16_mixed_matmul_context(*, enabled: bool) -> Iterator[None]:
 
     _orig_layer_norm = torch.nn.functional.layer_norm
     _orig_linear = torch.nn.functional.linear
+    prev_precision = torch.get_float32_matmul_precision()
+    prev_cuda_tf32 = torch.backends.cuda.matmul.allow_tf32
+    prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
 
     def _enable_tf32_flags() -> None:
         torch.set_float32_matmul_precision("high")
@@ -242,10 +278,6 @@ def backbone_bf16_mixed_matmul_context(*, enabled: bool) -> Iterator[None]:
             _enable_tf32_flags()
             return _orig_linear(input, weight, bias)
         return _orig_linear(input, weight, bias)
-
-    prev_precision = torch.get_float32_matmul_precision()
-    prev_cuda_tf32 = torch.backends.cuda.matmul.allow_tf32
-    prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
 
     token = _bf16_matmul_routing.set(True)
     hybrid_token = _bf16_hybrid_matmul.set(True)
