@@ -4,12 +4,15 @@
 Each tier rolls out independently from the same initial condition. Step k of a
 candidate is compared to step k of the reference trajectory (not teacher-forced).
 This is implementation fidelity under AR feedback, not WeatherBench skill.
+Perceiver encoder/decoder stays FP32; only the backbone may change
+(``bf16_mixed@fp32``, ``tf32@fp32``, ``tf32x3@fp32``). Named ``tf32`` / ``tf32x3``
+/ ``bf16_mixed`` presets are rejected because they turn on Perceiver TF32.
 
 Example::
 
     export AURORA_ASSET_ROOT=/path/to/data/aurora
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_rollout_drift.py \\
-        --presets era5_pretrained cams --steps 40
+        --presets era5_pretrained cams --horizon-hours 240
 """
 
 from __future__ import annotations
@@ -19,7 +22,11 @@ import gc
 import json
 import os
 import random
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -52,12 +59,16 @@ from _pretrained_era5 import (  # noqa: E402
 import torch
 
 _BENCHMARK_SEED = 42
+MEDIUM_RANGE_LEAD_HOURS = 240
 _DEFAULT_TIERS: tuple[str, ...] = (
     _PYTORCH_BASELINE_KEY,
     "bf16_mixed@fp32",
     "tf32@fp32",
+    "tf32x3@fp32",
     "pytorch_backbone_autocast_bf16_encoder_decoder_fp32",
 )
+_NAMED_PRESETS_WITH_PERCEIVER_TF32 = frozenset({"tf32", "tf32x3", "bf16_mixed"})
+CLOSEDLOOP_WORKER = Path(_BENCH_DIR) / "_closedloop_tier_worker.py"
 _PRESET_PLOT_ORDER: tuple[str, ...] = (
     "era5_pretrained",
     "small_pretrained",
@@ -86,6 +97,55 @@ def set_benchmark_seed(seed: int = _BENCHMARK_SEED) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def require_perceiver_fp32(precision: str) -> None:
+    """Closed-loop may change the backbone; Perceiver encoder/decoder stay FP32."""
+    raw = precision.strip().lower().replace("-", "_")
+    if raw in _NAMED_PRESETS_WITH_PERCEIVER_TF32:
+        raise ValueError(
+            f"{precision!r} turns on Perceiver TF32; use {raw}@fp32 so encoder/decoder stay FP32."
+        )
+    from flash_aurora.models.inference_precision import (
+        EncoderDecoderMatmulLevel,
+        resolve_inference_config,
+    )
+
+    if raw in {label for label, _p, _d in pytorch_reference_tiers()}:
+        return
+    cfg = resolve_inference_config(precision)
+    if cfg is None:
+        raise ValueError(f"Could not resolve inference tier {precision!r}.")
+    if cfg.encoder_decoder_matmul_level != EncoderDecoderMatmulLevel.FP32:
+        raise ValueError(
+            f"{precision!r} sets Perceiver encoder/decoder to "
+            f"{cfg.encoder_decoder_matmul_level.value}; closed-loop requires FP32."
+        )
+
+
+def steps_for_horizon(horizon_hours: int, timestep_hours: float) -> int:
+    if timestep_hours <= 0:
+        raise ValueError(f"timestep_hours must be positive, got {timestep_hours}")
+    steps = int(round(horizon_hours / timestep_hours))
+    if steps < 1:
+        raise ValueError(f"horizon {horizon_hours} h is shorter than one {timestep_hours:g} h step")
+    reconstructed = steps * timestep_hours
+    if abs(reconstructed - horizon_hours) > 1e-6:
+        raise ValueError(
+            f"horizon {horizon_hours} h is not an integer number of {timestep_hours:g} h steps"
+        )
+    return steps
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _atomic_save(obj: Any, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(path)
 
 
 def resolve_tier_specs(names: list[str]) -> list[tuple[str, str]]:
@@ -133,7 +193,7 @@ def rollout_tensors(
     *,
     steps: int,
     device: torch.device,
-) -> tuple[list[dict[str, torch.Tensor]], float]:
+) -> tuple[list[dict[str, torch.Tensor]], float, float]:
     from flash_aurora.engine.core.model_protocol import model_uses_v1p5_rollout
     from flash_aurora.models.aurora.rollout import rollout as legacy_rollout
     from flash_aurora.models.aurora_v1p5.rollout import rollout as v1p5_rollout
@@ -147,16 +207,19 @@ def rollout_tensors(
         else legacy_rollout(model, batch, steps)
     )
     preds: list[dict[str, torch.Tensor]] = []
+    t0 = time.perf_counter()
     with torch.inference_mode():
         for pred in stream:
             preds.append(prediction_tensors(pred))
             del pred
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+    _synchronize(device)
+    forecast_s = time.perf_counter() - t0
     peak_gib = 0.0
     if device.type == "cuda":
         peak_gib = torch.cuda.max_memory_allocated(device) / (1024.0**3)
-    return preds, peak_gib
+    return preds, peak_gib, forecast_s
 
 
 def compare_step(
@@ -187,6 +250,34 @@ def compare_step(
     }
 
 
+def format_forecast_timing_table(
+    timing: dict[str, dict[str, Any]],
+    *,
+    baseline: str,
+) -> list[str]:
+    lines = [
+        "| tier | load (s) | forecast (s) | per step (s) | peak GiB | vs FP32 forecast |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    ref_forecast = None
+    ref = timing.get(baseline)
+    if ref and ref.get("ok"):
+        ref_forecast = float(ref["forecast_s"])
+    for tier, row in timing.items():
+        if not row.get("ok"):
+            err = row.get("error", "failed")
+            lines.append(f"| {tier} | — | — | — | — | {err} |")
+            continue
+        vs = "base"
+        if tier != baseline and ref_forecast and row["forecast_s"] > 0:
+            vs = f"{ref_forecast / float(row['forecast_s']):.2f}x"
+        lines.append(
+            f"| {tier} | {row['load_s']:.1f} | {row['forecast_s']:.1f} | "
+            f"{row['per_step_s']:.2f} | {row['peak_gib']:.1f} | {vs} |"
+        )
+    return lines
+
+
 def write_markdown(
     path: Path,
     *,
@@ -200,21 +291,31 @@ def write_markdown(
         f"- PyTorch: `{payload['torch']}`",
         f"- Asset root: `{payload['asset_root']}`",
         f"- Seed: **{payload['seed']}**",
+        f"- Horizon: **{payload.get('horizon_hours', MEDIUM_RANGE_LEAD_HOURS)} h** (medium range)",
+        "- Perceiver encoder/decoder: **FP32** (backbone may be mixed / TF32 / 3xTF32)",
         "- Metric: $\\bar{e}_v=\\mathrm{mean}(|y-\\hat{y}|)/\\mathrm{mean}(|\\hat{y}|)$ at each AR step",
         "- Each tier rolls out on its own predictions from the same IC (not teacher-forced)",
         "",
     ]
     for preset, block in payload["presets"].items():
         hours = block["timestep_hours"]
-        lines.append(f"## `{preset}` ({block['steps']} steps, {hours:g} h/step)")
-        lines.append("")
         lines.append(
-            f"Peak allocated VRAM (GiB): "
-            + ", ".join(f"{k}={v:.1f}" for k, v in block["peak_gib"].items())
+            f"## `{preset}` ({block['steps']} steps, {hours:g} h/step, "
+            f"{block['steps'] * hours:g} h lead)"
         )
         lines.append("")
+        timing = block.get("timing") or {}
+        if timing:
+            lines.extend(format_forecast_timing_table(timing, baseline=payload["baseline"]))
+            lines.append("")
+        else:
+            lines.append(
+                "Peak allocated VRAM (GiB): "
+                + ", ".join(f"{k}={v:.1f}" for k, v in block["peak_gib"].items())
+            )
+            lines.append("")
         for tier, series in block["tiers"].items():
-            if tier == payload["baseline"]:
+            if tier == payload["baseline"] or not series:
                 continue
             lines.append(f"### {tier}")
             lines.append("")
@@ -222,9 +323,11 @@ def write_markdown(
             lines.append("| ---: | -------: | ---: | --- | ---: | ---: | ---: | ---: | ---: |")
             for row in series:
                 by_name = {v["name"]: v["mean_rel"] for v in row["vars"]}
+
                 def _fmt(name: str) -> str:
                     val = by_name.get(name)
                     return "—" if val is None else f"{val:.3e}"
+
                 lines.append(
                     f"| {row['step']} | {row['lead_hours']:g} | "
                     f"{row['n_fail']}/{row['n_vars']} | {row['worst_name']} | "
@@ -263,18 +366,20 @@ def plot_drift(payload: dict[str, Any], dest: Path) -> None:
     colors = {
         "bf16_mixed@fp32": "#0D7377",
         "tf32@fp32": "#C45C26",
+        "tf32x3@fp32": "#6A1B9A",
         "pytorch_backbone_autocast_bf16_encoder_decoder_fp32": "#90A4AE",
     }
     labels = {
         "bf16_mixed@fp32": "bf16_mixed@fp32",
         "tf32@fp32": "tf32@fp32",
+        "tf32x3@fp32": "tf32x3@fp32",
         "pytorch_backbone_autocast_bf16_encoder_decoder_fp32": "PyTorch autocast",
     }
     for idx, preset in enumerate(presets):
         ax = axes[idx // ncols][idx % ncols]
         block = payload["presets"][preset]
         for tier, series in block["tiers"].items():
-            if tier == payload["baseline"]:
+            if tier == payload["baseline"] or not series:
                 continue
             xs = [row["lead_hours"] for row in series]
             ys = [row["worst_rel"] for row in series]
@@ -304,6 +409,84 @@ def plot_drift(payload: dict[str, Any], dest: Path) -> None:
     plt.close(fig)
 
 
+def run_tier_isolated(
+    *,
+    preset: str,
+    precision: str,
+    steps: int,
+    asset_root: Path,
+    step_dir: Path,
+) -> dict[str, Any]:
+    """Spawn a fresh process so CuTe/Triton cannot leak VRAM across tiers."""
+    require_perceiver_fp32(precision)
+    if step_dir.exists():
+        shutil.rmtree(step_dir)
+    step_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        str(CLOSEDLOOP_WORKER),
+        "--preset",
+        preset,
+        "--precision",
+        precision,
+        "--steps",
+        str(steps),
+        "--asset-root",
+        str(asset_root),
+        "--step-dir",
+        str(step_dir),
+    ]
+    err_path = step_dir / "worker.stderr"
+    preds: list[dict[str, torch.Tensor]] = []
+    meta: dict[str, Any] = {}
+    with err_path.open("w", encoding="utf-8") as err_f:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=_REPO,
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=err_f,
+            text=True,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = msg.get("event")
+            if kind == "step":
+                path = Path(msg["path"])
+                tensors = torch.load(path, map_location="cpu", weights_only=False)
+                preds.append(tensors)
+                path.unlink(missing_ok=True)
+            elif kind == "done":
+                meta = msg
+        rc = proc.wait()
+    stderr_text = err_path.read_text(encoding="utf-8") if err_path.is_file() else ""
+    shutil.rmtree(step_dir, ignore_errors=True)
+    if rc != 0:
+        tail = stderr_text[-4000:] if stderr_text else ""
+        raise RuntimeError(
+            f"isolated closed-loop failed preset={preset!r} precision={precision!r} rc={rc}\n{tail}"
+        )
+    if len(preds) != steps:
+        raise RuntimeError(
+            f"isolated closed-loop returned {len(preds)} steps, expected {steps} "
+            f"(preset={preset!r} precision={precision!r})"
+        )
+    return {
+        "preds": preds,
+        "peak_gib": float(meta.get("peak_gib", 0.0)),
+        "load_s": float(meta.get("load_s", 0.0)),
+        "forecast_s": float(meta.get("forecast_s", 0.0)),
+        "per_step_s": float(meta.get("per_step_s", 0.0)),
+    }
+
+
 def run_preset(
     *,
     preset: str,
@@ -312,6 +495,8 @@ def run_preset(
     tier_specs: list[tuple[str, str]],
     device: torch.device,
     baseline: str,
+    isolate_tiers: bool,
+    scratch_root: Path,
 ) -> dict[str, Any]:
     batch, config = load_preset_batch(preset, asset_root)
     ckpt = checkpoint_path(config, asset_root)
@@ -321,26 +506,77 @@ def run_preset(
 
     trajectories: dict[str, list[dict[str, torch.Tensor]]] = {}
     peak_gib: dict[str, float] = {}
+    timing: dict[str, dict[str, Any]] = {}
     for label, precision in tier_specs:
+        require_perceiver_fp32(precision)
         print(f"  [load] {label} ({precision})", flush=True)
-        purge_gpu()
-        model = build_model(config, ckpt, precision=precision, device=device)
-        preds, peak = rollout_tensors(model, batch, steps=steps, device=device)
-        trajectories[label] = preds
-        peak_gib[label] = peak
-        print(f"  [done] {label}  peak={peak:.1f} GiB", flush=True)
-        del model
-        purge_gpu()
-        gc.collect()
+        try:
+            if isolate_tiers:
+                result = run_tier_isolated(
+                    preset=preset,
+                    precision=precision,
+                    steps=steps,
+                    asset_root=asset_root,
+                    step_dir=scratch_root / f"{preset}_{label}",
+                )
+                trajectories[label] = result["preds"]
+                peak_gib[label] = result["peak_gib"]
+                timing[label] = {
+                    "ok": True,
+                    "load_s": result["load_s"],
+                    "forecast_s": result["forecast_s"],
+                    "per_step_s": result["per_step_s"],
+                    "peak_gib": result["peak_gib"],
+                }
+            else:
+                purge_gpu()
+                t_load = time.perf_counter()
+                model = build_model(config, ckpt, precision=precision, device=device)
+                _synchronize(device)
+                load_s = time.perf_counter() - t_load
+                preds, peak, forecast_s = rollout_tensors(
+                    model, batch, steps=steps, device=device
+                )
+                trajectories[label] = preds
+                peak_gib[label] = peak
+                per_step_s = forecast_s / steps if steps else 0.0
+                timing[label] = {
+                    "ok": True,
+                    "load_s": load_s,
+                    "forecast_s": forecast_s,
+                    "per_step_s": per_step_s,
+                    "peak_gib": peak,
+                }
+                del model
+                purge_gpu()
+                gc.collect()
+            print(
+                f"  [done] {label}  forecast={timing[label]['forecast_s']:.1f}s  "
+                f"peak={peak_gib[label]:.1f} GiB",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"  [fail] {label}: {type(exc).__name__}: {exc}", flush=True)
+            timing[label] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            trajectories[label] = []
+            peak_gib[label] = 0.0
+            purge_gpu()
+            gc.collect()
 
-    ref_traj = trajectories[baseline]
+    ref_traj = trajectories.get(baseline) or []
     tiers_out: dict[str, Any] = {baseline: []}
+    if not ref_traj:
+        print(f"  [skip-compare] baseline {baseline} produced no trajectory", flush=True)
     for label, _precision in tier_specs:
         if label == baseline:
             continue
+        cand = trajectories.get(label) or []
+        if not cand or not ref_traj:
+            tiers_out[label] = []
+            continue
         rows = []
-        for step, (ref, cand) in enumerate(zip(ref_traj, trajectories[label]), start=1):
-            stats = compare_step(ref, cand, var_specs)
+        for step, (ref, pred) in enumerate(zip(ref_traj, cand), start=1):
+            stats = compare_step(ref, pred, var_specs)
             stats["step"] = step
             stats["lead_hours"] = step * hours
             rows.append(stats)
@@ -350,10 +586,14 @@ def run_preset(
                 flush=True,
             )
         tiers_out[label] = rows
+        del cand
+        trajectories[label] = []
+        gc.collect()
     return {
         "steps": steps,
         "timestep_hours": hours,
         "peak_gib": peak_gib,
+        "timing": timing,
         "tiers": tiers_out,
     }
 
@@ -367,11 +607,49 @@ def main() -> None:
         default=list(PRECISION_PRESETS),
         choices=list(PRECISION_PRESETS),
     )
-    parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--era5-steps", type=int, default=40)
-    parser.add_argument("--cams-steps", type=int, default=16)
-    parser.add_argument("--ensemble-steps", type=int, default=8)
+    parser.add_argument(
+        "--horizon-hours",
+        type=int,
+        default=MEDIUM_RANGE_LEAD_HOURS,
+        help="Medium-range lead time. Step count is horizon / timestep (6 h -> 40).",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Override step count for every preset. Default is --horizon-hours / dt.",
+    )
+    parser.add_argument(
+        "--era5-steps",
+        type=int,
+        default=None,
+        help="Override step count for era5_pretrained only.",
+    )
+    parser.add_argument(
+        "--cams-steps",
+        type=int,
+        default=None,
+        help="Override step count for cams only.",
+    )
+    parser.add_argument(
+        "--ensemble-steps",
+        type=int,
+        default=None,
+        help="Override step count for aurora_v1p5_ensemble only.",
+    )
     parser.add_argument("--tiers", nargs="+", default=list(_DEFAULT_TIERS))
+    parser.add_argument(
+        "--isolate-tiers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run each precision tier in a fresh subprocess (default: on).",
+    )
+    parser.add_argument(
+        "--scratch-dir",
+        type=Path,
+        default=None,
+        help="Directory for isolated-worker step files (default: /dev/shm).",
+    )
     parser.add_argument(
         "--merge-json",
         type=Path,
@@ -400,7 +678,16 @@ def main() -> None:
     if device.type != "cuda":
         raise SystemExit("CUDA is required for rollout drift")
     gpu = torch.cuda.get_device_name(device)
+    for _label, precision in resolve_tier_specs(args.tiers):
+        require_perceiver_fp32(precision)
     tier_specs = resolve_tier_specs(args.tiers)
+
+    scratch_root = args.scratch_dir
+    if scratch_root is None:
+        shm = Path("/dev/shm")
+        scratch_root = shm if shm.is_dir() else Path(tempfile.gettempdir())
+    scratch_root = scratch_root / f"flash_aurora_cl_{os.getpid()}"
+    scratch_root.mkdir(parents=True, exist_ok=True)
 
     payload: dict[str, Any] = {
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -408,6 +695,7 @@ def main() -> None:
         "torch": torch.__version__,
         "asset_root": str(asset_root),
         "seed": _BENCHMARK_SEED,
+        "horizon_hours": args.horizon_hours,
         "baseline": _PYTORCH_BASELINE_KEY,
         "presets": {},
     }
@@ -416,31 +704,40 @@ def main() -> None:
         payload["presets"].update(prior.get("presets", {}))
         print(f"[merge] loaded {len(payload['presets'])} presets from {args.merge_json}", flush=True)
 
-    def _n_steps(preset: str) -> int:
-        if preset == "era5_pretrained":
+    def _n_steps(preset: str, timestep_hours: float) -> int:
+        if preset == "era5_pretrained" and args.era5_steps is not None:
             return args.era5_steps
-        if preset == "cams":
+        if preset == "cams" and args.cams_steps is not None:
             return args.cams_steps
-        if preset == "aurora_v1p5_ensemble":
+        if preset == "aurora_v1p5_ensemble" and args.ensemble_steps is not None:
             return args.ensemble_steps
-        return args.steps
+        if args.steps is not None:
+            return args.steps
+        return steps_for_horizon(args.horizon_hours, timestep_hours)
 
-    for preset in args.presets:
-        if preset in payload["presets"]:
-            print(f"[skip] {preset} already in merge JSON", flush=True)
-            continue
-        payload["presets"][preset] = run_preset(
-            preset=preset,
-            asset_root=asset_root,
-            steps=_n_steps(preset),
-            tier_specs=tier_specs,
-            device=device,
-            baseline=_PYTORCH_BASELINE_KEY,
-        )
-        args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        write_markdown(args.report_out, payload=payload)
-        print(f"[checkpoint] {preset} -> {args.json_out}", flush=True)
+    try:
+        for preset in args.presets:
+            if preset in payload["presets"]:
+                print(f"[skip] {preset} already in merge JSON", flush=True)
+                continue
+            _, config = load_preset_batch(preset, asset_root)
+            n_steps = _n_steps(preset, float(config.variant.timestep_hours))
+            payload["presets"][preset] = run_preset(
+                preset=preset,
+                asset_root=asset_root,
+                steps=n_steps,
+                tier_specs=tier_specs,
+                device=device,
+                baseline=_PYTORCH_BASELINE_KEY,
+                isolate_tiers=args.isolate_tiers,
+                scratch_root=scratch_root,
+            )
+            args.json_out.parent.mkdir(parents=True, exist_ok=True)
+            args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            write_markdown(args.report_out, payload=payload)
+            print(f"[checkpoint] {preset} -> {args.json_out}", flush=True)
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
 
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")

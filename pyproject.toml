@@ -49,7 +49,11 @@ dependencies = [
 dev = [
     "pytest>=9.0.2",
     "ipywidgets>=8.1.0",
+    "flash-attn-4[cu13]>=4.0.0b31",
 ]
+
+[tool.uv]
+prerelease = "allow"
 
 [tool.hatch.build.targets.wheel]
 packages = ["flash_aurora"]

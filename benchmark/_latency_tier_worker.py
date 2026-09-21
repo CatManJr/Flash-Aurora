@@ -15,7 +15,7 @@ if _BENCH_DIR not in sys.path:
 import _bootstrap  # noqa: F401, E402
 
 from _asset_root import default_asset_root  # noqa: E402
-from _latency_bench import run_tier_lora_modes  # noqa: E402
+from _latency_bench import DEFAULT_LATENCY_REPEAT, DEFAULT_LATENCY_WARMUP, run_tier_lora_modes  # noqa: E402
 from _preset_ic import checkpoint_path, load_preset_batch  # noqa: E402
 
 import torch
@@ -27,8 +27,8 @@ def main() -> None:
     parser.add_argument("--tier-label", required=True)
     parser.add_argument("--precision", required=True)
     parser.add_argument("--asset-root", type=Path, default=default_asset_root())
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=DEFAULT_LATENCY_WARMUP)
+    parser.add_argument("--repeat", type=int, default=DEFAULT_LATENCY_REPEAT)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -57,8 +57,13 @@ def main() -> None:
         "use_lora": config.variant.use_lora,
         "grid": f"{batch.spatial_shape[0]}x{batch.spatial_shape[1]}",
         "timings": {
-            key: {"ms": ms, "peak_alloc_mb": peak_alloc, "peak_reserved_mb": peak_reserved}
-            for key, (ms, peak_alloc, peak_reserved) in timings.items()
+            key: {
+                "ms": ms,
+                "std_ms": std_ms,
+                "peak_alloc_mb": peak_alloc,
+                "peak_reserved_mb": peak_reserved,
+            }
+            for key, (ms, std_ms, peak_alloc, peak_reserved) in timings.items()
         },
     }
     print(json.dumps(out))

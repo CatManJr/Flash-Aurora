@@ -39,7 +39,9 @@ import _bootstrap  # noqa: F401, E402
 
 from _asset_root import default_asset_root  # noqa: E402
 from _latency_bench import (  # noqa: E402
+    DEFAULT_LATENCY_REPEAT,
     DEFAULT_LATENCY_TIERS,
+    DEFAULT_LATENCY_WARMUP,
     PYTORCH_FP32_REF_TIER,
     order_tier_specs_for_timing,
     resolve_tier_specs,
@@ -78,17 +80,21 @@ def _cuda_version() -> str:
     return torch.version.cuda or "unknown"
 
 
+def _format_ms(mean: float, std: float) -> str:
+    return f"{mean:.1f} ± {std:.1f}"
+
+
 def _format_eager_merged(
     use_lora: bool,
-    timings: dict[str, tuple[float, float, float]],
+    timings: dict[str, tuple[float, float, float, float]],
 ) -> tuple[str, str, str]:
     if use_lora:
-        eager_ms = timings["lora_eager"][0]
-        merged_ms = timings["lora_merged"][0]
+        eager_ms, eager_std = timings["lora_eager"][0], timings["lora_eager"][1]
+        merged_ms, merged_std = timings["lora_merged"][0], timings["lora_merged"][1]
         ratio = f"{eager_ms / merged_ms:.2f}x" if merged_ms > 0 else "—"
-        return f"{eager_ms:.1f}", f"{merged_ms:.1f}", ratio
-    fwd = timings["forward"][0]
-    return "—", f"{fwd:.1f}", "—"
+        return _format_ms(eager_ms, eager_std), _format_ms(merged_ms, merged_std), ratio
+    fwd, fwd_std = timings["forward"][0], timings["forward"][1]
+    return "—", _format_ms(fwd, fwd_std), "—"
 
 
 def print_preset_latency_table(
@@ -100,17 +106,17 @@ def print_preset_latency_table(
 ) -> None:
     print(f"\n=== {preset} ({grid}) ===")
     if use_lora:
-        hdr = f"{'tier':<44} {'eager':>10} {'merged':>10} {'eager/merged':>12} {'vs ref':>8}"
+        hdr = f"{'tier':<44} {'eager':>16} {'merged':>16} {'eager/merged':>12} {'vs ref':>8}"
         print(hdr)
         print("-" * len(hdr))
         for tier, eager_s, merged_s, ratio_s, vs_ref in rows:
-            print(f"{tier:<44} {eager_s:>10} {merged_s:>10} {ratio_s:>12} {vs_ref:>8}")
+            print(f"{tier:<44} {eager_s:>16} {merged_s:>16} {ratio_s:>12} {vs_ref:>8}")
     else:
-        hdr = f"{'tier':<44} {'forward':>10} {'vs ref':>8}"
+        hdr = f"{'tier':<44} {'forward':>16} {'vs ref':>8}"
         print(hdr)
         print("-" * len(hdr))
         for tier, _eager_s, merged_s, _ratio_s, vs_ref in rows:
-            print(f"{tier:<44} {merged_s:>10} {vs_ref:>8}")
+            print(f"{tier:<44} {merged_s:>16} {vs_ref:>8}")
 
 
 _BENCH_WORKER = Path(__file__).resolve().parent / "_latency_tier_worker.py"
@@ -125,7 +131,7 @@ def _run_tier_isolated(
     asset_root: Path,
     warmup: int,
     repeat: int,
-) -> dict[str, tuple[float, float, float]]:
+) -> dict[str, tuple[float, float, float, float]]:
     """Spawn a clean process so cuDNN autotune from other tiers cannot skew timing."""
     cmd = [
         sys.executable,
@@ -158,7 +164,12 @@ def _run_tier_isolated(
         )
     payload = json.loads(proc.stdout.strip())
     return {
-        key: (vals["ms"], vals["peak_alloc_mb"], vals["peak_reserved_mb"])
+        key: (
+            vals["ms"],
+            vals.get("std_ms", 0.0),
+            vals["peak_alloc_mb"],
+            vals["peak_reserved_mb"],
+        )
         for key, vals in payload["timings"].items()
     }
 
@@ -191,7 +202,7 @@ def write_markdown_report(
     lines.extend(
         [
             f"- Asset root: `{asset_root}`",
-            f"- Warmup: {warmup}, repeat: {repeat}",
+            f"- Warmup: {warmup}, repeat: {repeat} (mean ± sample std, one CUDA event per forward)",
             f"- Tier isolation: **{'subprocess per tier' if isolate_tiers else 'single process'}**",
             (
                 f"- PyTorch FP32 ref: **timed after custom tiers (--defer-ref)**"
@@ -251,8 +262,8 @@ def main() -> None:
         nargs="+",
         default=list(DEFAULT_LATENCY_TIERS),
     )
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=DEFAULT_LATENCY_WARMUP)
+    parser.add_argument("--repeat", type=int, default=DEFAULT_LATENCY_REPEAT)
     parser.add_argument(
         "--isolate-tiers",
         action=argparse.BooleanOptionalAction,
@@ -314,7 +325,7 @@ def main() -> None:
             flush=True,
         )
 
-        tier_timings: dict[str, dict[str, tuple[float, float, float]]] = {}
+        tier_timings: dict[str, dict[str, tuple[float, float, float, float]]] = {}
 
         def _run_tier(tier_label: str, precision: str) -> None:
             print(f"  [run] {tier_label}...", flush=True)
@@ -376,7 +387,10 @@ def main() -> None:
             if tier_label == PYTORCH_FP32_REF_TIER:
                 vs_ref = "base"
             elif preset in ref_merged_ms:
-                merged_val = float(merged_s) if merged_s != "—" else 0.0
+                if use_lora:
+                    merged_val = tier_timings[tier_label]["lora_merged"][0]
+                else:
+                    merged_val = tier_timings[tier_label]["forward"][0]
                 ref = ref_merged_ms[preset]
                 vs_ref = f"{ref / merged_val:.2f}x" if merged_val > 0 else "—"
             else:

@@ -32,6 +32,7 @@ from _aurora_attn_shapes import (
     SHAPES_ERA5_025,
     all_unique_attn_shapes,
 )
+from _window_attn_libs import available_sdpa_backends
 from flash_aurora.models.ops.cute.window_attn_fwd import (
     _best_tile_m,
     _choose_tile_n,
@@ -407,11 +408,7 @@ def run_sdpa_backend_probe(
     masked: bool,
 ) -> None:
     """Force each PyTorch SDPA backend on Aurora BF16 ERA5 shapes."""
-    backends = (
-        ("flash", SDPBackend.FLASH_ATTENTION),
-        ("mem_eff", SDPBackend.EFFICIENT_ATTENTION),
-        ("math", SDPBackend.MATH),
-    )
+    backends = available_sdpa_backends()
     print(f"\n{title}")
     print(
         f"{'shape':<{_COL_LABEL}}"

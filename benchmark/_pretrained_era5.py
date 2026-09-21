@@ -498,6 +498,17 @@ def build_model(
     return model.to(device)
 
 
+def summarize_repeat_ms(samples: list[float]) -> tuple[float, float]:
+    """Mean and sample standard deviation of per-forward CUDA-event times."""
+    if not samples:
+        raise ValueError("need at least one timed repeat")
+    mean = sum(samples) / len(samples)
+    if len(samples) == 1:
+        return mean, 0.0
+    var = sum((x - mean) ** 2 for x in samples) / (len(samples) - 1)
+    return mean, var ** 0.5
+
+
 def time_forward(
     model: Any,
     batch: Any,
@@ -505,7 +516,7 @@ def time_forward(
     warmup: int,
     repeat: int,
     device: torch.device,
-) -> tuple[Any, float, float, float]:
+) -> tuple[Any, float, float, float, float]:
     def _call_forward() -> Any:
         from flash_aurora.engine.core.model_protocol import model_uses_v1p5_rollout
 
@@ -528,31 +539,32 @@ def time_forward(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
+        samples: list[float] = []
+        pred = None
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            pred = None
             for _ in range(repeat):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
                 pred = _call_forward()
-            end.record()
-            torch.cuda.synchronize(device)
-            ms_total = start.elapsed_time(end)
+                end.record()
+                torch.cuda.synchronize(device)
+                samples.append(float(start.elapsed_time(end)))
             peak_alloc = torch.cuda.max_memory_allocated(device) / 1e6
             peak_reserved = torch.cuda.max_memory_reserved(device) / 1e6
         else:
             import time
 
-            t0 = time.perf_counter()
-            pred = None
             for _ in range(repeat):
+                t0 = time.perf_counter()
                 pred = _call_forward()
-            ms_total = (time.perf_counter() - t0) * 1e3
+                samples.append((time.perf_counter() - t0) * 1e3)
             peak_alloc = float("nan")
             peak_reserved = float("nan")
 
-    return pred, ms_total / repeat, peak_alloc, peak_reserved
+    mean_ms, std_ms = summarize_repeat_ms(samples)
+    return pred, mean_ms, std_ms, peak_alloc, peak_reserved
 
 
 def run_tier(
@@ -574,7 +586,7 @@ def run_tier(
         cute_window_attn_dtype=cute_window_attn_dtype,
     )
     try:
-        pred, ms_per, peak_alloc, peak_reserved = time_forward(
+        pred, ms_per, _std_ms, peak_alloc, peak_reserved = time_forward(
             model, batch, warmup=warmup, repeat=repeat, device=device
         )
         return prediction_tensors(pred), ms_per, peak_alloc, peak_reserved

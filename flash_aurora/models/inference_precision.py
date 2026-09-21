@@ -8,7 +8,8 @@ Two independent axes (combinable):
 * **Encoder/decoder** - :class:`EncoderDecoderMatmulLevel`: ``fp32`` | ``tf32`` only
   (no E/D BF16 autocast: Perceiver needs FP32 ``lat``/``lon`` and AdaLN paths).
 
-Named presets (``fp32``, ``fast_fp32``, ``tf32``, ``bf16_mixed``, ``bf16``, …) set both axes.
+Named presets (``fp32``, ``pytorch_tf32``, ``fast_fp32``, ``tf32``, ``bf16_mixed``, ``bf16``, …) set both axes.
+``pytorch_tf32`` is eager PyTorch with TF32 matmul and no Triton/CuTe. It is not ``tf32@fp32``.
 Override either axis explicitly or use a combo string (``backbone@encoder_decoder``).
 The left token is always a **backbone matmul level**; the right is **encoder/decoder only**:
 
@@ -64,6 +65,7 @@ class AuroraInferencePrecision(str, Enum):
 
     FP32 = "fp32"
     PYTORCH_AUTOCAST = "pytorch_autocast"
+    PYTORCH_TF32 = "pytorch_tf32"
     FAST_FP32 = "fast_fp32"
     TF32 = "tf32"
     TF32X3 = "tf32x3"
@@ -202,6 +204,11 @@ _PRESET_GRID: dict[AuroraInferencePrecision, _PresetGridCell] = {
         EncoderDecoderMatmulLevel.FP32,
         autocast_backbone=True,
     ),
+    AuroraInferencePrecision.PYTORCH_TF32: _PresetGridCell(
+        "baseline",
+        BackboneMatmulLevel.TF32,
+        EncoderDecoderMatmulLevel.FP32,
+    ),
     AuroraInferencePrecision.FAST_FP32: _PresetGridCell(
         "fast_fp32",
         BackboneMatmulLevel.FP32,
@@ -328,8 +335,22 @@ class AuroraInferenceConfig:
                 raise ValueError(
                     "baseline profile enables backbone autocast only for PYTORCH_AUTOCAST."
                 )
-            if self.backbone_matmul_level != BackboneMatmulLevel.FP32:
-                raise ValueError("baseline profile requires strict FP32 backbone matmul.")
+            if self.backbone_matmul_level not in (
+                BackboneMatmulLevel.FP32,
+                BackboneMatmulLevel.TF32,
+            ):
+                raise ValueError(
+                    "baseline profile allows only FP32 or TF32 backbone matmul "
+                    "(no BF16, no Triton/CuTe)."
+                )
+            if (
+                self.backbone_matmul_level == BackboneMatmulLevel.TF32
+                and self.precision not in (AuroraInferencePrecision.PYTORCH_TF32, None)
+            ):
+                raise ValueError(
+                    "baseline TF32 backbone is the pytorch_tf32 preset; "
+                    "named fused presets must not use kernel_profile=baseline."
+                )
         if self.kernel_profile == "fast_fp32":
             if self.use_cute_window_attn:
                 raise ValueError("fast_fp32 profile must not enable CuTe window attention.")
@@ -355,6 +376,17 @@ class AuroraInferenceConfig:
                 raise ValueError("PYTORCH_AUTOCAST requires backbone_matmul_level=fp32.")
             if not self.autocast_backbone:
                 raise ValueError("PYTORCH_AUTOCAST requires autocast_backbone=True.")
+        if self.precision == AuroraInferencePrecision.PYTORCH_TF32:
+            if uses_custom_swin:
+                raise ValueError("PYTORCH_TF32 must not enable Triton/CuTe.")
+            if self.kernel_profile != "baseline":
+                raise ValueError("PYTORCH_TF32 requires kernel_profile=baseline.")
+            if self.backbone_matmul_level != BackboneMatmulLevel.TF32:
+                raise ValueError("PYTORCH_TF32 requires backbone_matmul_level=tf32.")
+            if self.encoder_decoder_matmul_level != EncoderDecoderMatmulLevel.FP32:
+                raise ValueError("PYTORCH_TF32 requires encoder_decoder_matmul_level=fp32.")
+            if self.autocast_backbone:
+                raise ValueError("PYTORCH_TF32 forbids backbone autocast.")
 
 
 def _parse_matmul_level(

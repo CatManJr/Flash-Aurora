@@ -341,6 +341,7 @@ class Aurora(torch.nn.Module):
             use_triton_mlp=use_triton_mlp,
             use_cute_window_attn=use_cute_window_attn,
             cute_window_attn_dtype=self.cute_window_attn_dtype,
+            cute_window_attn_tf32_mode=self.cute_window_attn_tf32_mode,
             workspace_pool=workspace_pool,
         )
 

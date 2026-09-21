@@ -16,6 +16,8 @@ from _pretrained_era5 import (
 )
 
 PYTORCH_FP32_REF_TIER = _PYTORCH_BASELINE_KEY
+DEFAULT_LATENCY_WARMUP = 5
+DEFAULT_LATENCY_REPEAT = 20
 
 DEFAULT_LATENCY_TIERS: tuple[str, ...] = (
     PYTORCH_FP32_REF_TIER,
@@ -23,6 +25,8 @@ DEFAULT_LATENCY_TIERS: tuple[str, ...] = (
     "bf16_mixed@tf32",
     "tf32@fp32",
     "tf32@tf32",
+    "tf32x3@fp32",
+    "tf32x3@tf32",
     "fp32@fp32",
     "pytorch_backbone_autocast_bf16_encoder_decoder_fp32",
 )
@@ -90,15 +94,15 @@ def time_forward_ms(
     warmup: int,
     repeat: int,
     device: torch.device,
-) -> tuple[float, float, float]:
-    _, ms, peak_alloc, peak_reserved = time_forward(
+) -> tuple[float, float, float, float]:
+    _, ms, std_ms, peak_alloc, peak_reserved = time_forward(
         model,
         batch,
         warmup=warmup,
         repeat=repeat,
         device=device,
     )
-    return ms, peak_alloc, peak_reserved
+    return ms, std_ms, peak_alloc, peak_reserved
 
 
 def run_tier_lora_modes(
@@ -110,9 +114,9 @@ def run_tier_lora_modes(
     device: torch.device,
     warmup: int,
     repeat: int,
-) -> dict[str, tuple[float, float, float]]:
+) -> dict[str, tuple[float, float, float, float]]:
     """Return ``lora_eager`` / ``lora_merged`` timings, or single ``forward`` for no-LoRA."""
-    out: dict[str, tuple[float, float, float]] = {}
+    out: dict[str, tuple[float, float, float, float]] = {}
     if config.variant.use_lora:
         for key, merged in (("lora_eager", False), ("lora_merged", True)):
             model = build_model(

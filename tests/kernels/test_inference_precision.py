@@ -28,6 +28,7 @@ from flash_aurora.models.inference_precision import (
     [
         ("fp32", AuroraInferencePrecision.FP32),
         ("pytorch_autocast", AuroraInferencePrecision.PYTORCH_AUTOCAST),
+        ("pytorch_tf32", AuroraInferencePrecision.PYTORCH_TF32),
         ("fast_fp32", AuroraInferencePrecision.FAST_FP32),
         ("tf32", AuroraInferencePrecision.TF32),
         ("bf16_mixed", AuroraInferencePrecision.BF16_MIXED),
@@ -64,6 +65,31 @@ def test_pytorch_autocast_preset() -> None:
     assert cfg.use_triton_layout is False
     assert cfg.autocast_encoder_decoder is False
     assert cfg.backbone_matmul_bf16 is False
+
+
+def test_pytorch_tf32_is_eager_not_fused() -> None:
+    eager = resolve_inference_config("pytorch_tf32")
+    fused = resolve_inference_config("tf32@fp32")
+    assert eager is not None
+    assert fused is not None
+    assert eager.kernel_profile == "baseline"
+    assert eager.backbone_matmul_level == BackboneMatmulLevel.TF32
+    assert eager.backbone_matmul_tf32 is True
+    assert eager.use_triton_layout is False
+    assert eager.use_cute_window_attn is False
+    assert eager.encoder_decoder_use_tensor_core is False
+    assert fused.use_cute_window_attn is True
+    assert fused.use_triton_layout is True
+    assert eager.config_label != fused.config_label
+
+
+def test_baseline_kernel_accepts_tf32_backbone_without_named_preset() -> None:
+    cfg = resolve_inference_config("tf32@fp32", kernel_profile="baseline")
+    assert cfg is not None
+    assert cfg.precision is None
+    assert cfg.kernel_profile == "baseline"
+    assert cfg.backbone_matmul_tf32 is True
+    assert cfg.use_cute_window_attn is False
 
 
 def test_fast_fp32_preset_is_triton_with_native_perceiver() -> None:
@@ -454,6 +480,34 @@ def test_backbone_bf16_hybrid_hooks_qkv_linear_fp32() -> None:
         with backbone_matmul_context(tf32=True, bf16=True):
             qkv = linear(x)
     assert qkv.dtype == torch.float32
+
+
+def _window_attn_tf32_modes(model) -> set[str]:
+    return {
+        m.cute_window_attn_tf32_mode
+        for m in model.modules()
+        if type(m).__name__ == "WindowAttention"
+    }
+
+
+def test_tf32x3_combo_reaches_window_attention() -> None:
+    from flash_aurora.models.aurora.model.aurora import AuroraSmallPretrained
+    from flash_aurora.models.aurora_v1p5.model.aurora import (
+        AuroraSmallPretrained as AuroraV1p5Small,
+    )
+
+    cfg = resolve_inference_config("tf32x3@fp32")
+    assert cfg is not None
+    assert cfg.window_attn_tf32_mode == "tf32x3"
+    assert apply_inference_config("tf32x3@fp32")["window_attn_tf32_mode"] == "tf32x3"
+
+    for ctor in (AuroraSmallPretrained, AuroraV1p5Small):
+        tf32 = ctor(use_lora=False, inference_precision="tf32@fp32")
+        assert _window_attn_tf32_modes(tf32) == {"tf32"}
+        del tf32
+        tf32x3 = ctor(use_lora=False, inference_precision="tf32x3@fp32")
+        assert _window_attn_tf32_modes(tf32x3) == {"tf32x3"}
+        del tf32x3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
