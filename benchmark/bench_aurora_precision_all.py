@@ -64,7 +64,10 @@ _DEFAULT_PRECISION_TIERS: tuple[str, ...] = (
     "bf16_mixed@tf32",
     "tf32@fp32",
     "tf32@tf32",
+    "tf32x3@fp32",
+    "tf32x3@tf32",
     "fp32@fp32",
+    "fp32@tf32",
     "bf16@fp32",
     "pytorch_backbone_autocast_bf16_encoder_decoder_fp32",
 )

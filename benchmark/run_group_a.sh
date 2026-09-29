@@ -7,7 +7,9 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-PY="${ROOT}/.venv/bin/python"
+# Same entry as the benchmark docstrings. --no-sync uses the existing project
+# venv and does not re-resolve Cutlass during a multi-hour queue.
+UV=(uv run --no-sync)
 
 export AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-/root/autodl-tmp/aurora}"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
@@ -27,13 +29,28 @@ IDLE_WAIT_SEC="${GPU_IDLE_WAIT_SEC:-120}"
 GROUP_A_STAGE="${GROUP_A_STAGE:-all}"
 mkdir -p "$DUMP_DIR" "$LOG_DIR" "$REPORT_DIR"
 
-PAPER_PRESETS=(era5_pretrained aurora_v1p5 aurora_v1p5_ensemble hres_0.1 cams)
+# 0.25 finetuned and TC tracking share the finetuned checkpoint and HRES-T0 cache.
+PAPER_PRESETS=(
+  era5_pretrained
+  hres_t0_finetuned
+  tc_tracking
+  aurora_v1p5
+  aurora_v1p5_ensemble
+  hres_0.1
+  cams
+)
+# Mean-rel contract pairs every backbone with Perceiver FP32 and Perceiver TF32.
+# fp32@fp32 vs fp32@tf32 isolates the Perceiver TF32 ablation (backbone stays FP32).
 CONTRACT_TIERS=(
   pytorch_backbone_fp32_encoder_decoder_fp32
   bf16_mixed@fp32
+  bf16_mixed@tf32
   tf32@fp32
+  tf32@tf32
   tf32x3@fp32
+  tf32x3@tf32
   fp32@fp32
+  fp32@tf32
   pytorch_backbone_autocast_bf16_encoder_decoder_fp32
 )
 
@@ -70,13 +87,13 @@ run_job() {
   shift
   local log="${LOG_DIR}/${name}.log"
   echo "=== ${name} start $(date -Is) ===" | tee -a "$QUEUE_LOG"
-  echo "cmd: $*" | tee -a "$QUEUE_LOG"
+  echo "cmd: ${UV[*]} python $*" | tee -a "$QUEUE_LOG"
   if ! wait_gpu_idle; then
     echo "${name}" >>"${LOG_DIR}/failures.txt"
     echo "=== ${name} end exit=busy $(date -Is) ===" | tee -a "$QUEUE_LOG"
     return 1
   fi
-  "${PY}" "$@" >"$log" 2>&1
+  "${UV[@]}" python "$@" >"$log" 2>&1
   ec=$?
   echo "=== ${name} end exit=${ec} $(date -Is) ===" | tee -a "$QUEUE_LOG"
   if [[ "${ec}" -eq 0 ]]; then
@@ -105,12 +122,13 @@ echo "asset=${AURORA_ASSET_ROOT} dump=${DUMP_DIR} torch-dump-id=${DUMP_ID}" | te
 
 echo "=== adapter_tests start $(date -Is) ===" | tee -a "$QUEUE_LOG"
 adapter_ec=0
-CUDA_VISIBLE_DEVICES= "${PY}" -m pytest \
+CUDA_VISIBLE_DEVICES= "${UV[@]}" pytest \
   tests/benchmark/test_window_attn_libs.py \
   tests/benchmark/test_baseline_matrix.py \
   tests/benchmark/test_latency_bench.py \
   tests/benchmark/test_rollout_horizon.py \
   tests/benchmark/test_one_step_profile.py \
+  tests/benchmark/test_precision_tiers.py \
   -q --tb=short >"${LOG_DIR}/adapter_tests.log" 2>&1 || adapter_ec=$?
 if [[ "${adapter_ec}" -eq 0 ]]; then
   echo "=== adapter_tests end exit=0 $(date -Is) ===" | tee -a "$QUEUE_LOG"
@@ -125,6 +143,13 @@ if ! wait_gpu_idle; then
   echo "GPU busy after adapter tests" | tee -a "$QUEUE_LOG"
   exit 1
 fi
+
+# gapfill: new 0.25 presets get dumps/closed-loop/profile; every preset
+# re-runs latency (fp32@tf32) and the mean-rel contract (@tf32 pairs).
+GAPFILL_PRESETS=(hres_t0_finetuned tc_tracking)
+DUMP_PRESETS=("${PAPER_PRESETS[@]}")
+CLOSEDLOOP_PRESETS=("${PAPER_PRESETS[@]}")
+PROFILE_PRESETS=("${PAPER_PRESETS[@]}")
 
 run_dumps=0
 run_sota=0
@@ -151,6 +176,16 @@ case "${GROUP_A_STAGE}" in
     run_contract=1
     run_profile=1
     ;;
+  gapfill)
+    run_dumps=1
+    run_latency=1
+    run_contract=1
+    run_closedloop=1
+    run_profile=1
+    DUMP_PRESETS=("${GAPFILL_PRESETS[@]}")
+    CLOSEDLOOP_PRESETS=("${GAPFILL_PRESETS[@]}")
+    PROFILE_PRESETS=("${GAPFILL_PRESETS[@]}")
+    ;;
   *)
     echo "unknown GROUP_A_STAGE=${GROUP_A_STAGE}" | tee -a "$QUEUE_LOG"
     exit 1
@@ -158,7 +193,7 @@ case "${GROUP_A_STAGE}" in
 esac
 
 if [[ "${run_dumps}" -eq 1 ]]; then
-  for preset in "${PAPER_PRESETS[@]}"; do
+  for preset in "${DUMP_PRESETS[@]}"; do
     run_job "dump_${preset}" benchmark/freeze_pytorch_ref.py \
       --preset "$preset" \
       --dump-dir "$DUMP_DIR" \
@@ -202,7 +237,7 @@ if [[ "${run_contract}" -eq 1 ]]; then
 fi
 
 if [[ "${run_closedloop}" -eq 1 ]]; then
-  for preset in "${PAPER_PRESETS[@]}"; do
+  for preset in "${CLOSEDLOOP_PRESETS[@]}"; do
     run_job "closedloop_${preset}" benchmark/bench_rollout_drift.py \
       --presets "$preset" \
       --asset-root "$AURORA_ASSET_ROOT" \
@@ -228,7 +263,7 @@ if [[ "${run_roi}" -eq 1 ]]; then
 fi
 
 if [[ "${run_profile}" -eq 1 ]]; then
-  for preset in "${PAPER_PRESETS[@]}"; do
+  for preset in "${PROFILE_PRESETS[@]}"; do
     run_job "profile_${preset}" benchmark/bench_one_step_profile.py \
       --preset "$preset" \
       --asset-root "$AURORA_ASSET_ROOT" \

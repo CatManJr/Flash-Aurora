@@ -272,6 +272,20 @@ def test_encoder_decoder_bf16_combo_rejected() -> None:
         parse_precision_spec("tf32@bf16")
 
 
+def test_fp32_at_tf32_changes_only_perceiver() -> None:
+    base = resolve_inference_config("fp32@fp32")
+    perceiver_tf32 = resolve_inference_config("fp32@tf32")
+    assert base is not None and perceiver_tf32 is not None
+    assert base.backbone_matmul_level == BackboneMatmulLevel.FP32
+    assert perceiver_tf32.backbone_matmul_level == BackboneMatmulLevel.FP32
+    assert base.encoder_decoder_matmul_level == EncoderDecoderMatmulLevel.FP32
+    assert perceiver_tf32.encoder_decoder_matmul_level == EncoderDecoderMatmulLevel.TF32
+    assert base.encoder_decoder_use_tensor_core is False
+    assert perceiver_tf32.encoder_decoder_use_tensor_core is True
+    assert base.backbone_matmul_tf32 is False
+    assert perceiver_tf32.backbone_matmul_tf32 is False
+
+
 def test_resolve_bf16_mixed_at_fp32_combo() -> None:
     cfg = resolve_inference_config("bf16_mixed@fp32")
     assert cfg is not None

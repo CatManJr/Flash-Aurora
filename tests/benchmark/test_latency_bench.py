@@ -20,6 +20,8 @@ def test_default_latency_tiers_include_tf32x3() -> None:
     tf32_at = DEFAULT_LATENCY_TIERS.index("tf32@tf32")
     assert DEFAULT_LATENCY_TIERS[tf32_at + 1] == "tf32x3@fp32"
     assert DEFAULT_LATENCY_TIERS[tf32_at + 2] == "tf32x3@tf32"
+    fp32_at = DEFAULT_LATENCY_TIERS.index("fp32@fp32")
+    assert DEFAULT_LATENCY_TIERS[fp32_at + 1] == "fp32@tf32"
 
 
 def test_tf32x3_latency_specs_keep_x3_precision_string() -> None:

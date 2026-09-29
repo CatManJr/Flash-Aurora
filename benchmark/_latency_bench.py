@@ -28,6 +28,7 @@ DEFAULT_LATENCY_TIERS: tuple[str, ...] = (
     "tf32x3@fp32",
     "tf32x3@tf32",
     "fp32@fp32",
+    "fp32@tf32",
     "pytorch_backbone_autocast_bf16_encoder_decoder_fp32",
 )
 
