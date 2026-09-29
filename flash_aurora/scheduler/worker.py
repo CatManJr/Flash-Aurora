@@ -132,8 +132,11 @@ class ForecastWorker:
 
     @property
     def device(self) -> str:
+        """Primary device: the one inputs are placed on."""
         if self._config.device is not None:
             return self._config.device
+        if self._config.distributed_devices:
+            return self._config.distributed_devices[0]
         engine_config = getattr(self._engine, "config", None)
         engine_device = getattr(engine_config, "device", None)
         return engine_device if isinstance(engine_device, str) else "cuda:0"

@@ -35,6 +35,13 @@ class WorkerEndpoint:
     capacity: int = 1
 
 
+def _reject_duplicate_worker_ids(endpoints: tuple[WorkerEndpoint, ...]) -> None:
+    worker_ids = [endpoint.worker_id for endpoint in endpoints]
+    duplicates = sorted({worker_id for worker_id in worker_ids if worker_ids.count(worker_id) > 1})
+    if duplicates:
+        raise ValueError(f"worker ids must be unique, got duplicates: {duplicates}")
+
+
 @dataclass
 class ForecastCoordinatorConfig:
     """Configuration for a front-end scheduler over one or more workers."""
@@ -85,6 +92,7 @@ class ForecastCoordinator:
     ) -> None:
         if not config.workers:
             raise ValueError("coordinator requires at least one worker endpoint")
+        _reject_duplicate_worker_ids(config.workers)
         self._config = config
         self._owns_context = context is None
         self._context = zmq.Context() if context is None else context
@@ -389,14 +397,9 @@ class ForecastCoordinator:
         return True
 
     def serve_forever(self) -> None:
-        self.refresh_worker_health()
-        self._next_probe_s = self._clock() + self._config.worker_probe_interval_ms / 1000.0
-        poller = zmq.Poller()
-        poller.register(self._command_socket, zmq.POLLIN)
-        for worker in self._workers.values():
-            poller.register(worker.event_socket, zmq.POLLIN)
-
         try:
+            self._start_serving()
+            poller = self._build_poller()
             while self._running:
                 events = dict(poller.poll(timeout=self._config.poll_timeout_ms))
                 if self._command_socket in events:
@@ -410,6 +413,17 @@ class ForecastCoordinator:
                 self._supervise_workers()
         finally:
             self.close()
+
+    def _start_serving(self) -> None:
+        self.refresh_worker_health()
+        self._next_probe_s = self._clock() + self._config.worker_probe_interval_ms / 1000.0
+
+    def _build_poller(self) -> zmq.Poller:
+        poller = zmq.Poller()
+        poller.register(self._command_socket, zmq.POLLIN)
+        for worker in self._workers.values():
+            poller.register(worker.event_socket, zmq.POLLIN)
+        return poller
 
 
 def install_signal_handlers(coordinator: ForecastCoordinator) -> None:

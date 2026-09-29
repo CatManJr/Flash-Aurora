@@ -177,3 +177,23 @@ def test_wait_for_bind_times_out_when_ipc_socket_file_is_missing(tmp_path: Path)
 
 def test_wait_for_bind_does_not_wait_for_tcp_endpoints() -> None:
     wait_for_bind("tcp://127.0.0.1:65000", timeout_s=0.0)
+
+
+def test_pipeline_worker_reports_its_first_device_rather_than_the_engine_default(
+    tmp_path: Path, context: zmq.Context
+) -> None:
+    worker = _worker(
+        tmp_path,
+        _mock_engine(tmp_path),
+        context,
+        worker_id="pipe-0",
+        distributed_devices=("cuda:2", "cuda:3"),
+    )
+    client = _client(worker, context)
+
+    worker.handle_command(_forecast_command("req-1"))
+    events = _events_until_terminal(client)
+
+    assert {event.worker_device for event in events} == {"cuda:2"}
+    client.close()
+    worker.close()

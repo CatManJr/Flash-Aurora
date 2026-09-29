@@ -9,7 +9,11 @@ import pytest
 import zmq
 
 from flash_aurora.scheduler.client import ForecastClient
-from flash_aurora.scheduler.coordinator import ForecastCoordinator, ForecastCoordinatorConfig
+from flash_aurora.scheduler.coordinator import (
+    ForecastCoordinator,
+    ForecastCoordinatorConfig,
+    WorkerEndpoint,
+)
 from flash_aurora.scheduler.protocol import ForecastEvent
 from tests.scheduler.stub_cluster import (
     IO_TIMEOUT_MS,
@@ -129,3 +133,22 @@ def test_owned_context_is_not_the_process_singleton(tmp_path: Path) -> None:
     assert not shared.closed
     stub.close()
     stub_context.term()
+
+
+def test_coordinator_rejects_two_workers_with_the_same_id(tmp_path: Path) -> None:
+    def endpoint(name: str) -> WorkerEndpoint:
+        return WorkerEndpoint(
+            worker_id="gpu-0",
+            preset=PRESET,
+            command_addr=f"ipc://{tmp_path / f'{name}-commands.ipc'}",
+            event_addr=f"ipc://{tmp_path / f'{name}-events.ipc'}",
+        )
+
+    config = ForecastCoordinatorConfig(
+        command_addr=f"ipc://{tmp_path / 'front-commands.ipc'}",
+        event_addr=f"ipc://{tmp_path / 'front-events.ipc'}",
+        workers=(endpoint("first"), endpoint("second")),
+    )
+
+    with pytest.raises(ValueError, match="unique"):
+        ForecastCoordinator(config)
