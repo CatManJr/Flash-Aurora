@@ -60,6 +60,9 @@ def _time_library(
     _out, err = probe_library(spec, q, k, v, scale=scale, bias=bias)
     if err is not None:
         return {"ok": False, "error": err, "mean_ms": None}
+    resolved = {}
+    if spec.resolve_backend is not None:
+        resolved["resolved_backend"] = spec.resolve_backend(q, k, v, scale=scale, bias=bias)
     try:
         if spec.make_timed is not None:
             timed = spec.make_timed(q, k, v, scale=scale, bias=bias)
@@ -69,7 +72,12 @@ def _time_library(
             stats = bench(lambda: spec.run(q, k, v, scale=scale, bias=bias))
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": type(exc).__name__, "mean_ms": None}
-    return {"ok": True, "error": None, "mean_ms": stats.mean, "ci95_ms": stats.ci95}
+    row = {"ok": True, "error": None, "mean_ms": stats.mean, "ci95_ms": stats.ci95, **resolved}
+    if bias is not None and spec.reports_mask_build_variant:
+        with_build = bench(lambda: spec.run(q, k, v, scale=scale, bias=bias))
+        row["with_mask_build_mean_ms"] = with_build.mean
+        row["with_mask_build_ci95_ms"] = with_build.ci95
+    return row
 
 
 def run_shape(
@@ -121,6 +129,8 @@ def _to_markdown(payload: dict[str, Any]) -> str:
         "alone is 0.787 ms; with those layout copies, FA-4 in actual "
         "use is much slower than SDPA FLASH_ATTENTION. "
         "The table times the FA-4 kernel on pre-converted BSHD tensors. "
+        "SDPA rows time the attention kernel with the dense mask prebuilt; "
+        "masked SDPA rows also list the latency including mask construction. "
         "An unavailable row names the exception type.",
         "",
     ]
@@ -135,7 +145,12 @@ def _to_markdown(payload: dict[str, Any]) -> str:
                 continue
             row = block["libraries"][name]
             if row["ok"]:
-                lines.append(f"| `{name}` | {row['mean_ms']:.3f} | ok |")
+                status = "ok"
+                if "resolved_backend" in row:
+                    status += f" (dispatched to `{row['resolved_backend']}`)"
+                if "with_mask_build_mean_ms" in row:
+                    status += f"; {row['with_mask_build_mean_ms']:.3f} ms incl. mask build"
+                lines.append(f"| `{name}` | {row['mean_ms']:.3f} | {status} |")
             else:
                 lines.append(f"| `{name}` | — | `{row['error']}` |")
         lines.append("")

@@ -70,6 +70,9 @@ class MLP(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
         self.use_triton_gelu = use_triton_gelu
+        # Cleared by stochastic backbones: BF16 MLP matmuls push the ensemble past tolerance
+        # on precipitation and cloud variables, so those runs keep the tier's TF32 path.
+        self.allow_bf16_matmul = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP."""
@@ -79,7 +82,8 @@ class MLP(nn.Module):
         )
 
         use_bf16_mlp = (
-            backbone_bf16_hybrid_matmul_active()
+            self.allow_bf16_matmul
+            and backbone_bf16_hybrid_matmul_active()
             and x.is_cuda
             and not torch.is_grad_enabled()
             and x.dtype in (torch.float32, torch.bfloat16)
@@ -1293,6 +1297,11 @@ class Swin3DTransformerBackbone(nn.Module):
             bly.init_respostnorm()
         for bly in self.decoder_layers:
             bly.init_respostnorm()
+
+        if self.stochastic:
+            for module in self.modules():
+                if isinstance(module, MLP):
+                    module.allow_bf16_matmul = False
 
     def reset_noise(self) -> None:
         """Flush the noise cache.

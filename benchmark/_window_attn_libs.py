@@ -47,6 +47,14 @@ class LibrarySpec:
     # If set, the microbench times this factory's zero-arg kernel after layout
     # conversion. ``run`` still includes BHSD<->BSHD copies for the probe.
     make_timed: Callable[..., Callable[[], Any]] | None = None
+    # Dispatching libraries (SDPA without a forced backend) name the backend
+    # PyTorch selected, so reports never have to say only "auto".
+    resolve_backend: Callable[..., str] | None = None
+    # SDPA needs the compact (nW, N, N) bias expanded to a dense per-window mask,
+    # while the fused kernels read the compact bias directly. True marks specs
+    # whose timed kernel excludes that expansion and that also report the
+    # expansion-included latency for masked shapes.
+    reports_mask_build_variant: bool = False
 
 
 def sdpa_backend_enum(attr_name: str) -> SDPBackend | None:
@@ -91,6 +99,28 @@ def expand_bias(bias: torch.Tensor | None, q: torch.Tensor) -> torch.Tensor | No
     return _expand_bias_for_sdpa(bias, q.shape[0], q.shape[1], q.shape[2]).to(dtype=q.dtype)
 
 
+def resolve_sdpa_auto_backend(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    bias: torch.Tensor | None,
+) -> str:
+    """Short name (``flash``, ``mem_eff``, ...) of the backend SDPA auto-dispatch picks.
+
+    ``scale`` is accepted for signature parity with the run adapters; the
+    dispatcher's choice does not depend on it.
+    """
+    chosen = SDPBackend(
+        torch._fused_sdp_choice(q, k, v, attn_mask=expand_bias(bias, q), dropout_p=0.0, is_causal=False)
+    )
+    for short, attr in SDPA_BACKEND_NAMES:
+        if sdpa_backend_enum(attr) == chosen:
+            return short
+    return chosen.name.lower()
+
+
 def _run_cute(precision: WinAttnPrecision) -> Callable[..., torch.Tensor]:
     def _fwd(
         q: torch.Tensor,
@@ -122,6 +152,33 @@ def _run_sdpa_auto(
 ) -> torch.Tensor:
     mask = expand_bias(bias, q)
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+
+
+def _make_sdpa_timed(backend: SDPBackend | None) -> Callable[..., Callable[[], Any]]:
+    """Build the dense mask once so the timed kernel is attention only.
+
+    ``backend=None`` keeps PyTorch's auto-dispatch.
+    """
+
+    def _factory(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        scale: float,
+        bias: torch.Tensor | None,
+    ) -> Callable[[], Any]:
+        mask = expand_bias(bias, q)
+
+        def _kernel() -> torch.Tensor:
+            if backend is None:
+                return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            with sdpa_kernel(backends=[backend]):
+                return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+
+        return _kernel
+
+    return _factory
 
 
 def _run_sdpa(
@@ -202,14 +259,25 @@ def library_specs() -> tuple[LibrarySpec, ...]:
     bf16 = (torch.bfloat16,)
     both = MICROBENCH_DTYPES
     specs: list[LibrarySpec] = [
-        LibrarySpec("fast_fp32", True, _run_sdpa_auto, fp32),
+        LibrarySpec(
+            "fast_fp32", True, _run_sdpa_auto, fp32, _make_sdpa_timed(None),
+            resolve_backend=resolve_sdpa_auto_backend, reports_mask_build_variant=True,
+        ),
         LibrarySpec("cute_tf32", True, _run_cute(WinAttnPrecision.TF32), fp32),
         LibrarySpec("cute_tf32x3", True, _run_cute(WinAttnPrecision.TF32X3), fp32),
         LibrarySpec("cute_bf16", True, _run_cute(WinAttnPrecision.BF16_MIXED), bf16),
-        LibrarySpec("sdpa_auto", True, _run_sdpa_auto, both),
+        LibrarySpec(
+            "sdpa_auto", True, _run_sdpa_auto, both, _make_sdpa_timed(None),
+            resolve_backend=resolve_sdpa_auto_backend, reports_mask_build_variant=True,
+        ),
     ]
     for short, backend in available_sdpa_backends():
-        specs.append(LibrarySpec(f"sdpa_{short}", True, _run_sdpa(backend), both))
+        specs.append(
+            LibrarySpec(
+                f"sdpa_{short}", True, _run_sdpa(backend), both, _make_sdpa_timed(backend),
+                reports_mask_build_variant=True,
+            )
+        )
     if not sdpa_covers_flash2():
         specs.append(LibrarySpec("fa2", False, _run_fa2, FLASH_KERNEL_DTYPES))
     specs.append(LibrarySpec("fa4", False, _run_fa4, FLASH_KERNEL_DTYPES, _make_fa4_timed))

@@ -30,6 +30,24 @@ _TRITON_DTYPE = {
 }
 
 
+def _modulation_layout(
+    scale: torch.Tensor, shift: torch.Tensor, B: int, L: int, D: int
+) -> tuple[bool, int, int]:
+    """Validate FiLM modulation tensors and return ``(per_token, stride_b, stride_l)``.
+
+    Strides are taken from the tensors so that ``chunk`` views of a ``(B, L, 2D)``
+    modulation output can be consumed without a copy.
+    """
+    if scale.shape != shift.shape or scale.stride() != shift.stride():
+        raise ValueError("scale and shift must share shape and strides.")
+    if scale.shape not in ((B, 1, D), (B, L, D)):
+        raise ValueError(f"modulation must be (B,1,D) or (B,L,D); got {tuple(scale.shape)}.")
+    if scale.stride(-1) != 1:
+        raise ValueError("modulation must have unit stride on the last dimension.")
+    per_token = scale.shape[1] == L and L != 1
+    return per_token, scale.stride(0), scale.stride(1) if per_token else 0
+
+
 def adaptive_layernorm_film_forward(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -43,7 +61,8 @@ def adaptive_layernorm_film_forward(
 
     Args:
         x: ``(B, L, D)`` float32 or bfloat16 CUDA.
-        scale, shift: ``(B, 1, D)`` CUDA (typically same dtype as ``x``).
+        scale, shift: ``(B, 1, D)`` batch conditioning or ``(B, L, D)`` per-token conditioning,
+            CUDA, unit stride on the last dim (views of a chunked tensor are fine).
         scale_bias: Added to ``scale`` before multiply (same as module).
         eps: LayerNorm epsilon.
         output_fp32: If ``True``, write FP32 outputs (LN math still in FP32).
@@ -56,7 +75,7 @@ def adaptive_layernorm_film_forward(
     B, L, D = x.shape
     if D > _MAX_D:
         raise ValueError(f"adaptive_layernorm_film_forward supports D <= {_MAX_D} for now.")
-    assert scale.shape == (B, 1, D) and shift.shape == (B, 1, D)
+    per_token, mod_stride_b, mod_stride_l = _modulation_layout(scale, shift, B, L, D)
     out_dtype = torch.float32 if output_fp32 else x.dtype
     out = torch.empty(B, L, D, device=x.device, dtype=out_dtype)
     grid = (B * L,)
@@ -66,12 +85,15 @@ def adaptive_layernorm_film_forward(
         shift,
         scale,
         x,
+        mod_stride_b,
+        mod_stride_l,
         L=L,
         D=D,
         BLOCK_D=_BLOCK_D,
         scale_bias=float(scale_bias),
         eps=float(eps),
         WITH_RESIDUAL=False,
+        PER_TOKEN=per_token,
         X_DTYPE=_TRITON_DTYPE[x.dtype],
         RES_DTYPE=_TRITON_DTYPE[x.dtype],
         MOD_DTYPE=_TRITON_DTYPE[scale.dtype],
@@ -98,7 +120,7 @@ def adaptive_layernorm_film_add_residual_forward(
     Args:
         residual: ``(B, L, D)`` float32 or bfloat16 CUDA (must not alias ``x``).
         x: ``(B, L, D)`` CUDA, input to LayerNorm + FiLM.
-        scale, shift: ``(B, 1, D)`` CUDA.
+        scale, shift: ``(B, 1, D)`` or ``(B, L, D)`` CUDA, unit stride on the last dim.
         scale_bias: Added to ``scale`` before multiply.
         eps: LayerNorm epsilon.
         output_fp32: Store FP32 outputs; allows ``residual`` (FP32) and ``x`` (BF16) to differ.
@@ -121,7 +143,7 @@ def adaptive_layernorm_film_add_residual_forward(
         raise ValueError(
             f"adaptive_layernorm_film_add_residual_forward supports D <= {_MAX_D}."
         )
-    assert scale.shape == (B, 1, D) and shift.shape == (B, 1, D)
+    per_token, mod_stride_b, mod_stride_l = _modulation_layout(scale, shift, B, L, D)
     out_dtype = torch.float32 if output_fp32 else x.dtype
     out = torch.empty(B, L, D, device=x.device, dtype=out_dtype)
     grid = (B * L,)
@@ -131,12 +153,15 @@ def adaptive_layernorm_film_add_residual_forward(
         shift,
         scale,
         residual,
+        mod_stride_b,
+        mod_stride_l,
         L=L,
         D=D,
         BLOCK_D=_BLOCK_D,
         scale_bias=float(scale_bias),
         eps=float(eps),
         WITH_RESIDUAL=True,
+        PER_TOKEN=per_token,
         X_DTYPE=_TRITON_DTYPE[x.dtype],
         RES_DTYPE=_TRITON_DTYPE[residual.dtype],
         MOD_DTYPE=_TRITON_DTYPE[scale.dtype],
@@ -152,12 +177,15 @@ def _adaln_film_blocked_kernel(
     shift_ptr,
     scale_ptr,
     residual_ptr,
+    mod_stride_b,
+    mod_stride_l,
     L,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     scale_bias: tl.constexpr,
     eps: tl.constexpr,
     WITH_RESIDUAL: tl.constexpr,
+    PER_TOKEN: tl.constexpr,
     X_DTYPE: tl.constexpr,
     RES_DTYPE: tl.constexpr,
     MOD_DTYPE: tl.constexpr,
@@ -171,6 +199,9 @@ def _adaln_film_blocked_kernel(
     """
     row = tl.program_id(0)
     b = row // L
+    mod_row = b * mod_stride_b
+    if PER_TOKEN:
+        mod_row += (row % L) * mod_stride_l
     inv_d = 1.0 / D
 
     sum_x = tl.full((), 0.0, dtype=tl.float32)
@@ -190,8 +221,8 @@ def _adaln_film_blocked_kernel(
         offs = d0 + tl.arange(0, BLOCK_D)
         mask = offs < D
         xv = tl.load(x_ptr + row * D + offs, mask=mask, other=0.0).to(tl.float32)
-        sh = tl.load(shift_ptr + b * D + offs, mask=mask, other=0.0).to(tl.float32)
-        sc = tl.load(scale_ptr + b * D + offs, mask=mask, other=0.0).to(tl.float32)
+        sh = tl.load(shift_ptr + mod_row + offs, mask=mask, other=0.0).to(tl.float32)
+        sc = tl.load(scale_ptr + mod_row + offs, mask=mask, other=0.0).to(tl.float32)
         yn = (xv - mean) * inv_std
         y = yn * (scale_bias + sc) + sh
         if WITH_RESIDUAL:

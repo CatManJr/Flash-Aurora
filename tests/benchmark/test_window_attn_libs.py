@@ -70,13 +70,10 @@ def test_unpack_attn_out_accepts_fa4_tuple() -> None:
     assert got_plain.shape == (2, 8, 144, 64)
 
 
-def test_fa4_microbench_excludes_layout_conversion() -> None:
-    specs = {spec.name: spec for spec in library_specs()}
-    assert specs["fa4"].make_timed is not None
-    for name, spec in specs.items():
-        if name == "fa4":
-            continue
-        assert spec.make_timed is None
+def test_only_fa4_and_sdpa_prebuild_inputs_outside_the_timed_kernel() -> None:
+    for name, spec in {s.name: s for s in library_specs()}.items():
+        expects_prebuild = name == "fa4" or name == "fast_fp32" or name.startswith("sdpa_")
+        assert (spec.make_timed is not None) == expects_prebuild, name
 
 
 def test_probe_records_missing_optional_library() -> None:
@@ -104,3 +101,18 @@ def test_sdpa_backend_enum_handles_missing_cudnn() -> None:
         assert "cudnn" not in backends
     else:
         assert "cudnn" in backends
+
+
+def test_auto_dispatch_specs_can_resolve_their_backend() -> None:
+    resolvers = {spec.name for spec in library_specs() if spec.resolve_backend is not None}
+    assert {"fast_fp32", "sdpa_auto"} <= resolvers
+    forced = {spec.name for spec in library_specs() if spec.name.startswith("sdpa_") and spec.name != "sdpa_auto"}
+    assert all(spec.resolve_backend is None for spec in library_specs() if spec.name in forced)
+
+
+def test_sdpa_specs_prebuild_mask_outside_timed_kernel() -> None:
+    sdpa_like = [s for s in library_specs() if s.name == "fast_fp32" or s.name.startswith("sdpa_")]
+    assert sdpa_like
+    for spec in sdpa_like:
+        assert spec.make_timed is not None
+        assert spec.reports_mask_build_variant

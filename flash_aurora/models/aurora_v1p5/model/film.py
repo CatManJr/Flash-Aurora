@@ -67,6 +67,7 @@ class AdaptiveLayerNorm(nn.Module):
 
     def _modulate(self, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(shift, scale)`` for conditioning of shape ``(B, D)`` or ``(B, L, D)``."""
+        # Precision follows the active tier's matmul context (TF32 / 3xTF32 / FP32); no local override.
         c = self.ln_modulation(c)
         if c.ndim == 2:
             c = c.unsqueeze(1)
@@ -85,8 +86,7 @@ class AdaptiveLayerNorm(nn.Module):
         """
         shift, scale = self._modulate(c)
         x = self._adaln_branch_input(x)
-        # Triton FiLM path only supports batch conditioning broadcast over L.
-        if self._use_triton_film(x) and shift.shape[1] == 1:
+        if self._use_triton_film(x):
             from flash_aurora.models.ops.triton_adaln import adaptive_layernorm_film_forward
 
             return self._finalize_adaln_output(
@@ -108,7 +108,7 @@ class AdaptiveLayerNorm(nn.Module):
 
         When ``use_triton`` and CUDA float32 with batch conditioning, uses a fused kernel that
         avoids writing a full intermediate AdaLN tensor before the add. ``residual`` must not
-        alias ``x``. Per-token conditioning ``(B, L, D)`` always uses the eager path.
+        alias ``x``. Both batch ``(B, D)`` and per-token ``(B, L, D)`` conditioning are fused.
 
         Args:
             residual: Tensor of shape ``(B, L, D)``.
@@ -125,7 +125,6 @@ class AdaptiveLayerNorm(nn.Module):
             and residual.is_cuda
             and residual.dtype == torch.float32
             and self._use_triton_film(x)
-            and shift.shape[1] == 1
         ):
             from flash_aurora.models.ops.triton_adaln import adaptive_layernorm_film_add_residual_forward
 
