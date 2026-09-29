@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import signal
+import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Deque
 
@@ -43,6 +45,17 @@ class ForecastCoordinatorConfig:
     poll_timeout_ms: int = 100
     worker_health_timeout_ms: int = 1000
     sticky_sessions: bool = True
+    # Health probe cadence, and how long a worker that has spoken before may stay
+    # silent before its running jobs are failed. Workers never heard from are exempt
+    # so a checkpoint preload is not mistaken for a crash.
+    worker_probe_interval_ms: int = 2_000
+    worker_silence_limit_ms: int = 30_000
+
+    def __post_init__(self) -> None:
+        if self.worker_probe_interval_ms < 1:
+            raise ValueError("worker_probe_interval_ms must be >= 1")
+        if self.worker_silence_limit_ms <= self.worker_probe_interval_ms:
+            raise ValueError("worker_silence_limit_ms must exceed worker_probe_interval_ms")
 
 
 @dataclass
@@ -51,6 +64,9 @@ class _WorkerState:
     command_socket: zmq.Socket
     event_socket: zmq.Socket
     running: set[str]
+    dispatched_count: int = 0
+    last_heard_s: float | None = None
+    unresponsive: bool = False
 
     @property
     def available_slots(self) -> int:
@@ -65,12 +81,15 @@ class ForecastCoordinator:
         config: ForecastCoordinatorConfig,
         *,
         context: zmq.Context | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not config.workers:
             raise ValueError("coordinator requires at least one worker endpoint")
         self._config = config
         self._owns_context = context is None
-        self._context = context or zmq.Context.instance()
+        self._context = zmq.Context() if context is None else context
+        self._clock = clock
+        self._next_probe_s = clock()
         self._running = True
         self._queue: Deque[ForecastCommand] = deque()
         self._request_worker: dict[str, str] = {}
@@ -137,27 +156,33 @@ class ForecastCoordinator:
         worker.command_socket.send(encode_command(command))
 
     def refresh_worker_health(self) -> None:
-        """Best-effort worker metadata refresh from health events."""
+        """Best-effort worker metadata refresh; stops waiting on a worker that stays silent."""
         for worker in self._workers.values():
             self._send_worker(worker, ForecastCommand(kind="health"))
-
         for worker in self._workers.values():
+            self._await_health_reply(worker)
+
+    def _await_health_reply(self, worker: _WorkerState) -> None:
+        # Job events can arrive ahead of the reply; route them, keep waiting for health.
+        while True:
             try:
                 event = decode_event(worker.event_socket.recv())
             except zmq.Again:
-                continue
-            if event.kind != "health":
-                self._forward_worker_event(worker, event)
-                continue
-            endpoint = worker.endpoint
-            worker.endpoint = WorkerEndpoint(
-                worker_id=endpoint.worker_id,
-                preset=event.worker_preset or endpoint.preset,
-                command_addr=endpoint.command_addr,
-                event_addr=endpoint.event_addr,
-                device=event.worker_device or endpoint.device,
-                capacity=event.worker_capacity or endpoint.capacity,
-            )
+                return
+            self._handle_worker_event(worker, event)
+            if event.kind == "health":
+                return
+
+    def _apply_worker_health(self, worker: _WorkerState, event: ForecastEvent) -> None:
+        endpoint = worker.endpoint
+        worker.endpoint = WorkerEndpoint(
+            worker_id=endpoint.worker_id,
+            preset=event.worker_preset or endpoint.preset,
+            command_addr=endpoint.command_addr,
+            event_addr=endpoint.event_addr,
+            device=event.worker_device or endpoint.device,
+            capacity=event.worker_capacity or endpoint.capacity,
+        )
 
     def _matching_workers(self, request: ForecastRequest) -> list[_WorkerState]:
         return [
@@ -166,8 +191,11 @@ class ForecastCoordinator:
             if worker.endpoint.preset == request.preset
         ]
 
+    def _live_matching_workers(self, request: ForecastRequest) -> list[_WorkerState]:
+        return [worker for worker in self._matching_workers(request) if not worker.unresponsive]
+
     def _choose_worker(self, request: ForecastRequest) -> _WorkerState | None:
-        candidates = self._matching_workers(request)
+        candidates = self._live_matching_workers(request)
         if not candidates:
             return None
 
@@ -186,9 +214,15 @@ class ForecastCoordinator:
         ready = [worker for worker in candidates if worker.available_slots > 0]
         if not ready:
             return None
-        return max(
+        # Most free slots first, then the worker that has run the fewest jobs, so idle
+        # workers share load instead of the highest worker_id absorbing every burst.
+        return min(
             ready,
-            key=lambda worker: (worker.available_slots, worker.endpoint.worker_id),
+            key=lambda worker: (
+                -worker.available_slots,
+                worker.dispatched_count,
+                worker.endpoint.worker_id,
+            ),
         )
 
     def _enqueue_or_fail(self, command: ForecastCommand) -> None:
@@ -210,8 +244,20 @@ class ForecastCoordinator:
                 )
             )
             return
+        if not self._live_matching_workers(request):
+            self._emit_failed_unservable(request)
+            return
         self._queue.append(command)
         self._dispatch_ready()
+
+    def _emit_failed_unservable(self, request: ForecastRequest) -> None:
+        self._emit(
+            ForecastEvent(
+                kind="failed",
+                request_id=request.request_id,
+                error=f"every worker for preset {request.preset!r} is unresponsive",
+            )
+        )
 
     def _dispatch_ready(self) -> None:
         deferred: Deque[ForecastCommand] = deque()
@@ -225,11 +271,87 @@ class ForecastCoordinator:
                 deferred.append(command)
                 continue
             worker.running.add(request.request_id)
+            worker.dispatched_count += 1
             self._request_worker[request.request_id] = worker.endpoint.worker_id
             if self._config.sticky_sessions and request.sticky_key is not None:
                 self._sticky_workers[request.sticky_key] = worker.endpoint.worker_id
             self._send_worker(worker, command)
         self._queue = deferred
+
+    def _handle_worker_event(self, worker: _WorkerState, event: ForecastEvent) -> None:
+        was_unresponsive = worker.unresponsive
+        worker.last_heard_s = self._clock()
+        worker.unresponsive = False
+        # Health replies answer the coordinator, not a client, so they never leave here.
+        if event.kind == "health":
+            self._apply_worker_health(worker, event)
+        else:
+            self._forward_worker_event(worker, event)
+        if was_unresponsive:
+            self._dispatch_ready()
+
+    def _supervise_workers(self) -> None:
+        """Probe workers on a fixed cadence and give up on any that stay silent."""
+        now_s = self._clock()
+        if now_s >= self._next_probe_s:
+            self._next_probe_s = now_s + self._config.worker_probe_interval_ms / 1000.0
+            for worker in self._workers.values():
+                self._probe_worker(worker)
+        for worker in self._workers.values():
+            if self._has_gone_silent(worker, now_s):
+                self._declare_unresponsive(worker)
+
+    def _probe_worker(self, worker: _WorkerState) -> None:
+        # A dead peer's pipe fills to the high-water mark, after which a blocking send
+        # would freeze the whole coordinator; the silence limit already covers that worker.
+        try:
+            worker.command_socket.send(
+                encode_command(ForecastCommand(kind="health")),
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            pass
+
+    def _has_gone_silent(self, worker: _WorkerState, now_s: float) -> bool:
+        if worker.unresponsive or worker.last_heard_s is None:
+            return False
+        return now_s - worker.last_heard_s > self._config.worker_silence_limit_ms / 1000.0
+
+    def _declare_unresponsive(self, worker: _WorkerState) -> None:
+        worker.unresponsive = True
+        for request_id in sorted(worker.running):
+            self._request_worker.pop(request_id, None)
+            self._emit(self._lost_job_event(worker, request_id))
+        worker.running.clear()
+        self._sticky_workers = {
+            key: worker_id
+            for key, worker_id in self._sticky_workers.items()
+            if worker_id != worker.endpoint.worker_id
+        }
+        self._fail_queued_jobs_without_live_worker()
+
+    def _lost_job_event(self, worker: _WorkerState, request_id: str) -> ForecastEvent:
+        endpoint = worker.endpoint
+        return ForecastEvent(
+            kind="failed",
+            request_id=request_id,
+            worker_id=endpoint.worker_id,
+            worker_device=endpoint.device,
+            error=(
+                f"worker {endpoint.worker_id!r} stopped responding while running this job "
+                f"(silent for more than {self._config.worker_silence_limit_ms} ms)"
+            ),
+        )
+
+    def _fail_queued_jobs_without_live_worker(self) -> None:
+        still_servable: Deque[ForecastCommand] = deque()
+        for command in self._queue:
+            request = command.request
+            if request is not None and not self._live_matching_workers(request):
+                self._emit_failed_unservable(request)
+            else:
+                still_servable.append(command)
+        self._queue = still_servable
 
     def _forward_worker_event(self, worker: _WorkerState, event: ForecastEvent) -> None:
         self._emit(event)
@@ -268,6 +390,7 @@ class ForecastCoordinator:
 
     def serve_forever(self) -> None:
         self.refresh_worker_health()
+        self._next_probe_s = self._clock() + self._config.worker_probe_interval_ms / 1000.0
         poller = zmq.Poller()
         poller.register(self._command_socket, zmq.POLLIN)
         for worker in self._workers.values():
@@ -283,7 +406,8 @@ class ForecastCoordinator:
                 for worker in self._workers.values():
                     if worker.event_socket in events:
                         event = decode_event(worker.event_socket.recv())
-                        self._forward_worker_event(worker, event)
+                        self._handle_worker_event(worker, event)
+                self._supervise_workers()
         finally:
             self.close()
 
@@ -342,6 +466,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--poll-timeout-ms", type=int, default=100)
     parser.add_argument("--worker-health-timeout-ms", type=int, default=1000)
+    parser.add_argument("--worker-probe-interval-ms", type=int, default=2_000)
+    parser.add_argument(
+        "--worker-silence-limit-ms",
+        type=int,
+        default=30_000,
+        help="Fail a worker's running jobs after it stays silent this long",
+    )
     parser.add_argument(
         "--no-sticky-sessions",
         action="store_true",
@@ -359,6 +490,8 @@ def main() -> None:
         poll_timeout_ms=args.poll_timeout_ms,
         worker_health_timeout_ms=args.worker_health_timeout_ms,
         sticky_sessions=not args.no_sticky_sessions,
+        worker_probe_interval_ms=args.worker_probe_interval_ms,
+        worker_silence_limit_ms=args.worker_silence_limit_ms,
     )
     coordinator = ForecastCoordinator(config)
     install_signal_handlers(coordinator)

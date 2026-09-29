@@ -20,6 +20,7 @@ from flash_aurora.scheduler.addresses import resolve_bound_endpoint
 from flash_aurora.scheduler.protocol import (
     ForecastCommand,
     ForecastEvent,
+    ForecastEventKind,
     ForecastRequest,
     decode_command,
     encode_array,
@@ -71,7 +72,7 @@ class ForecastWorker:
         if config.capacity < 1:
             raise ValueError("worker capacity must be >= 1")
         self._owns_context = context is None
-        self._context = context or zmq.Context.instance()
+        self._context = zmq.Context() if context is None else context
         self._engine = engine or self._build_engine()
         self._downloader = downloader or DataDownloader.from_preset(
             config.preset,
@@ -211,6 +212,15 @@ class ForecastWorker:
         with self._emit_lock:
             self._event_socket.send(encode_event(event))
 
+    def _job_event(self, kind: ForecastEventKind, **fields: Any) -> ForecastEvent:
+        """Build an event attributed to this worker so clients can trace a job to a GPU."""
+        return ForecastEvent(
+            kind=kind,
+            worker_id=self.worker_id,
+            worker_device=self.device,
+            **fields,
+        )
+
     def _emit_ready(self, *, message: str) -> None:
         # NOBLOCK: startup ready must not stall when no PULL peer is connected yet.
         # Late clients recover via health (message ready|listening).
@@ -261,6 +271,7 @@ class ForecastWorker:
         request: ForecastRequest,
         step_index: int,
         prediction,
+        member: int | None,
     ) -> ForecastEvent:
         variable = request.preview_var or next(iter(prediction.surf_vars))
         if variable not in prediction.surf_vars:
@@ -268,13 +279,14 @@ class ForecastWorker:
             raise ValueError(f"surface variable {variable!r} not found; available: {available}")
         array = prediction.surf_vars[variable][0, -1].detach().float().cpu().numpy()
         valid_time = prediction.metadata.time[-1].isoformat()
-        return ForecastEvent(
-            kind="step",
+        return self._job_event(
+            "step",
             request_id=request.request_id,
             step=step_index,
             valid_time=valid_time,
             array_name=variable,
             array_data_b64=encode_array(array),
+            ensemble_member=member,
         )
 
     def _rollout_kwargs(self, request: ForecastRequest) -> dict[str, Any]:
@@ -307,8 +319,8 @@ class ForecastWorker:
             )
             for step_index, path in enumerate(export_paths):
                 self._emit(
-                    ForecastEvent(
-                        kind="step",
+                    self._job_event(
+                        "step",
                         request_id=request.request_id,
                         step=step_index,
                         export_path=str(path),
@@ -320,23 +332,12 @@ class ForecastWorker:
         stream = self._engine.rollout_stream(batch, request.steps, **rollout_kwargs)
         for step_index, prediction in enumerate(stream):
             if request.output_mode == "last_step_array" and step_index == request.steps - 1:
-                event = self._last_step_array_event(request, step_index, prediction)
-                self._emit(
-                    ForecastEvent(
-                        kind=event.kind,
-                        request_id=event.request_id,
-                        step=event.step,
-                        valid_time=event.valid_time,
-                        array_name=event.array_name,
-                        array_data_b64=event.array_data_b64,
-                        ensemble_member=member,
-                    )
-                )
+                self._emit(self._last_step_array_event(request, step_index, prediction, member))
                 continue
             valid_time = prediction.metadata.time[-1].isoformat()
             self._emit(
-                ForecastEvent(
-                    kind="step",
+                self._job_event(
+                    "step",
                     request_id=request.request_id,
                     step=step_index,
                     valid_time=valid_time,
@@ -349,7 +350,7 @@ class ForecastWorker:
         self._validate_request(request)
         if request.ensemble_members is not None and request.ensemble_members < 1:
             raise ValueError("ensemble_members must be >= 1 when set")
-        self._emit(ForecastEvent(kind="preparing", request_id=request.request_id))
+        self._emit(self._job_event("preparing", request_id=request.request_id))
 
         if request.netcdf_path is not None:
             batch = self._engine.prepare_from_netcdf(
@@ -371,7 +372,7 @@ class ForecastWorker:
                 overlap=request.overlap,
             )
 
-        self._emit(ForecastEvent(kind="running", request_id=request.request_id))
+        self._emit(self._job_event("running", request_id=request.request_id))
 
         members = request.ensemble_members
         if members is None or members <= 1:
@@ -383,7 +384,7 @@ class ForecastWorker:
                 member_batch = batch._fmap(lambda tensor: tensor.clone())
                 self._emit_member_rollout(request, member_batch, member=member)
 
-        self._emit(ForecastEvent(kind="completed", request_id=request.request_id))
+        self._emit(self._job_event("completed", request_id=request.request_id))
 
     def _execute_forecast_job(self, request: ForecastRequest) -> None:
         """Run one job with error handling (compute plane or inline)."""
@@ -392,13 +393,7 @@ class ForecastWorker:
             self.run_forecast(request)
             self._set_model_ready(True)
         except InsufficientVramError as exc:
-            self._emit(
-                ForecastEvent(
-                    kind="failed",
-                    request_id=request.request_id,
-                    error=str(exc),
-                )
-            )
+            self._emit_failed(request.request_id, str(exc))
             self._fatal_error = exc
             self._running = False
         except Exception as exc:
@@ -406,15 +401,24 @@ class ForecastWorker:
                 self._engine.release_gpu(move_model_to_cpu=True)
             except Exception:
                 pass
-            self._emit(
-                ForecastEvent(
-                    kind="failed",
-                    request_id=request.request_id,
-                    error=str(exc),
-                )
-            )
+            # The weights just moved to the CPU, so health must stop reporting "ready".
+            self._set_model_ready(False)
+            self._emit_failed(request.request_id, str(exc))
         finally:
             self._set_busy(False)
+
+    def _emit_failed(self, request_id: str | None, error: str) -> None:
+        self._emit(self._job_event("failed", request_id=request_id, error=error))
+
+    def _fail_queued_jobs(self, reason: str) -> None:
+        """Answer every accepted-but-unstarted job so the coordinator frees its slot."""
+        while True:
+            try:
+                item = self._job_queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, ForecastRequest):
+                self._emit_failed(item.request_id, reason)
 
     def _compute_loop(self) -> None:
         while True:
@@ -424,7 +428,8 @@ class ForecastWorker:
             assert isinstance(item, ForecastRequest)
             self._execute_forecast_job(item)
             if self._fatal_error is not None:
-                # Drain stop signal if present; wake control loop via _running=False.
+                # The control loop stops on _running=False; nothing will run the queued jobs.
+                self._fail_queued_jobs(f"worker stopped after fatal error: {self._fatal_error}")
                 break
 
     def _start_compute_thread(self) -> None:
@@ -472,12 +477,7 @@ class ForecastWorker:
             return True
         if command.kind == "forecast":
             if command.request is None:
-                self._emit(
-                    ForecastEvent(
-                        kind="failed",
-                        error="forecast command requires a request payload",
-                    )
-                )
+                self._emit_failed(None, "forecast command requires a request payload")
                 return True
             request = command.request
             try:
@@ -485,16 +485,10 @@ class ForecastWorker:
                 if request.ensemble_members is not None and request.ensemble_members < 1:
                     raise ValueError("ensemble_members must be >= 1 when set")
             except Exception as exc:
-                self._emit(
-                    ForecastEvent(
-                        kind="failed",
-                        request_id=request.request_id,
-                        error=str(exc),
-                    )
-                )
+                self._emit_failed(request.request_id, str(exc))
                 return True
             # Queued / starting acknowledgment from the control plane.
-            self._emit(ForecastEvent(kind="accepted", request_id=request.request_id))
+            self._emit(self._job_event("accepted", request_id=request.request_id))
             if self._detached_compute:
                 self._job_queue.put(request)
             else:
@@ -503,7 +497,7 @@ class ForecastWorker:
                     self.close()
                     raise SystemExit(1) from self._fatal_error
             return True
-        self._emit(ForecastEvent(kind="failed", error=f"unsupported command {command.kind!r}"))
+        self._emit_failed(None, f"unsupported command {command.kind!r}")
         return True
 
     def serve_forever(self) -> None:
@@ -551,10 +545,24 @@ def install_signal_handlers(worker: ForecastWorker) -> None:
     signal.signal(signal.SIGTERM, _handler)
 
 
-def wait_for_bind(addr: str, *, timeout_s: float = 5.0) -> None:
-    """Allow ZMQ bind/connect ordering in tests."""
-    del addr
-    time.sleep(0.05)
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        time.sleep(0.01)
+_IPC_SCHEME = "ipc://"
+_BIND_POLL_INTERVAL_S = 0.01
+# A spawned worker imports torch and builds its engine before it binds.
+_DEFAULT_BIND_TIMEOUT_S = 120.0
+
+
+def wait_for_bind(addr: str, *, timeout_s: float = _DEFAULT_BIND_TIMEOUT_S) -> None:
+    """Block until an ``ipc://`` endpoint has its socket file, then return at once.
+
+    Other schemes cannot be probed without connecting, and ZMQ connects retry on
+    their own, so they return immediately. Raises TimeoutError if the socket
+    file never appears.
+    """
+    if not addr.startswith(_IPC_SCHEME):
+        return
+    socket_path = Path(addr[len(_IPC_SCHEME):])
+    deadline = time.monotonic() + timeout_s
+    while not socket_path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{addr} was not bound within {timeout_s:.1f}s")
+        time.sleep(_BIND_POLL_INTERVAL_S)

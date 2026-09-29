@@ -36,7 +36,7 @@ class ForecastClient:
     ) -> None:
         self._config = config
         self._owns_context = context is None
-        self._context = context or zmq.Context.instance()
+        self._context = zmq.Context() if context is None else context
         self._command_socket = self._context.socket(zmq.PUSH)
         self._event_socket = self._context.socket(zmq.PULL)
         self._command_socket.connect(config.command_addr)
@@ -72,6 +72,12 @@ class ForecastClient:
         """Receive the next scheduler event from the event socket."""
         data = self._event_socket.recv()
         return decode_event(data)
+
+    def try_recv_event(self, *, timeout_ms: int) -> ForecastEvent | None:
+        """Return the next event, or None if none arrives within ``timeout_ms``."""
+        if not self._event_socket.poll(timeout=timeout_ms):
+            return None
+        return self.recv_event()
 
     def _recv_event(self) -> ForecastEvent:
         return self.recv_event()
