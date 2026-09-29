@@ -95,61 +95,62 @@ Two harness modes are reported.
 | Single-process | `--no-isolate-tiers`        | All tiers in one process; illustrates how cuDNN autotune warms across tiers and can deflate the PyTorch FP32 reference when it is timed after custom kernels. Custom-tier absolute latency is stable; only vs ref is misleading. |
 
 
-Both modes use warmup $2$ and repeat $5$. Speedup uses `lora_merged` on finetuned presets and forward latency on pretrained presets, each relative to `pytorch_backbone_fp32_encoder_decoder_fp32`. Machine-readable reports are `../benchmark/latency_all_isolated.md` and `../benchmark/latency_all_single_process.md`.
+The isolate-tiers tables were remeasured on 2026-09-29 with PyTorch **2.14.0+cu130**, warmup 5, and repeat 20. Speedup uses `lora_merged` on finetuned presets and forward latency on pretrained presets, each relative to `pytorch_backbone_fp32_encoder_decoder_fp32`. Source reports are the Group A `latency_<preset>.md` files. `small_pretrained` and the single-process tables were not remeasured.
 
-**Single-process reference deflation.** On `era5_pretrained`, the PyTorch FP32 reference is ${\sim}2128$ ms when isolated but ${\sim}1135$ ms when timed after Triton/CuTe DSL tiers in the same process. `bf16_mixed@fp32` remains ${\sim}676$ ms in both runs. The speedup ratio changes even though custom latency is unchanged.
+**Single-process reference deflation.** The single-process tables later in this section are the 2026-06-23 PyTorch 2.12.1 run (warmup 2, repeat 5). On that harness, `era5_pretrained` FP32 was about $2128$ ms when isolated and about $1135$ ms in one process, while `bf16_mixed@fp32` stayed about $676$ ms. Do not compare those absolute times with the 2026-09-29 isolate tables.
 
 **Finetuned models.** On finetuned models, encoder and decoder time plus backbone copy/cast overhead narrow the gap between custom tiers. LoRA eager adds a second low-rank GEMM; LoRA merge is independent of precision tier choice. For CAMS, `lora_merged` with `tf32@`* is the production latency path if strict `pm10` tolerance is required. Otherwise, `bf16_mixed@`* still keeps the balance of precision and speed.
 
 #### Cold-start speedup (`--isolate-tiers`)
 
-Generated 2026-06-23; full tables: `../benchmark/latency_all_isolated.md`.
+Generated 2026-09-29 on PyTorch 2.14.0+cu130 (warmup 5, repeat 20, one subprocess per tier). Tables now include `tf32x3@*` and `fp32@tf32`.
 
 ##### `era5_pretrained` ($721 \times 1440$)
 
-
-| Tier              | forward (ms) | vs PyTorch FP32 ref |
-| ----------------- | ------------ | ------------------- |
-| `bf16_mixed@fp32` | 676.4        | 3.15x               |
-| `bf16_mixed@tf32` | 676.8        | 3.14x               |
-| `tf32@fp32`       | 1077.5       | 1.98x               |
-| `tf32@tf32`       | 919.2        | 2.32x               |
-| `fp32@fp32`       | 1945.0       | 1.09x               |
-| PyTorch autocast  | 1004.4       | 2.12x               |
-| PyTorch FP32 ref  | 2128.2       | base                |
-
+| Tier | forward (ms) | vs PyTorch FP32 ref |
+| --- | ---: | ---: |
+| `bf16_mixed@fp32` | 827.8 | 2.61x |
+| `bf16_mixed@tf32` | 677.6 | 3.19x |
+| `tf32@fp32` | 1078.3 | 2.00x |
+| `tf32@tf32` | 928.4 | 2.32x |
+| `tf32x3@fp32` | 1095.1 | 1.97x |
+| `tf32x3@tf32` | 944.5 | 2.29x |
+| `fp32@fp32` | 1993.4 | 1.08x |
+| `fp32@tf32` | 1841.1 | 1.17x |
+| PyTorch autocast | 1000.7 | 2.16x |
+| PyTorch FP32 ref | 2158.5 | base |
 
 ##### `aurora_v1p5` ($721 \times 1440$)
 
-Generated 2026-07-14 (`../benchmark/latency_aurora_v1p5_latest.md`); same machine and isolate-tiers harness as above. Uses the shared Swin Triton/CuTe + `inference_precision` path.
-
-
-| Tier              | forward (ms) | vs PyTorch FP32 ref |
-| ----------------- | ------------ | ------------------- |
-| `bf16_mixed@fp32` | 700.8        | 3.12x               |
-| `bf16_mixed@tf32` | 702.4        | 3.11x               |
-| `tf32@fp32`       | 1109.3       | 1.97x               |
-| `tf32@tf32`       | 946.0        | 2.31x               |
-| `fp32@fp32`       | 2005.6       | 1.09x               |
-| PyTorch autocast  | 1034.5       | 2.11x               |
-| PyTorch FP32 ref  | 2185.8       | base                |
-
+| Tier | forward (ms) | vs PyTorch FP32 ref |
+| --- | ---: | ---: |
+| `bf16_mixed@fp32` | 852.6 | 2.56x |
+| `bf16_mixed@tf32` | 701.3 | 3.11x |
+| `tf32@fp32` | 1102.9 | 1.98x |
+| `tf32@tf32` | 951.8 | 2.29x |
+| `tf32x3@fp32` | 1119.8 | 1.95x |
+| `tf32x3@tf32` | 968.0 | 2.26x |
+| `fp32@fp32` | 2032.0 | 1.07x |
+| `fp32@tf32` | 1860.7 | 1.17x |
+| PyTorch autocast | 1022.3 | 2.14x |
+| PyTorch FP32 ref | 2183.0 | base |
 
 ##### `aurora_v1p5_ensemble` ($721 \times 1440$)
 
-Generated 2026-08-14 (`../benchmark/latency_aurora_v1p5_ensemble_latest.md`); isolate-tiers. Stochastic noise in the Ensemble checkpoint raises both mixed and FP32 latency, so the vs-FP32 ratio drops to $2.52\times$.
+Generated 2026-09-29. Stochastic noise raises both mixed and FP32 latency. `bf16_mixed@fp32` is the slow end of the mixed tiers ($1148.6$ ms, $2.20\times$) because the ensemble MLP stays on TF32. A TF32 Perceiver (`bf16_mixed@tf32`) is $999.7$ ms ($2.53\times$).
 
-
-| Tier              | forward (ms) | vs PyTorch FP32 ref |
-| ----------------- | ------------ | ------------------- |
-| `bf16_mixed@fp32` | 1004.9       | 2.52x               |
-| `bf16_mixed@tf32` | 1006.6       | 2.52x               |
-| `tf32@fp32`       | 1411.9       | 1.80x               |
-| `tf32@tf32`       | 1248.7       | 2.03x               |
-| `fp32@fp32`       | 2450.8       | 1.03x               |
-| PyTorch autocast  | 1137.1       | 2.23x               |
-| PyTorch FP32 ref  | 2535.1       | base                |
-
+| Tier | forward (ms) | vs PyTorch FP32 ref |
+| --- | ---: | ---: |
+| `bf16_mixed@fp32` | 1148.6 | 2.20x |
+| `bf16_mixed@tf32` | 999.7 | 2.53x |
+| `tf32@fp32` | 1263.1 | 2.00x |
+| `tf32@tf32` | 1106.7 | 2.28x |
+| `tf32x3@fp32` | 1275.2 | 1.98x |
+| `tf32x3@tf32` | 1123.0 | 2.25x |
+| `fp32@fp32` | 2326.9 | 1.09x |
+| `fp32@tf32` | 2173.6 | 1.16x |
+| PyTorch autocast | 1125.5 | 2.25x |
+| PyTorch FP32 ref | 2527.1 | base |
 
 ##### `small_pretrained` ($400 \times 800$)
 
@@ -164,64 +165,72 @@ Generated 2026-08-14 (`../benchmark/latency_aurora_v1p5_ensemble_latest.md`); is
 | PyTorch autocast  | 56.3         | 1.81x               |
 | PyTorch FP32 ref  | 101.9        | base                |
 
+Not remeasured on 2026-09-29. The numbers above are the 2026-06-23 PyTorch 2.12.1 run.
+
 
 ##### `hres_t0_finetuned` ($721 \times 1440$, LoRA)
 
-
-| Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
-| ----------------- | --------------- | ---------------- | ------------ | ------------------- |
-| `bf16_mixed@fp32` | 881.7           | 638.7            | 1.38x        | 3.23x               |
-| `bf16_mixed@tf32` | 881.6           | 638.4            | 1.38x        | 3.23x               |
-| `tf32@fp32`       | 1249.6          | 1006.3           | 1.24x        | 2.05x               |
-| `tf32@tf32`       | 1091.5          | 846.5            | 1.29x        | 2.44x               |
-| `fp32@fp32`       | 2115.5          | 1890.4           | 1.12x        | 1.09x               |
-| PyTorch autocast  | 1104.4          | 967.7            | 1.14x        | 2.13x               |
-| PyTorch FP32 ref  | 2307.9          | 2061.9           | 1.12x        | base                |
-
+| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
+| --- | ---: | ---: | ---: | ---: |
+| `bf16_mixed@fp32` | 1035.0 | 796.0 | 1.30x | 2.68x |
+| `bf16_mixed@tf32` | 883.4 | 640.4 | 1.38x | 3.33x |
+| `tf32@fp32` | 1248.6 | 1017.5 | 1.23x | 2.09x |
+| `tf32@tf32` | 1098.2 | 859.9 | 1.28x | 2.48x |
+| `tf32x3@fp32` | 1264.3 | 1034.1 | 1.22x | 2.06x |
+| `tf32x3@tf32` | 1113.3 | 875.2 | 1.27x | 2.44x |
+| `fp32@fp32` | 2152.2 | 1957.4 | 1.10x | 1.09x |
+| `fp32@tf32` | 2002.4 | 1796.0 | 1.11x | 1.19x |
+| PyTorch autocast | 1099.6 | 966.0 | 1.14x | 2.21x |
+| PyTorch FP32 ref | 2338.8 | 2131.4 | 1.10x | base |
 
 ##### `hres_0.1` ($1801 \times 3600$, LoRA)
 
-
-| Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
-| ----------------- | --------------- | ---------------- | ------------ | ------------------- |
-| `bf16_mixed@fp32` | 898.0           | 672.0            | 1.34x        | 2.97x               |
-| `bf16_mixed@tf32` | 898.6           | 672.4            | 1.34x        | 2.97x               |
-| `tf32@fp32`       | 1247.7          | 1019.9           | 1.22x        | 1.96x               |
-| `tf32@tf32`       | 1091.1          | 861.3            | 1.27x        | 2.32x               |
-| `fp32@fp32`       | 2051.0          | 1838.0           | 1.12x        | 1.09x               |
-| PyTorch autocast  | 1112.1          | 986.2            | 1.13x        | 2.02x               |
-| PyTorch FP32 ref  | 2227.5          | 1994.6           | 1.12x        | base                |
-
+| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
+| --- | ---: | ---: | ---: | ---: |
+| `bf16_mixed@fp32` | 1036.5 | 819.4 | 1.27x | 2.50x |
+| `bf16_mixed@tf32` | 897.4 | 673.6 | 1.33x | 3.04x |
+| `tf32@fp32` | 1232.0 | 1019.2 | 1.21x | 2.01x |
+| `tf32@tf32` | 1093.0 | 873.0 | 1.25x | 2.34x |
+| `tf32x3@fp32` | 1246.8 | 1037.1 | 1.20x | 1.97x |
+| `tf32x3@tf32` | 1107.6 | 889.8 | 1.24x | 2.30x |
+| `fp32@fp32` | 2064.1 | 1888.4 | 1.09x | 1.08x |
+| `fp32@tf32` | 1920.5 | 1734.1 | 1.11x | 1.18x |
+| PyTorch autocast | 1096.0 | 976.8 | 1.12x | 2.09x |
+| PyTorch FP32 ref | 2236.1 | 2044.5 | 1.09x | base |
 
 ##### `cams` ($451 \times 900$, LoRA)
 
-
-| Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
-| ----------------- | --------------- | ---------------- | ------------ | ------------------- |
-| `bf16_mixed@fp32` | 747.3           | 571.0            | 1.31x        | 2.96x               |
-| `bf16_mixed@tf32` | 747.5           | 571.9            | 1.31x        | 2.96x               |
-| `tf32@fp32`       | 1096.1          | 916.5            | 1.20x        | 1.85x               |
-| `tf32@tf32`       | 898.1           | 718.3            | 1.25x        | 2.35x               |
-| `fp32@fp32`       | 1734.6          | 1562.3           | 1.11x        | 1.08x               |
-| PyTorch autocast  | 985.7           | 888.6            | 1.11x        | 1.90x               |
-| PyTorch FP32 ref  | 1874.5          | 1691.6           | 1.11x        | base                |
-
+| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
+| --- | ---: | ---: | ---: | ---: |
+| `bf16_mixed@fp32` | 970.1 | 801.4 | 1.21x | 2.19x |
+| `bf16_mixed@tf32` | 747.5 | 572.4 | 1.31x | 3.06x |
+| `tf32@fp32` | 1123.1 | 958.2 | 1.17x | 1.83x |
+| `tf32@tf32` | 900.3 | 726.6 | 1.24x | 2.41x |
+| `tf32x3@fp32` | 1133.6 | 969.6 | 1.17x | 1.81x |
+| `tf32x3@tf32` | 911.7 | 738.7 | 1.23x | 2.37x |
+| `fp32@fp32` | 1773.6 | 1629.8 | 1.09x | 1.08x |
+| `fp32@tf32` | 1551.0 | 1395.9 | 1.11x | 1.26x |
+| PyTorch autocast | 1016.3 | 923.4 | 1.10x | 1.90x |
+| PyTorch FP32 ref | 1909.9 | 1753.2 | 1.09x | base |
 
 ##### `tc_tracking` ($721 \times 1440$, LoRA)
 
-
-| Tier              | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
-| ----------------- | --------------- | ---------------- | ------------ | ------------------- |
-| `bf16_mixed@fp32` | 881.7           | 638.5            | 1.38x        | 3.23x               |
-| `bf16_mixed@tf32` | 881.7           | 638.3            | 1.38x        | 3.23x               |
-| `tf32@fp32`       | 1249.6          | 1006.1           | 1.24x        | 2.05x               |
-| `tf32@tf32`       | 1092.0          | 847.0            | 1.29x        | 2.43x               |
-| `fp32@fp32`       | 2115.1          | 1890.9           | 1.12x        | 1.09x               |
-| PyTorch autocast  | 1104.2          | 967.4            | 1.14x        | 2.13x               |
-| PyTorch FP32 ref  | 2307.9          | 2059.9           | 1.12x        | base                |
-
+| Tier | lora_eager (ms) | lora_merged (ms) | eager/merged | vs PyTorch FP32 ref |
+| --- | ---: | ---: | ---: | ---: |
+| `bf16_mixed@fp32` | 1034.9 | 796.2 | 1.30x | 2.67x |
+| `bf16_mixed@tf32` | 883.6 | 640.6 | 1.38x | 3.32x |
+| `tf32@fp32` | 1249.1 | 1018.4 | 1.23x | 2.09x |
+| `tf32@tf32` | 1098.6 | 860.4 | 1.28x | 2.47x |
+| `tf32x3@fp32` | 1264.3 | 1034.7 | 1.22x | 2.05x |
+| `tf32x3@tf32` | 1112.4 | 875.0 | 1.27x | 2.43x |
+| `fp32@fp32` | 2152.8 | 1961.2 | 1.10x | 1.08x |
+| `fp32@tf32` | 2007.2 | 1798.7 | 1.12x | 1.18x |
+| PyTorch autocast | 1099.1 | 965.8 | 1.14x | 2.20x |
+| PyTorch FP32 ref | 2335.0 | 2124.0 | 1.10x | base |
 
 #### Non-isolated benchmarking artifact (`--no-isolate-tiers`)
+
+These tables were not remeasured on 2026-09-29. They remain the 2026-06-23 PyTorch 2.12.1 run and are not comparable with the isolate-tiers times above.
 
 Custom tiers run first in one cold-start and the PyTorch FP32 reference is timed last. cuDNN state from earlier tiers is already warm, so vs-ref speedup is understated. Custom-tier absolute latency matches the isolated run.
 
