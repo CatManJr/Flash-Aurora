@@ -11,8 +11,11 @@ cd "$ROOT"
 # venv and does not re-resolve Cutlass during a multi-hour queue.
 UV=(uv run --no-sync)
 
-export AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-/root/autodl-tmp/aurora}"
-export TMPDIR="${TMPDIR:-/root/autodl-tmp/tmp}"
+if [[ -z "${AURORA_ASSET_ROOT:-}" ]]; then
+  echo "Set AURORA_ASSET_ROOT to the asset directory before running Group A." >&2
+  exit 1
+fi
+export TMPDIR="${TMPDIR:-/tmp}"
 export TEMP="${TEMP:-$TMPDIR}"
 export TMP="${TMP:-$TMPDIR}"
 mkdir -p "$TMPDIR"
@@ -21,7 +24,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
 
-OUT_ROOT="${GROUP_A_OUT:-/root/autodl-tmp/groupA}"
+OUT_ROOT="${GROUP_A_OUT:-${ROOT}/groupA}"
 DUMP_ID="${DUMP_ID:-pytorch-ref-pro6000-torch2.14.0-cu130-seed42}"
 DUMP_DIR="${OUT_ROOT}/dumps/${DUMP_ID}"
 LOG_DIR="${OUT_ROOT}/logs"
