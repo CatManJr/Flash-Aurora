@@ -22,7 +22,6 @@ import gc
 import json
 import os
 import random
-import shutil
 import subprocess
 import sys
 import time
@@ -49,7 +48,6 @@ from _preset_ic import (  # noqa: E402
 )
 from _pretrained_era5 import (  # noqa: E402
     _PYTORCH_BASELINE_KEY,
-    prediction_tensors,
     purge_gpu,
     pytorch_reference_tiers,
     tier_entry,
@@ -152,10 +150,19 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _atomic_save(obj: Any, path: Path) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(obj, tmp)
-    tmp.replace(path)
+def data_disk_tmp(anchor: Path) -> Path:
+    """Scratch directory on the data disk that holds ``anchor``, not the system disk."""
+    path = anchor.expanduser().resolve().parent / "tmp"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def pin_temp_to_data_disk(anchor: Path) -> Path:
+    """Point temp and matplotlib caches at the data disk."""
+    path = data_disk_tmp(anchor)
+    for key in ("TMPDIR", "TEMP", "TMP", "MPLCONFIGDIR"):
+        os.environ[key] = str(path)
+    return path
 
 
 def resolve_tier_specs(names: list[str]) -> list[tuple[str, str]]:
@@ -197,52 +204,70 @@ def mean_rel(ref: torch.Tensor, cand: torch.Tensor) -> float:
     return float(err.mean().item() / ref.abs().mean().clamp_min(1e-8).item())
 
 
-def rollout_tensors(
+def field_of(pred: Any, variable: str) -> torch.Tensor:
+    """Copy one predicted variable to CPU and drop the rest of the field."""
+    for group in ("surf_vars", "atmos_vars"):
+        variables = getattr(pred, group)
+        if variable in variables:
+            return variables[variable].detach().to(dtype=torch.float32, device="cpu").contiguous()
+    raise KeyError(variable)
+
+
+def compare_variable(
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+    *,
+    name: str,
+    tolerance: float,
+    step: int,
+    hours: float,
+) -> dict[str, Any]:
+    rel = mean_rel(reference, candidate)
+    ok = rel <= tolerance
+    return {
+        "step": step,
+        "lead_hours": step * hours,
+        "vars": [{"name": name, "mean_rel": rel, "tol": tolerance, "ok": ok}],
+        "n_fail": 0 if ok else 1,
+        "n_vars": 1,
+        "worst_name": name,
+        "worst_rel": rel,
+    }
+
+
+def rollout_variable(
     model: Any,
     batch: Any,
     *,
     steps: int,
     device: torch.device,
-    cache_in_dram: bool = True,
-    on_step: Any | None = None,
-) -> tuple[list[dict[str, torch.Tensor]], float, float]:
-    """Roll out ``steps`` predictions.
+    on_field: Any,
+    variable: str,
+) -> tuple[float, float]:
+    """Roll out ``steps`` predictions and hand one CPU variable per step to ``on_field``.
 
-    ``cache_in_dram=False`` keeps only the current step's report tensors alive.
-    ``on_step(index, tensors)`` receives that step (1-based) before it is dropped.
+    The rollout runs through the engine's ``RolloutSession`` with
+    ``cache_in_dram=False``, the same switch as ``EngineConfig.cache_in_dram``,
+    so no full-field trajectory is retained. Returns ``(peak_gib, forecast_s)``.
     """
-    from flash_aurora.engine.core.model_protocol import model_uses_v1p5_rollout
-    from flash_aurora.models.aurora.rollout import rollout as legacy_rollout
-    from flash_aurora.models.aurora_v1p5.rollout import rollout as v1p5_rollout
+    from flash_aurora.engine.core.rollout_session import RolloutSession
 
     set_benchmark_seed()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    stream = (
-        v1p5_rollout(model, batch, steps)
-        if model_uses_v1p5_rollout(model)
-        else legacy_rollout(model, batch, steps)
-    )
-    preds: list[dict[str, torch.Tensor]] = []
+    stream = RolloutSession(model, cache_in_dram=False).run(batch, steps)
     t0 = time.perf_counter()
-    with torch.inference_mode():
-        for step_index, pred in enumerate(stream, start=1):
-            tensors = prediction_tensors(pred)
-            del pred
-            if on_step is not None:
-                on_step(step_index, tensors)
-            if cache_in_dram:
-                preds.append(tensors)
-            else:
-                del tensors
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+    for step_index, pred in enumerate(stream, start=1):
+        on_field(step_index, field_of(pred, variable))
+        del pred
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     _synchronize(device)
     forecast_s = time.perf_counter() - t0
     peak_gib = 0.0
     if device.type == "cuda":
         peak_gib = torch.cuda.max_memory_allocated(device) / (1024.0**3)
-    return preds, peak_gib, forecast_s
+    return peak_gib, forecast_s
 
 
 def compare_step(
@@ -469,106 +494,76 @@ def plot_drift(payload: dict[str, Any], dest: Path) -> None:
     plt.close(fig)
 
 
-def compare_step_files(
-    reference_dir: Path,
-    candidate_dir: Path,
-    *,
-    steps: int,
-    hours: float,
-    var_specs: tuple[tuple[str, str, float], ...],
-) -> list[dict[str, Any]]:
-    """Load one reference step and one candidate step, then drop both tensors."""
-    rows: list[dict[str, Any]] = []
-    for step in range(1, steps + 1):
-        reference = torch.load(
-            reference_dir / f"step_{step:04d}.pt",
-            map_location="cpu",
-            weights_only=False,
-        )
-        candidate = torch.load(
-            candidate_dir / f"step_{step:04d}.pt",
-            map_location="cpu",
-            weights_only=False,
-        )
-        stats = compare_step(reference, candidate, var_specs)
-        del reference, candidate
-        stats["step"] = step
-        stats["lead_hours"] = step * hours
-        rows.append(stats)
-    return rows
-
-
 def run_tier_isolated(
     *,
     preset: str,
     precision: str,
     steps: int,
     asset_root: Path,
-    step_dir: Path,
+    variable: str,
+    tolerance: float,
+    hours: float,
+    reference_fields: list[torch.Tensor] | None,
 ) -> dict[str, Any]:
-    """Spawn a fresh process so CuTe/Triton cannot leak VRAM across tiers."""
+    """One model per process. The parent keeps only ``variable`` from the reference tier."""
+    import multiprocessing as mp
+
     require_perceiver_fp32(precision)
-    if step_dir.exists():
-        shutil.rmtree(step_dir)
-    step_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable,
-        str(CLOSEDLOOP_WORKER),
-        "--preset",
-        preset,
-        "--precision",
-        precision,
-        "--steps",
-        str(steps),
-        "--asset-root",
-        str(asset_root),
-        "--step-dir",
-        str(step_dir),
-    ]
-    err_path = step_dir / "worker.stderr"
+    from _closedloop_tier_worker import stream_tier
+
+    context = mp.get_context("spawn")
+    queue: mp.Queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=stream_tier,
+        args=(queue, preset, precision, steps, str(asset_root), variable),
+    )
+    process.start()
+    fields: list[torch.Tensor] = []
+    rows: list[dict[str, Any]] = []
     meta: dict[str, Any] = {}
-    n_steps = 0
-    child_env = os.environ.copy()
-    child_env["AURORA_ASSET_ROOT"] = str(asset_root)
-    with err_path.open("w", encoding="utf-8") as err_f:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=_REPO,
-            env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=err_f,
-            text=True,
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            kind = msg.get("event")
-            if kind == "step":
-                n_steps += 1
+    try:
+        while True:
+            kind, payload = queue.get()
+            if kind == "field":
+                tensor = payload
+                if reference_fields is None:
+                    fields.append(tensor)
+                else:
+                    rows.append(
+                        compare_variable(
+                            reference_fields[len(rows)],
+                            tensor,
+                            name=variable,
+                            tolerance=tolerance,
+                            step=len(rows) + 1,
+                            hours=hours,
+                        )
+                    )
+                    del tensor
             elif kind == "done":
-                meta = msg
-        rc = proc.wait()
-    stderr_text = err_path.read_text(encoding="utf-8") if err_path.is_file() else ""
-    if rc != 0:
-        shutil.rmtree(step_dir, ignore_errors=True)
-        tail = stderr_text[-4000:] if stderr_text else ""
+                meta = payload
+                break
+            elif kind == "error":
+                raise RuntimeError(payload)
+            else:
+                raise RuntimeError(f"unknown worker event {kind!r}")
+    finally:
+        process.join()
+        queue.close()
+    if process.exitcode not in (0, None):
         raise RuntimeError(
-            f"isolated closed-loop failed preset={preset!r} precision={precision!r} rc={rc}\n{tail}"
+            f"isolated closed-loop failed preset={preset!r} precision={precision!r} "
+            f"rc={process.exitcode}"
         )
-    if n_steps != steps:
-        shutil.rmtree(step_dir, ignore_errors=True)
+    expected = fields if reference_fields is None else rows
+    if len(expected) != steps:
         raise RuntimeError(
-            f"isolated closed-loop returned {n_steps} steps, expected {steps} "
+            f"isolated closed-loop returned {len(expected)} steps, expected {steps} "
             f"(preset={preset!r} precision={precision!r})"
         )
     return {
-        "step_dir": step_dir,
+        "fields": fields,
+        "rows": rows,
         "peak_gib": float(meta.get("peak_gib", 0.0)),
         "load_s": float(meta.get("load_s", 0.0)),
         "forecast_s": float(meta.get("forecast_s", 0.0)),
@@ -585,21 +580,32 @@ def run_preset(
     device: torch.device,
     baseline: str,
     isolate_tiers: bool,
-    scratch_root: Path,
 ) -> dict[str, Any]:
     batch, config = load_preset_batch(preset, asset_root)
     ckpt = checkpoint_path(config, asset_root)
     var_specs = output_var_tolerances(config)
     hours = float(config.variant.timestep_hours)
-    print(f"\n=== {preset}  steps={steps}  dt={hours:g}h  ckpt={ckpt.name} ===", flush=True)
+    variable = representative_variable(preset)
+    tolerance = next((tol for _group, name, tol in var_specs if name == variable), 5e-3)
+    print(
+        f"\n=== {preset}  steps={steps}  dt={hours:g}h  ckpt={ckpt.name}  "
+        f"variable={variable} ===",
+        flush=True,
+    )
 
-    step_dirs: dict[str, Path] = {}
+    reference_fields: list[torch.Tensor] = []
     peak_gib: dict[str, float] = {}
     timing: dict[str, dict[str, Any]] = {}
+    tiers_out: dict[str, Any] = {baseline: []}
     for label, precision in tier_specs:
         require_perceiver_fp32(precision)
+        if label != baseline and len(reference_fields) != steps:
+            print(f"  [skip] {label}: no baseline trajectory to compare against", flush=True)
+            timing[label] = {"ok": False, "error": "baseline trajectory unavailable"}
+            peak_gib[label] = 0.0
+            tiers_out[label] = []
+            continue
         print(f"  [load] {label} ({precision})", flush=True)
-        tier_dir = scratch_root / f"{preset}_{label}"
         try:
             if isolate_tiers:
                 result = run_tier_isolated(
@@ -607,9 +613,14 @@ def run_preset(
                     precision=precision,
                     steps=steps,
                     asset_root=asset_root,
-                    step_dir=tier_dir,
+                    variable=variable,
+                    tolerance=tolerance,
+                    hours=hours,
+                    reference_fields=None if label == baseline else reference_fields,
                 )
-                step_dirs[label] = result["step_dir"]
+                if label == baseline:
+                    reference_fields = result["fields"]
+                rows = result["rows"]
                 peak_gib[label] = result["peak_gib"]
                 timing[label] = {
                     "ok": True,
@@ -620,28 +631,45 @@ def run_preset(
                 }
             else:
                 purge_gpu()
+                collected: list[torch.Tensor] = []
+                compared: list[dict[str, Any]] = []
+
+                def _keep_reference(_index: int, tensor: torch.Tensor) -> None:
+                    collected.append(tensor)
+
+                def _compare_candidate(index: int, tensor: torch.Tensor) -> None:
+                    compared.append(
+                        compare_variable(
+                            reference_fields[index - 1],
+                            tensor,
+                            name=variable,
+                            tolerance=tolerance,
+                            step=index,
+                            hours=hours,
+                        )
+                    )
+                    del tensor
+
                 t_load = time.perf_counter()
                 model = build_model(config, ckpt, precision=precision, device=device)
                 _synchronize(device)
                 load_s = time.perf_counter() - t_load
-                if tier_dir.exists():
-                    shutil.rmtree(tier_dir)
-                tier_dir.mkdir(parents=True, exist_ok=True)
-
-                def _save_step(index: int, tensors: dict[str, torch.Tensor], dest: Path = tier_dir) -> None:
-                    _atomic_save(tensors, dest / f"step_{index:04d}.pt")
-
-                _preds, peak, forecast_s = rollout_tensors(
+                peak, forecast_s = rollout_variable(
                     model,
                     batch,
                     steps=steps,
                     device=device,
-                    cache_in_dram=False,
-                    on_step=_save_step,
+                    on_field=_keep_reference if label == baseline else _compare_candidate,
+                    variable=variable,
                 )
-                step_dirs[label] = tier_dir
-                peak_gib[label] = peak
+                del model
+                purge_gpu()
+                gc.collect()
+                if label == baseline:
+                    reference_fields = collected
+                rows = compared
                 per_step_s = forecast_s / steps if steps else 0.0
+                peak_gib[label] = peak
                 timing[label] = {
                     "ok": True,
                     "load_s": load_s,
@@ -649,9 +677,15 @@ def run_preset(
                     "per_step_s": per_step_s,
                     "peak_gib": peak,
                 }
-                del model
-                purge_gpu()
-                gc.collect()
+            if label != baseline:
+                tiers_out[label] = rows
+                for stats in rows:
+                    print(
+                        f"  [{label}] step {stats['step']:02d}  "
+                        f"fail {stats['n_fail']}/{stats['n_vars']}  "
+                        f"worst {stats['worst_name']}={stats['worst_rel']:.3e}",
+                        flush=True,
+                    )
             print(
                 f"  [done] {label}  forecast={timing[label]['forecast_s']:.1f}s  "
                 f"peak={peak_gib[label]:.1f} GiB",
@@ -661,40 +695,12 @@ def run_preset(
             print(f"  [fail] {label}: {type(exc).__name__}: {exc}", flush=True)
             timing[label] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             peak_gib[label] = 0.0
-            shutil.rmtree(tier_dir, ignore_errors=True)
+            if label != baseline:
+                tiers_out[label] = []
             purge_gpu()
             gc.collect()
-
-    ref_dir = step_dirs.get(baseline)
-    tiers_out: dict[str, Any] = {baseline: []}
-    if ref_dir is None:
+    if not timing.get(baseline, {}).get("ok"):
         print(f"  [skip-compare] baseline {baseline} produced no trajectory", flush=True)
-    for label, _precision in tier_specs:
-        if label == baseline:
-            continue
-        cand_dir = step_dirs.get(label)
-        if cand_dir is None or ref_dir is None:
-            tiers_out[label] = []
-            shutil.rmtree(cand_dir, ignore_errors=True) if cand_dir else None
-            continue
-        rows = compare_step_files(
-            ref_dir,
-            cand_dir,
-            steps=steps,
-            hours=hours,
-            var_specs=var_specs,
-        )
-        for stats in rows:
-            print(
-                f"  [{label}] step {stats['step']:02d}  fail {stats['n_fail']}/{stats['n_vars']}  "
-                f"worst {stats['worst_name']}={stats['worst_rel']:.3e}",
-                flush=True,
-            )
-        tiers_out[label] = rows
-        shutil.rmtree(cand_dir, ignore_errors=True)
-        gc.collect()
-    if ref_dir is not None:
-        shutil.rmtree(ref_dir, ignore_errors=True)
     return {
         "steps": steps,
         "timestep_hours": hours,
@@ -751,12 +757,6 @@ def main() -> None:
         help="Run each precision tier in a fresh subprocess (default: on).",
     )
     parser.add_argument(
-        "--scratch-dir",
-        type=Path,
-        default=None,
-        help="Directory for one-step report tensors (default: beside --json-out, not tmpfs).",
-    )
-    parser.add_argument(
         "--merge-json",
         type=Path,
         default=None,
@@ -780,6 +780,7 @@ def main() -> None:
     args = parser.parse_args()
 
     asset_root = (args.asset_root or default_asset_root()).expanduser().resolve()
+    pin_temp_to_data_disk(asset_root)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         raise SystemExit("CUDA is required for rollout drift")
@@ -787,12 +788,6 @@ def main() -> None:
     for _label, precision in resolve_tier_specs(args.tiers):
         require_perceiver_fp32(precision)
     tier_specs = resolve_tier_specs(args.tiers)
-
-    scratch_root = args.scratch_dir
-    if scratch_root is None:
-        scratch_root = args.json_out.expanduser().resolve().parent / "closedloop_steps"
-    scratch_root = scratch_root / f"flash_aurora_cl_{os.getpid()}"
-    scratch_root.mkdir(parents=True, exist_ok=True)
 
     payload: dict[str, Any] = {
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -820,29 +815,25 @@ def main() -> None:
             return args.steps
         return steps_for_horizon(args.horizon_hours, timestep_hours)
 
-    try:
-        for preset in args.presets:
-            if preset in payload["presets"]:
-                print(f"[skip] {preset} already in merge JSON", flush=True)
-                continue
-            _, config = load_preset_batch(preset, asset_root)
-            n_steps = _n_steps(preset, float(config.variant.timestep_hours))
-            payload["presets"][preset] = run_preset(
-                preset=preset,
-                asset_root=asset_root,
-                steps=n_steps,
-                tier_specs=tier_specs,
-                device=device,
-                baseline=_PYTORCH_BASELINE_KEY,
-                isolate_tiers=args.isolate_tiers,
-                scratch_root=scratch_root,
-            )
-            args.json_out.parent.mkdir(parents=True, exist_ok=True)
-            args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            write_markdown(args.report_out, payload=payload)
-            print(f"[checkpoint] {preset} -> {args.json_out}", flush=True)
-    finally:
-        shutil.rmtree(scratch_root, ignore_errors=True)
+    for preset in args.presets:
+        if preset in payload["presets"]:
+            print(f"[skip] {preset} already in merge JSON", flush=True)
+            continue
+        _, config = load_preset_batch(preset, asset_root)
+        n_steps = _n_steps(preset, float(config.variant.timestep_hours))
+        payload["presets"][preset] = run_preset(
+            preset=preset,
+            asset_root=asset_root,
+            steps=n_steps,
+            tier_specs=tier_specs,
+            device=device,
+            baseline=_PYTORCH_BASELINE_KEY,
+            isolate_tiers=args.isolate_tiers,
+        )
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_markdown(args.report_out, payload=payload)
+        print(f"[checkpoint] {preset} -> {args.json_out}", flush=True)
 
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")

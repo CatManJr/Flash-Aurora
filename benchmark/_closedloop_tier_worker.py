@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""One closed-loop precision tier in a fresh process (VRAM isolation)."""
+"""One closed-loop tier in its own process: a single model on the GPU."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-import time
+import traceback
 from pathlib import Path
 
 _BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -18,14 +17,69 @@ import _bootstrap  # noqa: F401, E402
 from flash_aurora.engine.core.asset_root import resolve_asset_root  # noqa: E402
 from _preset_ic import checkpoint_path, load_preset_batch  # noqa: E402
 from bench_rollout_drift import (  # noqa: E402
-    _atomic_save,
     _synchronize,
     build_model,
+    pin_temp_to_data_disk,
     require_perceiver_fp32,
-    rollout_tensors,
+    rollout_variable,
 )
 
 import torch
+
+
+def stream_tier(queue, preset: str, precision: str, steps: int, asset_root: str, variable: str) -> None:
+    """Roll one model. Each step sends only ``variable`` to the parent, then frees the GPU."""
+    try:
+        root = Path(asset_root)
+        os.environ["AURORA_ASSET_ROOT"] = str(root)
+        os.environ["OMP_NUM_THREADS"] = "8"
+        os.environ["MKL_NUM_THREADS"] = "8"
+        pin_temp_to_data_disk(root)
+        require_perceiver_fp32(precision)
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA required")
+        device = torch.device("cuda")
+        import time
+
+        started = time.perf_counter()
+        batch, config = load_preset_batch(preset, root)
+        ckpt = checkpoint_path(config, root)
+        if not ckpt.is_file():
+            raise FileNotFoundError(f"checkpoint missing: {ckpt}")
+        model = build_model(config, ckpt, precision=precision, device=device)
+        _synchronize(device)
+        load_s = time.perf_counter() - started
+
+        def send_field(index: int, tensor: torch.Tensor) -> None:
+            queue.put(("field", tensor))
+
+        forecast_started = time.perf_counter()
+        peak_gib, _inner = rollout_variable(
+            model,
+            batch,
+            steps=steps,
+            device=device,
+            on_field=send_field,
+            variable=variable,
+        )
+        _synchronize(device)
+        forecast_s = time.perf_counter() - forecast_started
+        del model, batch
+        torch.cuda.empty_cache()
+        queue.put(
+            (
+                "done",
+                {
+                    "peak_gib": peak_gib,
+                    "load_s": load_s,
+                    "forecast_s": forecast_s,
+                    "per_step_s": forecast_s / steps if steps else 0.0,
+                },
+            )
+        )
+    except Exception:
+        queue.put(("error", traceback.format_exc()))
+        raise
 
 
 def main() -> None:
@@ -33,63 +87,17 @@ def main() -> None:
     parser.add_argument("--preset", required=True)
     parser.add_argument("--precision", required=True)
     parser.add_argument("--steps", type=int, required=True)
+    parser.add_argument("--variable", required=True)
     parser.add_argument("--asset-root", type=Path, default=None)
-    parser.add_argument("--step-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.asset_root is None:
         args.asset_root = resolve_asset_root()
     if args.asset_root is None:
         raise SystemExit("pass --asset-root or export AURORA_ASSET_ROOT")
+    import multiprocessing as mp
 
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA required")
-
-    require_perceiver_fp32(args.precision)
-    device = torch.device("cuda")
-    asset_root = args.asset_root.expanduser().resolve()
-    step_dir = args.step_dir.expanduser().resolve()
-    step_dir.mkdir(parents=True, exist_ok=True)
-
-    t_load = time.perf_counter()
-    batch, config = load_preset_batch(args.preset, asset_root)
-    ckpt = checkpoint_path(config, asset_root)
-    if not ckpt.is_file():
-        raise SystemExit(f"checkpoint missing: {ckpt}")
-    model = build_model(config, ckpt, precision=args.precision, device=device)
-    _synchronize(device)
-    load_s = time.perf_counter() - t_load
-
-    def save_report_step(index: int, tensors: dict) -> None:
-        path = step_dir / f"step_{index:04d}.pt"
-        _atomic_save(tensors, path)
-        print(json.dumps({"event": "step", "index": index, "path": str(path)}), flush=True)
-
-    t_forecast = time.perf_counter()
-    _preds, peak_gib, _inner_s = rollout_tensors(
-        model,
-        batch,
-        steps=args.steps,
-        device=device,
-        cache_in_dram=False,
-        on_step=save_report_step,
-    )
-    _synchronize(device)
-    forecast_s = time.perf_counter() - t_forecast
-    del model, _preds
-
-    per_step_s = forecast_s / args.steps if args.steps else 0.0
-    print(
-        json.dumps(
-            {
-                "event": "done",
-                "peak_gib": peak_gib,
-                "load_s": load_s,
-                "forecast_s": forecast_s,
-                "per_step_s": per_step_s,
-            }
-        ),
-        flush=True,
-    )
+    queue = mp.get_context("spawn").Queue()
+    stream_tier(queue, args.preset, args.precision, args.steps, str(args.asset_root), args.variable)
 
 
 if __name__ == "__main__":

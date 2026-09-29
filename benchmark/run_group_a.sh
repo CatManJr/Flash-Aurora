@@ -12,6 +12,10 @@ cd "$ROOT"
 UV=(uv run --no-sync)
 
 export AURORA_ASSET_ROOT="${AURORA_ASSET_ROOT:-/root/autodl-tmp/aurora}"
+export TMPDIR="${TMPDIR:-/root/autodl-tmp/tmp}"
+export TEMP="${TEMP:-$TMPDIR}"
+export TMP="${TMP:-$TMPDIR}"
+mkdir -p "$TMPDIR"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONUNBUFFERED=1
