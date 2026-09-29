@@ -17,8 +17,8 @@ license-files = [
 requires-python = ">=3.12, <3.14"
 dependencies = [
     "einops>=0.8.2",
-    "nvidia-cutlass-dsl[cu13]==4.5.2",
-    "quack-kernels>=0.5.0,<0.5.1",
+    "nvidia-cutlass-dsl[cu13]==4.7.1",
+    "quack-kernels==0.6.5",
     "huggingface-hub>=1.8.0",
     "matplotlib>=3.10.8",
     "numpy",
@@ -28,8 +28,8 @@ dependencies = [
     "scipy>=1.17.1",
     "timm>=1.0.26",
     "tqdm>=4.67.0",
-    "torch>=2.10.0",
-    "triton>=3.6.0",
+    "torch==2.14.0",
+    "triton==3.8.0",
     "xarray",
     "netcdf4",
     "cdsapi",

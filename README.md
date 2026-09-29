@@ -20,7 +20,7 @@ cd Flash-Aurora
 uv sync
 ```
 
-Set `CUTE_DSL_ARCH` when the CuTe kernels need an explicit GPU architecture (`sm_89` on RTX 4090, `sm_120a` on Blackwell). If PyPI is slow, point `uv` at a mirror with `UV_DEFAULT_INDEX` or a local `uv.toml`; keep the committed `uv.lock` on the official index.
+Set `CUTE_DSL_ARCH` when the CuTe kernels need an explicit GPU architecture (`sm_89` on RTX 4090, `sm_120a` on Blackwell). The published measurements use PyTorch 2.14.0, Triton 3.8.0, and CuTe DSL 4.7.1, which `uv.lock` pins. If PyPI is slow, point `uv` at a mirror with `UV_DEFAULT_INDEX` or a local `uv.toml`; keep the committed `uv.lock` on the official index.
 
 ## Quick start
 
@@ -54,7 +54,7 @@ Scheduler loopback, two-GPU placement, and the notebook index: [docs/tutorial.md
 
 ## What it does
 
-Production mixed precision is faster than unfused FP32 and stays closer to that twin than framework autocast. One forward step on RTX PRO 6000 Blackwell is about $680$--$1000\,\mathrm{ms}$ with a TF32 Perceiver (`bf16_mixed@tf32`) and about $830$--$1150\,\mathrm{ms}$ with an FP32 Perceiver (`bf16_mixed@fp32`), versus about $1.9$--$2.5\,\mathrm{s}$ for unfused FP32. Aurora 1.5 ensemble is the slow end of both ranges, because its stochastic MLP stays on the tier's TF32 matmul. Each bar is a separate process (`--isolate-tiers`).
+Production mixed precision is faster than unfused FP32 and stays closer to that twin than framework autocast. One forward step on RTX PRO 6000 Blackwell, measured with PyTorch 2.14.0 and CuTe DSL 4.7.1, is about $680$--$1000\,\mathrm{ms}$ with a TF32 Perceiver (`bf16_mixed@tf32`) and about $830$--$1150\,\mathrm{ms}$ with an FP32 Perceiver (`bf16_mixed@fp32`), versus about $1.9$--$2.5\,\mathrm{s}$ for unfused FP32. Aurora 1.5 ensemble is the slow end of both ranges, because its stochastic MLP stays on the tier's TF32 matmul. Each bar is a separate process (`--isolate-tiers`).
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/e2e_latency_by_tier_all_presets.svg" alt="One-step end-to-end forward latency by precision tier" width="95%"/>
