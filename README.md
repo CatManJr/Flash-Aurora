@@ -54,14 +54,14 @@ Scheduler loopback, two-GPU placement, and the notebook index: [docs/tutorial.md
 
 ## What it does
 
-Production mixed precision (`bf16_mixed@fp32`) is faster than unfused FP32 and stays closer to that twin than framework autocast. One forward step on RTX PRO 6000 Blackwell is about $570$--$680\,\mathrm{ms}$ on the $0.25^{\circ}$ weather presets, versus about $1.7$--$2.1\,\mathrm{s}$ for unfused FP32. Each bar is a separate process (`--isolate-tiers`).
+Production mixed precision is faster than unfused FP32 and stays closer to that twin than framework autocast. One forward step on RTX PRO 6000 Blackwell is about $680$--$1000\,\mathrm{ms}$ with a TF32 Perceiver (`bf16_mixed@tf32`) and about $830$--$1150\,\mathrm{ms}$ with an FP32 Perceiver (`bf16_mixed@fp32`), versus about $1.9$--$2.5\,\mathrm{s}$ for unfused FP32. Aurora 1.5 ensemble is the slow end of both ranges, because its stochastic MLP stays on the tier's TF32 matmul. Each bar is a separate process (`--isolate-tiers`).
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/e2e_latency_by_tier_all_presets.svg" alt="One-step end-to-end forward latency by precision tier" width="95%"/>
 </p>
 
-Recommended tiers stay within per-variable tolerances versus the unfused FP32 reference (seed 42). `bf16@*` is not a production path.
-
+Recommended tiers stay within per-variable tolerances versus the unfused FP32 reference (seed 42). The one exception is `bf16_mixed@tf32` on `aurora_v1p5_ensemble`, where `scaled_tp_1h` is about $1.1\times$ the tolerance. `bf16@*` is not a production path because full BF16 GEEM.
+prediction in experiments.
 <p align="center">
   <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/precision_mean_rel_stacked_by_model.svg" alt="Stacked mean relative error by precision tier and preset" width="95%"/>
 </p>
