@@ -53,6 +53,16 @@ from flash_aurora.engine.distributed import (
 from flash_aurora.engine.distributed.pipeline import distributed_status, restore_pipeline_parallel
 
 
+def collect_rollout_batches(stream: Iterable[Batch], *, cache_in_dram: bool) -> list[Batch]:
+    """Keep every yielded prediction, or only the last one when DRAM caching is off."""
+    if cache_in_dram:
+        return list(stream)
+    last: Batch | None = None
+    for last in stream:
+        pass
+    return [] if last is None else [last]
+
+
 class AuroraEngine:
     def __init__(
         self,
@@ -464,13 +474,19 @@ class AuroraEngine:
         batch = self._builder().from_netcdf_path(Path(path))
         if steps == 1:
             return [self.predict(batch)]
-        return list(self.rollout_stream(batch, steps))
+        return collect_rollout_batches(
+            self.rollout_stream(batch, steps),
+            cache_in_dram=self.config.cache_in_dram,
+        )
 
     def run_from_adapter(self, request: IngestRequest, steps: int = 1) -> list[Batch]:
         batch = self._builder().from_source(request)
         if steps == 1:
             return [self.predict(batch)]
-        return list(self.rollout_stream(batch, steps))
+        return collect_rollout_batches(
+            self.rollout_stream(batch, steps),
+            cache_in_dram=self.config.cache_in_dram,
+        )
 
     def validate(self, batch: Batch) -> None:
         self._validator.validate(batch)
@@ -491,7 +507,11 @@ class AuroraEngine:
         self.validate(batch)
         self._maybe_warmup(batch)
         try:
-            session = RolloutSession(self.model, observers)
+            session = RolloutSession(
+                self.model,
+                observers,
+                cache_in_dram=self.config.cache_in_dram,
+            )
             yield from session.run(
                 batch,
                 steps,

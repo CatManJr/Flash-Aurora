@@ -18,11 +18,15 @@ class RolloutSession:
         self,
         model: AuroraModel,
         observers: Iterable[RolloutObserver] | None = None,
+        *,
+        cache_in_dram: bool = True,
     ) -> None:
         self._model = model
         self._observers = list(observers or [])
         self._uses_v1p5 = model_uses_v1p5_rollout(model)
         self._rollout = v1p5_rollout if self._uses_v1p5 else optimized_rollout
+        self.cache_in_dram = cache_in_dram
+        self.predictions: list[Batch] = []
 
     def run(
         self,
@@ -50,4 +54,6 @@ class RolloutSession:
             for step, pred in enumerate(stream):
                 for observer in self._observers:
                     observer.on_step(step, pred)
+                if self.cache_in_dram:
+                    self.predictions.append(pred)
                 yield pred

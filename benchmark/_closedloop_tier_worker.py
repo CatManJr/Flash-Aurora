@@ -55,19 +55,23 @@ def main() -> None:
     _synchronize(device)
     load_s = time.perf_counter() - t_load
 
-    t_forecast = time.perf_counter()
-    preds, peak_gib, _inner_s = rollout_tensors(
-        model, batch, steps=args.steps, device=device
-    )
-    _synchronize(device)
-    forecast_s = time.perf_counter() - t_forecast
-    del model
-
-    for index, tensors in enumerate(preds, start=1):
+    def save_report_step(index: int, tensors: dict) -> None:
         path = step_dir / f"step_{index:04d}.pt"
         _atomic_save(tensors, path)
         print(json.dumps({"event": "step", "index": index, "path": str(path)}), flush=True)
-    del preds
+
+    t_forecast = time.perf_counter()
+    _preds, peak_gib, _inner_s = rollout_tensors(
+        model,
+        batch,
+        steps=args.steps,
+        device=device,
+        cache_in_dram=False,
+        on_step=save_report_step,
+    )
+    _synchronize(device)
+    forecast_s = time.perf_counter() - t_forecast
+    del model, _preds
 
     per_step_s = forecast_s / args.steps if args.steps else 0.0
     print(

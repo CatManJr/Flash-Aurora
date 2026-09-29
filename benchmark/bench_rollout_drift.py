@@ -25,7 +25,6 @@ import random
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -193,7 +192,14 @@ def rollout_tensors(
     *,
     steps: int,
     device: torch.device,
+    cache_in_dram: bool = True,
+    on_step: Any | None = None,
 ) -> tuple[list[dict[str, torch.Tensor]], float, float]:
+    """Roll out ``steps`` predictions.
+
+    ``cache_in_dram=False`` keeps only the current step's report tensors alive.
+    ``on_step(index, tensors)`` receives that step (1-based) before it is dropped.
+    """
     from flash_aurora.engine.core.model_protocol import model_uses_v1p5_rollout
     from flash_aurora.models.aurora.rollout import rollout as legacy_rollout
     from flash_aurora.models.aurora_v1p5.rollout import rollout as v1p5_rollout
@@ -209,9 +215,15 @@ def rollout_tensors(
     preds: list[dict[str, torch.Tensor]] = []
     t0 = time.perf_counter()
     with torch.inference_mode():
-        for pred in stream:
-            preds.append(prediction_tensors(pred))
+        for step_index, pred in enumerate(stream, start=1):
+            tensors = prediction_tensors(pred)
             del pred
+            if on_step is not None:
+                on_step(step_index, tensors)
+            if cache_in_dram:
+                preds.append(tensors)
+            else:
+                del tensors
             if device.type == "cuda":
                 torch.cuda.empty_cache()
     _synchronize(device)
@@ -409,6 +421,35 @@ def plot_drift(payload: dict[str, Any], dest: Path) -> None:
     plt.close(fig)
 
 
+def compare_step_files(
+    reference_dir: Path,
+    candidate_dir: Path,
+    *,
+    steps: int,
+    hours: float,
+    var_specs: tuple[tuple[str, str, float], ...],
+) -> list[dict[str, Any]]:
+    """Load one reference step and one candidate step, then drop both tensors."""
+    rows: list[dict[str, Any]] = []
+    for step in range(1, steps + 1):
+        reference = torch.load(
+            reference_dir / f"step_{step:04d}.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        candidate = torch.load(
+            candidate_dir / f"step_{step:04d}.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        stats = compare_step(reference, candidate, var_specs)
+        del reference, candidate
+        stats["step"] = step
+        stats["lead_hours"] = step * hours
+        rows.append(stats)
+    return rows
+
+
 def run_tier_isolated(
     *,
     preset: str,
@@ -437,8 +478,8 @@ def run_tier_isolated(
         str(step_dir),
     ]
     err_path = step_dir / "worker.stderr"
-    preds: list[dict[str, torch.Tensor]] = []
     meta: dict[str, Any] = {}
+    n_steps = 0
     with err_path.open("w", encoding="utf-8") as err_f:
         proc = subprocess.Popen(
             cmd,
@@ -459,27 +500,25 @@ def run_tier_isolated(
                 continue
             kind = msg.get("event")
             if kind == "step":
-                path = Path(msg["path"])
-                tensors = torch.load(path, map_location="cpu", weights_only=False)
-                preds.append(tensors)
-                path.unlink(missing_ok=True)
+                n_steps += 1
             elif kind == "done":
                 meta = msg
         rc = proc.wait()
     stderr_text = err_path.read_text(encoding="utf-8") if err_path.is_file() else ""
-    shutil.rmtree(step_dir, ignore_errors=True)
     if rc != 0:
+        shutil.rmtree(step_dir, ignore_errors=True)
         tail = stderr_text[-4000:] if stderr_text else ""
         raise RuntimeError(
             f"isolated closed-loop failed preset={preset!r} precision={precision!r} rc={rc}\n{tail}"
         )
-    if len(preds) != steps:
+    if n_steps != steps:
+        shutil.rmtree(step_dir, ignore_errors=True)
         raise RuntimeError(
-            f"isolated closed-loop returned {len(preds)} steps, expected {steps} "
+            f"isolated closed-loop returned {n_steps} steps, expected {steps} "
             f"(preset={preset!r} precision={precision!r})"
         )
     return {
-        "preds": preds,
+        "step_dir": step_dir,
         "peak_gib": float(meta.get("peak_gib", 0.0)),
         "load_s": float(meta.get("load_s", 0.0)),
         "forecast_s": float(meta.get("forecast_s", 0.0)),
@@ -504,12 +543,13 @@ def run_preset(
     hours = float(config.variant.timestep_hours)
     print(f"\n=== {preset}  steps={steps}  dt={hours:g}h  ckpt={ckpt.name} ===", flush=True)
 
-    trajectories: dict[str, list[dict[str, torch.Tensor]]] = {}
+    step_dirs: dict[str, Path] = {}
     peak_gib: dict[str, float] = {}
     timing: dict[str, dict[str, Any]] = {}
     for label, precision in tier_specs:
         require_perceiver_fp32(precision)
         print(f"  [load] {label} ({precision})", flush=True)
+        tier_dir = scratch_root / f"{preset}_{label}"
         try:
             if isolate_tiers:
                 result = run_tier_isolated(
@@ -517,9 +557,9 @@ def run_preset(
                     precision=precision,
                     steps=steps,
                     asset_root=asset_root,
-                    step_dir=scratch_root / f"{preset}_{label}",
+                    step_dir=tier_dir,
                 )
-                trajectories[label] = result["preds"]
+                step_dirs[label] = result["step_dir"]
                 peak_gib[label] = result["peak_gib"]
                 timing[label] = {
                     "ok": True,
@@ -534,10 +574,22 @@ def run_preset(
                 model = build_model(config, ckpt, precision=precision, device=device)
                 _synchronize(device)
                 load_s = time.perf_counter() - t_load
-                preds, peak, forecast_s = rollout_tensors(
-                    model, batch, steps=steps, device=device
+                if tier_dir.exists():
+                    shutil.rmtree(tier_dir)
+                tier_dir.mkdir(parents=True, exist_ok=True)
+
+                def _save_step(index: int, tensors: dict[str, torch.Tensor], dest: Path = tier_dir) -> None:
+                    _atomic_save(tensors, dest / f"step_{index:04d}.pt")
+
+                _preds, peak, forecast_s = rollout_tensors(
+                    model,
+                    batch,
+                    steps=steps,
+                    device=device,
+                    cache_in_dram=False,
+                    on_step=_save_step,
                 )
-                trajectories[label] = preds
+                step_dirs[label] = tier_dir
                 peak_gib[label] = peak
                 per_step_s = forecast_s / steps if steps else 0.0
                 timing[label] = {
@@ -558,37 +610,41 @@ def run_preset(
         except Exception as exc:
             print(f"  [fail] {label}: {type(exc).__name__}: {exc}", flush=True)
             timing[label] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            trajectories[label] = []
             peak_gib[label] = 0.0
+            shutil.rmtree(tier_dir, ignore_errors=True)
             purge_gpu()
             gc.collect()
 
-    ref_traj = trajectories.get(baseline) or []
+    ref_dir = step_dirs.get(baseline)
     tiers_out: dict[str, Any] = {baseline: []}
-    if not ref_traj:
+    if ref_dir is None:
         print(f"  [skip-compare] baseline {baseline} produced no trajectory", flush=True)
     for label, _precision in tier_specs:
         if label == baseline:
             continue
-        cand = trajectories.get(label) or []
-        if not cand or not ref_traj:
+        cand_dir = step_dirs.get(label)
+        if cand_dir is None or ref_dir is None:
             tiers_out[label] = []
+            shutil.rmtree(cand_dir, ignore_errors=True) if cand_dir else None
             continue
-        rows = []
-        for step, (ref, pred) in enumerate(zip(ref_traj, cand), start=1):
-            stats = compare_step(ref, pred, var_specs)
-            stats["step"] = step
-            stats["lead_hours"] = step * hours
-            rows.append(stats)
+        rows = compare_step_files(
+            ref_dir,
+            cand_dir,
+            steps=steps,
+            hours=hours,
+            var_specs=var_specs,
+        )
+        for stats in rows:
             print(
-                f"  [{label}] step {step:02d}  fail {stats['n_fail']}/{stats['n_vars']}  "
+                f"  [{label}] step {stats['step']:02d}  fail {stats['n_fail']}/{stats['n_vars']}  "
                 f"worst {stats['worst_name']}={stats['worst_rel']:.3e}",
                 flush=True,
             )
         tiers_out[label] = rows
-        del cand
-        trajectories[label] = []
+        shutil.rmtree(cand_dir, ignore_errors=True)
         gc.collect()
+    if ref_dir is not None:
+        shutil.rmtree(ref_dir, ignore_errors=True)
     return {
         "steps": steps,
         "timestep_hours": hours,
@@ -648,7 +704,7 @@ def main() -> None:
         "--scratch-dir",
         type=Path,
         default=None,
-        help="Directory for isolated-worker step files (default: /dev/shm).",
+        help="Directory for one-step report tensors (default: beside --json-out, not tmpfs).",
     )
     parser.add_argument(
         "--merge-json",
@@ -684,8 +740,7 @@ def main() -> None:
 
     scratch_root = args.scratch_dir
     if scratch_root is None:
-        shm = Path("/dev/shm")
-        scratch_root = shm if shm.is_dir() else Path(tempfile.gettempdir())
+        scratch_root = args.json_out.expanduser().resolve().parent / "closedloop_steps"
     scratch_root = scratch_root / f"flash_aurora_cl_{os.getpid()}"
     scratch_root.mkdir(parents=True, exist_ok=True)
 

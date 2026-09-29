@@ -127,6 +127,7 @@ CUDA_VISIBLE_DEVICES= "${UV[@]}" pytest \
   tests/benchmark/test_baseline_matrix.py \
   tests/benchmark/test_latency_bench.py \
   tests/benchmark/test_rollout_horizon.py \
+  tests/benchmark/test_closedloop_scratch.py \
   tests/benchmark/test_one_step_profile.py \
   tests/benchmark/test_precision_tiers.py \
   -q --tb=short >"${LOG_DIR}/adapter_tests.log" 2>&1 || adapter_ec=$?

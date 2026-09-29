@@ -196,6 +196,8 @@ class EngineConfig:
     export_max_inflight: int | None = None
     export_use_egress_stream: bool = True
     ic_cache: bool = False
+    # When False, multi-step helpers keep only the latest prediction in DRAM.
+    cache_in_dram: bool = True
     forward_warmup_iters: int = 2
     distributed: "DistributedConfig | None" = None
 
