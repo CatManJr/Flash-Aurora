@@ -15,7 +15,7 @@ if _BENCH_DIR not in sys.path:
     sys.path.insert(0, _BENCH_DIR)
 import _bootstrap  # noqa: F401, E402
 
-from _asset_root import default_asset_root  # noqa: E402
+from flash_aurora.engine.core.asset_root import resolve_asset_root  # noqa: E402
 from _preset_ic import checkpoint_path, load_preset_batch  # noqa: E402
 from bench_rollout_drift import (  # noqa: E402
     _atomic_save,
@@ -33,9 +33,13 @@ def main() -> None:
     parser.add_argument("--preset", required=True)
     parser.add_argument("--precision", required=True)
     parser.add_argument("--steps", type=int, required=True)
-    parser.add_argument("--asset-root", type=Path, default=default_asset_root())
+    parser.add_argument("--asset-root", type=Path, default=None)
     parser.add_argument("--step-dir", type=Path, required=True)
     args = parser.parse_args()
+    if args.asset_root is None:
+        args.asset_root = resolve_asset_root()
+    if args.asset_root is None:
+        raise SystemExit("pass --asset-root or export AURORA_ASSET_ROOT")
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")

@@ -88,6 +88,17 @@ _PRESET_TITLES: dict[str, str] = {
     "hres_0.1": "0.1 Fine-Tuned",
     "cams": "0.4 Air Pollution",
 }
+# One fixed channel per preset so the curve is not the max over variables.
+_PRESET_PLOT_VARIABLE: dict[str, str] = {
+    "era5_pretrained": "10v",
+    "small_pretrained": "10v",
+    "hres_t0_finetuned": "10v",
+    "tc_tracking": "10v",
+    "hres_0.1": "10v",
+    "aurora_v1p5": "scaled_sf_1h",
+    "aurora_v1p5_ensemble": "scaled_sf_1h",
+    "cams": "pm10",
+}
 
 
 def set_benchmark_seed(seed: int = _BENCHMARK_SEED) -> None:
@@ -350,6 +361,28 @@ def write_markdown(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def representative_variable(preset: str) -> str:
+    return _PRESET_PLOT_VARIABLE.get(preset, "10v")
+
+
+def variable_drift_series(
+    series: list[dict[str, Any]],
+    variable: str,
+) -> tuple[list[float], list[float], float | None]:
+    """Lead time, mean relative error, and tolerance for one named variable."""
+    lead_hours: list[float] = []
+    mean_rel: list[float] = []
+    tolerance: float | None = None
+    for row in series:
+        match = next((item for item in row["vars"] if item["name"] == variable), None)
+        if match is None:
+            continue
+        lead_hours.append(float(row["lead_hours"]))
+        mean_rel.append(float(match["mean_rel"]))
+        tolerance = float(match["tol"])
+    return lead_hours, mean_rel, tolerance
+
+
 def plot_drift(payload: dict[str, Any], dest: Path) -> None:
     import matplotlib as mpl
     import matplotlib.pyplot as plt
@@ -390,11 +423,16 @@ def plot_drift(payload: dict[str, Any], dest: Path) -> None:
     for idx, preset in enumerate(presets):
         ax = axes[idx // ncols][idx % ncols]
         block = payload["presets"][preset]
+        variable = representative_variable(preset)
+        tolerance: float | None = None
         for tier, series in block["tiers"].items():
             if tier == payload["baseline"] or not series:
                 continue
-            xs = [row["lead_hours"] for row in series]
-            ys = [row["worst_rel"] for row in series]
+            xs, ys, tier_tol = variable_drift_series(series, variable)
+            if tier_tol is not None:
+                tolerance = tier_tol
+            if not xs:
+                continue
             ax.plot(
                 xs,
                 ys,
@@ -403,10 +441,20 @@ def plot_drift(payload: dict[str, Any], dest: Path) -> None:
                 color=colors.get(tier, "#333333"),
                 label=labels.get(tier, tier),
             )
+        if tolerance is not None and tolerance > 0:
+            ax.axhline(
+                tolerance,
+                color="#616161",
+                linestyle=(0, (4, 2)),
+                linewidth=1.0,
+                zorder=0,
+                label=rf"$\tau$ ({variable})",
+            )
         ax.set_yscale("log")
         ax.set_xlabel("Lead time (h)")
-        ax.set_ylabel(r"worst-variable $\bar{e}_v$ vs FP32 AR ref")
-        ax.set_title(_PRESET_TITLES.get(preset, preset))
+        ax.set_ylabel(r"$\bar{e}_v$ vs FP32 AR ref")
+        title = _PRESET_TITLES.get(preset, preset)
+        ax.set_title(f"{title}, {variable}")
         ax.legend(frameon=False, fontsize=8)
     for idx in range(n, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
@@ -480,11 +528,13 @@ def run_tier_isolated(
     err_path = step_dir / "worker.stderr"
     meta: dict[str, Any] = {}
     n_steps = 0
+    child_env = os.environ.copy()
+    child_env["AURORA_ASSET_ROOT"] = str(asset_root)
     with err_path.open("w", encoding="utf-8") as err_f:
         proc = subprocess.Popen(
             cmd,
             cwd=_REPO,
-            env=os.environ.copy(),
+            env=child_env,
             stdout=subprocess.PIPE,
             stderr=err_f,
             text=True,
