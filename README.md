@@ -60,8 +60,8 @@ Production mixed precision is faster than unfused FP32 and stays closer to that 
   <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/e2e_latency_by_tier_all_presets.svg" alt="One-step end-to-end forward latency by precision tier" width="95%"/>
 </p>
 
-Recommended tiers stay within per-variable tolerances versus the unfused FP32 reference (seed 42). The one exception is `bf16_mixed@tf32` on `aurora_v1p5_ensemble`, where `scaled_tp_1h` is about $1.1\times$ the tolerance. `bf16@*` is not a production path because full BF16 GEEM.
-prediction in experiments.
+Recommended tiers stay within per-variable tolerances versus the unfused FP32 reference (seed 42). The one exception is `bf16_mixed@tf32` on `aurora_v1p5_ensemble`, where `scaled_tp_1h` is about $1.1\times$ the tolerance. `bf16@*` is not a production path because the full BF16 GEMM path corruptted 
+the prediction in experiments.
 <p align="center">
   <img src="https://raw.githubusercontent.com/CatManJr/Flash-Aurora/master/docs/image/precision_mean_rel_stacked_by_model.svg" alt="Stacked mean relative error by precision tier and preset" width="95%"/>
 </p>
