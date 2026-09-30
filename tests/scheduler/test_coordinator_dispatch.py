@@ -210,6 +210,38 @@ def test_close_delivers_shutdown(context: zmq.Context, tmp_path: Path) -> None:
         stub.close()
 
 
+def test_pool_dispatch_prefers_the_worker_that_already_holds_the_preset(
+    context: zmq.Context, tmp_path: Path
+) -> None:
+    holding = StubWorker(context, tmp_path, "gpu-2")
+    other = StubWorker(context, tmp_path, "gpu-3")
+    rotating = ("era5_pretrained", "cams")
+    coordinator = build_coordinator(context, tmp_path, [holding, other])
+    coordinator._workers["gpu-2"].endpoint = WorkerEndpoint(
+        worker_id="gpu-2",
+        preset="era5_pretrained",
+        command_addr=holding.command_addr,
+        event_addr=holding.event_addr,
+        accepted_presets=rotating,
+    )
+    coordinator._workers["gpu-3"].endpoint = WorkerEndpoint(
+        worker_id="gpu-3",
+        preset="cams",
+        command_addr=other.command_addr,
+        event_addr=other.event_addr,
+        accepted_presets=rotating,
+    )
+    coordinator._workers["gpu-3"].dispatched_count = 5
+
+    chosen = coordinator._choose_worker(forecast_request("req-cams", "cams"))
+
+    assert chosen is not None
+    assert chosen.endpoint.worker_id == "gpu-3"
+    coordinator.close()
+    holding.close()
+    other.close()
+
+
 def test_coordinator_rejects_two_workers_with_the_same_id(tmp_path: Path) -> None:
     def endpoint(name: str) -> WorkerEndpoint:
         return WorkerEndpoint(

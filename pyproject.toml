@@ -71,6 +71,7 @@ python_files = ["test_*.py"]
 markers = [
     "gpu: requires CUDA",
     "integration: requires asset_root and on-disk checkpoints",
+    "benchmark: scheduler and ingress benchmark checks, excluded from the production run",
     "engine: engine tests",
 ]
 norecursedirs = [
@@ -78,4 +79,4 @@ norecursedirs = [
     ".git",
     ".venv",
 ]
-addopts = ["-ra"]
+addopts = ["-ra", "-m", "not benchmark"]

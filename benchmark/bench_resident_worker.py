@@ -42,7 +42,7 @@ DEFAULT_PRECISION = "bf16_mixed@fp32"
 DEFAULT_JOBS = 5
 DEFAULT_STEPS = 1
 DEFAULT_DEVICE = "cuda:0"
-REPORT_DIR = Path(_REPO) / "groupB" / "reports"
+REPORT_DIR = Path(_REPO).parent / "groupB" / "reports"
 _BYTES_PER_GIB = 1024**3
 
 

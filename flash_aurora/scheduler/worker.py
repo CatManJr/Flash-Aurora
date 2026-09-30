@@ -65,6 +65,9 @@ class ForecastWorkerConfig:
     # When True, call ``engine.load()`` before accepting jobs and emit ``ready``.
     preload: bool = False
     preload_rollout_steps: int = 1
+    # Presets this process may load. Empty means only ``preset``. Switching releases
+    # GPU memory and builds a new engine; the previous weights are not kept resident.
+    presets: tuple[str, ...] = ()
 
 
 class ForecastWorker:
@@ -83,6 +86,12 @@ class ForecastWorker:
             raise ValueError("worker capacity must be >= 1")
         self._owns_context = context is None
         self._context = zmq.Context() if context is None else context
+        self._accepted_presets = config.presets or (config.preset,)
+        if config.preset not in self._accepted_presets:
+            raise ValueError(
+                f"initial preset {config.preset!r} is not in {self._accepted_presets}"
+            )
+        self._loaded_preset = config.preset
         self._engine = engine or self._build_engine()
         self._downloader = downloader or DataDownloader.from_preset(
             config.preset,
@@ -162,9 +171,10 @@ class ForecastWorker:
         except Exception:
             pass
 
-    def _build_engine(self) -> AuroraEngine:
+    def _build_engine(self, preset: str | None = None) -> AuroraEngine:
         kwargs: dict[str, Any] = {
             "asset_root": self._config.asset_root,
+            "allow_hub_download": False,
         }
         if self._config.inference_precision is not None:
             kwargs["inference_precision"] = self._config.inference_precision
@@ -186,7 +196,7 @@ class ForecastWorker:
                 max_vram_gib_per_device=self._config.distributed_max_vram_gib,
                 force=self._config.distributed_force,
             )
-        engine = AuroraEngine.from_preset(self._config.preset, **kwargs)
+        engine = AuroraEngine.from_preset(preset or self._loaded_preset, **kwargs)
         if self._config.device is not None and not self._config.distributed_devices:
             engine.config.device = self._config.device
         return engine
@@ -201,6 +211,7 @@ class ForecastWorker:
             self._flush_until_inline_deadline()
         except Exception:
             pass
+        self._log_memory_high_water()
         try:
             self._engine.close()
         except Exception:
@@ -209,6 +220,26 @@ class ForecastWorker:
         self._event_socket.close(linger=0)
         if self._owns_context:
             self._context.term()
+
+    def _log_memory_high_water(self) -> None:
+        """Print allocator peaks. Reserved, not allocated, is what must fit on the GPU."""
+        if not torch.cuda.is_available():
+            return
+        device_name = self.device if self.device.startswith("cuda") else "cuda"
+        try:
+            device = torch.device(device_name)
+            allocated = torch.cuda.max_memory_allocated(device)
+            reserved = torch.cuda.max_memory_reserved(device)
+        except Exception:
+            return
+        if reserved <= 0:
+            return
+        gib = 1024**3
+        print(
+            "memory_high_water "
+            f"allocated_gib={allocated / gib:.6f} reserved_gib={reserved / gib:.6f}",
+            flush=True,
+        )
 
     def _set_model_ready(self, ready: bool) -> None:
         with self._state_lock:
@@ -265,6 +296,7 @@ class ForecastWorker:
             kind=kind,
             worker_id=self.worker_id,
             worker_device=self.device,
+            worker_preset=self._loaded_preset,
             **fields,
         )
 
@@ -277,7 +309,7 @@ class ForecastWorker:
                     encode_event(
                         ForecastEvent(
                             kind="ready",
-                            worker_preset=self._config.preset,
+                            worker_preset=self._loaded_preset,
                             worker_id=self.worker_id,
                             worker_device=self.device,
                             worker_capacity=self.capacity,
@@ -289,6 +321,35 @@ class ForecastWorker:
         except zmq.Again:
             pass
 
+    def _prepare_engine_for(self, preset: str) -> None:
+        """Load ``preset``, releasing the previous engine first when the model changes."""
+        if preset == self._loaded_preset:
+            self.ensure_loaded()
+            return
+        self._release_loaded_engine()
+        self._engine = self._build_engine(preset)
+        self._downloader = DataDownloader.from_preset(
+            preset,
+            asset_root=self._config.asset_root,
+        )
+        self._loaded_preset = preset
+        self._config.preset = preset
+        self._set_model_ready(False)
+        self.ensure_loaded()
+
+    def _release_loaded_engine(self) -> None:
+        """Drop GPU weights and the caching allocator's reserved blocks."""
+        self._set_model_ready(False)
+        try:
+            self._engine.release_gpu(move_model_to_cpu=True)
+        except Exception:
+            pass
+        try:
+            self._engine.close()
+        except Exception:
+            pass
+        self._loaded_preset = None
+
     def ensure_loaded(self, *, rollout_steps: int | None = None) -> None:
         """Load weights onto the device and mark the worker warm."""
         if self.model_ready:
@@ -298,10 +359,10 @@ class ForecastWorker:
         self._set_model_ready(True)
 
     def _validate_request(self, request: ForecastRequest) -> None:
-        if request.preset != self._config.preset:
+        if request.preset not in self._accepted_presets:
+            accepted = ", ".join(self._accepted_presets)
             raise ValueError(
-                f"worker preset {self._config.preset!r} does not match "
-                f"request preset {request.preset!r}"
+                f"worker accepts {accepted}, not preset {request.preset!r}"
             )
         if request.steps < 1:
             raise ValueError("steps must be >= 1")
@@ -398,6 +459,7 @@ class ForecastWorker:
         if request.ensemble_members is not None and request.ensemble_members < 1:
             raise ValueError("ensemble_members must be >= 1 when set")
         self._emit(self._job_event("preparing", request_id=request.request_id))
+        self._prepare_engine_for(request.preset)
 
         if request.netcdf_path is not None:
             batch = self._engine.prepare_from_netcdf(
@@ -514,7 +576,7 @@ class ForecastWorker:
             self._emit(
                 ForecastEvent(
                     kind="health",
-                    worker_preset=self._config.preset,
+                    worker_preset=self._loaded_preset,
                     worker_id=self.worker_id,
                     worker_device=self.device,
                     worker_capacity=self.capacity,

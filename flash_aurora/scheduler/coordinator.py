@@ -50,6 +50,14 @@ class WorkerEndpoint:
     event_addr: str
     device: str | None = None
     capacity: int = 1
+    # Empty means this worker serves only ``preset``. A pool worker lists every preset it may load.
+    accepted_presets: tuple[str, ...] = ()
+
+
+def accepted_presets(endpoint: WorkerEndpoint) -> tuple[str, ...]:
+    if endpoint.accepted_presets:
+        return endpoint.accepted_presets
+    return (endpoint.preset,)
 
 
 def _reject_duplicate_worker_ids(endpoints: tuple[WorkerEndpoint, ...]) -> None:
@@ -275,6 +283,7 @@ class ForecastCoordinator:
             event_addr=endpoint.event_addr,
             device=event.worker_device or endpoint.device,
             capacity=event.worker_capacity or endpoint.capacity,
+            accepted_presets=endpoint.accepted_presets,
         )
         if event.message is not None:
             worker.reported_status = event.message
@@ -322,7 +331,7 @@ class ForecastCoordinator:
         return [
             worker
             for worker in self._workers.values()
-            if worker.endpoint.preset == request.preset
+            if request.preset in accepted_presets(worker.endpoint)
         ]
 
     def _live_matching_workers(self, request: ForecastRequest) -> list[_WorkerState]:
@@ -339,7 +348,7 @@ class ForecastCoordinator:
                 worker = self._workers.get(sticky_id)
                 if (
                     worker is not None
-                    and worker.endpoint.preset == request.preset
+                    and request.preset in accepted_presets(worker.endpoint)
                     and worker.available_slots > 0
                 ):
                     return worker
@@ -348,11 +357,12 @@ class ForecastCoordinator:
         ready = [worker for worker in candidates if worker.available_slots > 0]
         if not ready:
             return None
-        # Most free slots first, then the worker that has run the fewest jobs, so idle
-        # workers share load instead of the highest worker_id absorbing every burst.
+        # Prefer a worker that already has this preset loaded so a pool does not
+        # rebuild an engine it is still holding. Then the freest, least-used worker.
         return min(
             ready,
             key=lambda worker: (
+                0 if worker.endpoint.preset == request.preset else 1,
                 -worker.available_slots,
                 worker.dispatched_count,
                 worker.endpoint.worker_id,

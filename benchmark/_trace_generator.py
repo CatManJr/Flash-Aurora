@@ -145,6 +145,20 @@ def generate_homogeneous_burst(
     )
 
 
+# Production presets with a local ingress cache. ``small_pretrained`` is the
+# 400x800 test grid. ``wave`` has a checkpoint but no MARS cache on this machine.
+EXPENSIVE_PRESETS: tuple[str, ...] = ("hres_0.1", "aurora_v1p5_ensemble")
+ROTATING_PRESETS: tuple[str, ...] = (
+    "era5_pretrained",
+    "hres_t0_finetuned",
+    "cams",
+    "tc_tracking",
+    "aurora_v1p5",
+)
+SCHEDULER_TRACE_PRESETS: tuple[str, ...] = EXPENSIVE_PRESETS + ROTATING_PRESETS
+_ROTATION_ROUNDS = 2
+
+
 def default_operational_spec(
     cycle_interval_s: float,
     *,
@@ -176,6 +190,65 @@ def default_operational_spec(
         days=days,
         ad_hoc=ad_hoc,
     )
+
+
+def group_b_trace(
+    cycle_interval_s: float,
+    *,
+    ensemble_members: int = 8,
+    rotation_rounds: int = _ROTATION_ROUNDS,
+) -> tuple[TraceJob, ...]:
+    """Expensive presets first, then the five smaller presets round-robin.
+
+    ``hres_0.1`` and ``aurora_v1p5_ensemble`` are submitted at t=0 and stay on
+    their own GPUs. The other five arrive at ``cycle_interval_s`` and again one
+    interval later, so two pool GPUs have a queue to schedule. Each rotating
+    preset appears ``rotation_rounds`` times. The trace clock is synthetic; the
+    replayer still reads the local cached analysis.
+    """
+    if cycle_interval_s <= 0:
+        raise ValueError("cycle_interval_s must be > 0")
+    if ensemble_members < 1 or rotation_rounds < 1:
+        raise ValueError("ensemble_members and rotation_rounds must be >= 1")
+    jobs: list[TraceJob] = [
+        TraceJob(
+            job_id="expensive-hres_0.1",
+            product="hres-0.1",
+            preset="hres_0.1",
+            steps=2,
+            arrival_s=0.0,
+            valid_time="2024-06-01T00:00:00",
+            deadline_s=cycle_interval_s,
+        )
+    ]
+    jobs.extend(
+        TraceJob(
+            job_id=f"expensive-ens15-m{member:02d}",
+            product="ens15",
+            preset="aurora_v1p5_ensemble",
+            steps=4,
+            arrival_s=0.0,
+            valid_time="2024-06-01T00:00:00",
+            deadline_s=cycle_interval_s,
+            member=member,
+        )
+        for member in range(ensemble_members)
+    )
+    for round_index in range(rotation_rounds):
+        round_start_s = cycle_interval_s * (1 + round_index)
+        for preset in ROTATING_PRESETS:
+            jobs.append(
+                TraceJob(
+                    job_id=f"rotate-r{round_index}-{preset}",
+                    product="rotate",
+                    preset=preset,
+                    steps=4,
+                    arrival_s=round_start_s,
+                    valid_time="2024-06-01T06:00:00",
+                    deadline_s=cycle_interval_s,
+                )
+            )
+    return _in_arrival_order(jobs)
 
 
 def _cycle_start(start_date: date, cycle_index: int) -> datetime:
