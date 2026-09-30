@@ -2,8 +2,9 @@
 """Group B: two sticky expensive presets and a two-GPU pool for the other five.
 
 The pool workers may switch presets. A switch releases GPU memory and builds a
-new engine. Ingress is read from the local cache. The run does not download
-initial conditions and does not write NetCDF.
+new engine. Every job is queued at t=0; a free worker takes the next one.
+Ingress is read from the local cache. The run does not download initial
+conditions and does not write NetCDF.
 
     export AURORA_ASSET_ROOT=/root/autodl-tmp/aurora
     CUTE_DSL_ARCH=sm_120a uv run python benchmark/bench_scheduler_trace.py calibrate

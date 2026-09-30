@@ -81,14 +81,13 @@ def test_scheduler_trace_workers_cover_every_production_preset() -> None:
     assert len({worker.device for worker in SCHEDULER_TRACE_WORKERS}) == 4
 
 
-def test_expensive_jobs_arrive_before_the_rotating_presets() -> None:
+def test_pool_jobs_are_queued_with_the_expensive_presets() -> None:
     trace = group_b_trace(100.0, ensemble_members=2, rotation_rounds=2)
-    first_rotation_s = min(job.arrival_s for job in trace if job.preset in ROTATING_PRESETS)
+    rotating = [job for job in trace if job.preset in ROTATING_PRESETS]
 
-    assert {job.preset for job in trace if job.arrival_s == 0.0} == set(EXPENSIVE_PRESETS)
-    assert first_rotation_s == 100.0
-    assert all(job.arrival_s >= first_rotation_s for job in trace if job.preset in ROTATING_PRESETS)
-    assert {job.preset for job in trace if job.product == "rotate"} == set(ROTATING_PRESETS)
+    assert {job.arrival_s for job in trace} == {0.0}
+    assert set(EXPENSIVE_PRESETS) <= {job.preset for job in trace}
+    assert len(rotating) == 2 * len(ROTATING_PRESETS)
 
 
 def test_runtime_environment_names_the_stack_and_the_gpus() -> None:

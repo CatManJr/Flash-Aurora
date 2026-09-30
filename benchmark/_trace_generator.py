@@ -198,13 +198,13 @@ def group_b_trace(
     ensemble_members: int = 8,
     rotation_rounds: int = _ROTATION_ROUNDS,
 ) -> tuple[TraceJob, ...]:
-    """Expensive presets first, then the five smaller presets round-robin.
+    """Queue every job at t=0 and let the coordinator dispatch to a free worker.
 
-    ``hres_0.1`` and ``aurora_v1p5_ensemble`` are submitted at t=0 and stay on
-    their own GPUs. The other five arrive at ``cycle_interval_s`` and again one
-    interval later, so two pool GPUs have a queue to schedule. Each rotating
-    preset appears ``rotation_rounds`` times. The trace clock is synthetic; the
-    replayer still reads the local cached analysis.
+    There is no later cycle. ``hres_0.1`` and the ensemble members stay on
+    their own GPUs. ``rotation_rounds`` only repeats the five smaller presets
+    in that same queue, so a pool GPU that finishes one job takes the next.
+    ``cycle_interval_s`` is the deadline from submission, not an arrival gap.
+    The trace clock is synthetic; the replayer still reads the local cache.
     """
     if cycle_interval_s <= 0:
         raise ValueError("cycle_interval_s must be > 0")
@@ -234,16 +234,15 @@ def group_b_trace(
         )
         for member in range(ensemble_members)
     )
-    for round_index in range(rotation_rounds):
-        round_start_s = cycle_interval_s * (1 + round_index)
+    for copy_index in range(rotation_rounds):
         for preset in ROTATING_PRESETS:
             jobs.append(
                 TraceJob(
-                    job_id=f"rotate-r{round_index}-{preset}",
+                    job_id=f"rotate-{copy_index}-{preset}",
                     product="rotate",
                     preset=preset,
                     steps=4,
-                    arrival_s=round_start_s,
+                    arrival_s=0.0,
                     valid_time="2024-06-01T06:00:00",
                     deadline_s=cycle_interval_s,
                 )

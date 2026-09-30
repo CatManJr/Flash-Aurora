@@ -391,12 +391,21 @@ class AuroraEngine:
             return async_export
         return self.config.async_export
 
-    def _pipeline_exporter(self, export_dir: Path) -> PipelineRolloutExporter:
+    def _pipeline_exporter(
+        self,
+        export_dir: Path,
+        *,
+        trace: list[dict[str, float | int | str]] | None = None,
+        retain_steps: int | None = None,
+    ) -> PipelineRolloutExporter:
         return PipelineRolloutExporter.async_netcdf(
             export_dir,
             pool_size=self.config.export_pool_size,
             max_inflight=self.config.export_max_inflight,
             use_egress_stream=self.config.export_use_egress_stream,
+            trace=trace,
+            retain_steps=retain_steps,
+            device=torch.device(self.config.device),
         )
 
     def prepare(
@@ -577,6 +586,8 @@ class AuroraEngine:
         fine_lead_times: Sequence[float] | None = None,
         use_noise_accumulation: bool = True,
         apply_rollout_input_clipping: bool = True,
+        trace: list[dict[str, float | int | str]] | None = None,
+        retain_steps: int | None = None,
     ) -> Generator[Path, None, None]:
         if export_dir is not None:
             self.set_export_dir(export_dir)
@@ -605,10 +616,25 @@ class AuroraEngine:
             apply_rollout_input_clipping=apply_rollout_input_clipping,
         )
         if use_async:
-            with self._pipeline_exporter(resolved_dir) as exporter:
-                for step_index, prediction in enumerate(stream):
-                    yield exporter.write_step(step_index, prediction)
+            with self._pipeline_exporter(resolved_dir, trace=trace, retain_steps=retain_steps) as exporter:
+                yield from self._iter_exported_steps(stream, exporter.write_step, trace)
             return
 
         for step_index, prediction in enumerate(stream):
             yield from writer.write_step(step_index, prediction)
+
+    @staticmethod
+    def _iter_exported_steps(stream, write_step, trace: list[dict[str, float | int | str]] | None):
+        """Time each forward, then hand the prediction to the async writer.
+
+        The writer returns as soon as the NetCDF job is queued, so the next
+        forward overlaps that write. ``trace`` stores absolute ``perf_counter``
+        stamps; the caller subtracts its own origin.
+        """
+        cursor = time.perf_counter()
+        for step_index, prediction in enumerate(stream):
+            now = time.perf_counter()
+            if trace is not None:
+                trace.append({"kind": "rollout", "step": step_index, "start_s": cursor, "end_s": now})
+            yield write_step(step_index, prediction)
+            cursor = time.perf_counter()

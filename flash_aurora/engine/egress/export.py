@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import torch
 from flash_aurora.models.aurora import Batch
 
 from flash_aurora.engine.egress.io_backend import (
@@ -89,6 +90,9 @@ class PipelineRolloutExporter:
         pool_size: int = 2,
         max_inflight: int | None = None,
         use_egress_stream: bool = True,
+        trace: list[dict[str, float | int | str]] | None = None,
+        retain_steps: int | None = None,
+        device: torch.device | None = None,
     ) -> PipelineRolloutExporter:
         backend = AsyncNetCDFStepBackend(
             export_dir,
@@ -96,8 +100,10 @@ class PipelineRolloutExporter:
             blocking=False,
             pool_size=pool_size,
             max_inflight=max_inflight,
+            trace=trace,
+            retain_steps=retain_steps,
         )
-        offloader = EgressOffloader(use_stream=use_egress_stream)
+        offloader = EgressOffloader(device=device, use_stream=use_egress_stream)
         return cls(backend, offloader=offloader)
 
     def write_step(self, step_index: int, batch: Batch) -> Path:
