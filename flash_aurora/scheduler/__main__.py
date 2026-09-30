@@ -11,7 +11,12 @@ from flash_aurora.scheduler.worker import ForecastWorker, ForecastWorkerConfig, 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Flash-Aurora single-worker forecast scheduler")
-    parser.add_argument("--preset", required=True, help="Preset name bound to this worker")
+    parser.add_argument("--preset", required=True, help="Preset loaded at startup")
+    parser.add_argument(
+        "--presets",
+        default=None,
+        help="Comma-separated presets this worker may switch to. Switching releases GPU memory and rebuilds the engine.",
+    )
     parser.add_argument(
         "--asset-root",
         type=Path,
@@ -57,7 +62,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Call engine.load() and emit ready before accepting jobs",
     )
     parser.add_argument("--preload-rollout-steps", type=int, default=1)
+    parser.add_argument(
+        "--memory-report",
+        type=Path,
+        default=None,
+        help="JSON file updated after every job with peak allocated and reserved GiB",
+    )
     return parser
+
+
+def _parse_presets(raw: str | None) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    presets = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if len(presets) < 2:
+        raise SystemExit("--presets needs at least two names; omit it for a single-preset worker")
+    return presets
 
 
 def _parse_distributed_devices(raw: str | None) -> tuple[str, ...] | None:
@@ -91,6 +111,8 @@ def main() -> None:
         poll_timeout_ms=args.poll_timeout_ms,
         preload=args.preload,
         preload_rollout_steps=args.preload_rollout_steps,
+        presets=_parse_presets(args.presets),
+        memory_report=args.memory_report,
     )
     worker = ForecastWorker(config)
     install_signal_handlers(worker)

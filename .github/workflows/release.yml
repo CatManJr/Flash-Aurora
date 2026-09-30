@@ -42,7 +42,7 @@ jobs:
       - name: Run full test suite
         env:
           UV_DEFAULT_INDEX: https://pypi.org/simple
-        run: uv run --python 3.12 pytest -m "not integration" -q
+        run: uv run --python 3.12 pytest -m "not integration and not benchmark" -q
 
   build:
     name: Build distributions

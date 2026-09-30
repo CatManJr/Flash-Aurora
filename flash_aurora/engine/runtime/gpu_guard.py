@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import atexit
-import fcntl
 import json
+import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -21,6 +22,9 @@ from flash_aurora.engine.runtime.gpu_budget import (
 from flash_aurora.engine.runtime.gpu_memory import cuda_memory_snapshot, format_cuda_memory_snapshot
 from flash_aurora.engine.runtime.vram_preflight import check_single_device_vram
 
+_LOGGER = logging.getLogger(__name__)
+
+# The lease must be refreshed several times per _STALE_SECONDS window.
 _HEARTBEAT_SECONDS = 30.0
 _STALE_SECONDS = 120.0
 _POLL_SECONDS = 2.0
@@ -61,6 +65,17 @@ def try_local_cuda_cleanup(*, device_index: int = 0) -> None:
         pass
 
 
+def _import_fcntl():
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError(
+            "GpuGuard needs POSIX file locking (fcntl), which this platform lacks; "
+            "set FLASH_AURORA_GPU_GUARD=0 to run without the cross-process guard."
+        ) from exc
+    return fcntl
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -82,6 +97,8 @@ class GpuLeaseRecord:
     exclusive: bool
     rollout_steps: int
     heartbeat: float = field(default_factory=time.time)
+    # Tickets sharing this lease; it is dropped when the last one is released.
+    holders: int = 1
 
 
 @dataclass
@@ -101,6 +118,18 @@ class GpuDeviceState:
     queue: list[GpuQueueRecord] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class _LeaseRequest:
+    pid: int
+    device_index: int
+    preset: str
+    variant_name: str
+    needed_gib: float
+    exclusive: bool
+    rollout_steps: int
+    queue: bool
+
+
 @dataclass
 class GpuGuardTicket:
     lease_id: str
@@ -109,13 +138,32 @@ class GpuGuardTicket:
     exclusive: bool
     _registry: GpuGuardRegistry
     _released: bool = False
+    _stop_heartbeat: threading.Event = field(default_factory=threading.Event)
 
     def heartbeat(self) -> None:
         self._registry.heartbeat(self.lease_id, device_index=self.device_index)
 
+    def start_background_heartbeat(self, *, interval_s: float) -> None:
+        """Keep the lease fresh while idle or preparing, so it is never purged as stale."""
+        thread = threading.Thread(
+            target=self._heartbeat_until_released,
+            args=(interval_s,),
+            name=f"gpu-guard-heartbeat-{self.device_index}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _heartbeat_until_released(self, interval_s: float) -> None:
+        while not self._stop_heartbeat.wait(interval_s):
+            try:
+                self.heartbeat()
+            except Exception:
+                _LOGGER.warning("GPU lease heartbeat failed; retrying", exc_info=True)
+
     def release(self) -> None:
         if self._released:
             return
+        self._stop_heartbeat.set()
         self._registry.release(self.lease_id, device_index=self.device_index)
         self._released = True
 
@@ -123,9 +171,10 @@ class GpuGuardTicket:
 class GpuGuardRegistry:
     """Cross-process CUDA lease registry backed by a JSON file per device."""
 
-    def __init__(self, guard_dir: Path) -> None:
+    def __init__(self, guard_dir: Path, *, heartbeat_seconds: float = _HEARTBEAT_SECONDS) -> None:
         self._guard_dir = guard_dir
         self._guard_dir.mkdir(parents=True, exist_ok=True)
+        self._heartbeat_seconds = heartbeat_seconds
 
     def _state_path(self, device_index: int) -> Path:
         return self._guard_dir / f"device_{device_index}.json"
@@ -135,6 +184,7 @@ class GpuGuardRegistry:
 
     @contextmanager
     def _locked(self, device_index: int) -> Iterator[None]:
+        fcntl = _import_fcntl()
         lock_path = self._lock_path(device_index)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+", encoding="utf-8") as handle:
@@ -223,6 +273,114 @@ class GpuGuardRegistry:
 
         return True, "ok"
 
+    def _lease_of_pid(self, state: GpuDeviceState, pid: int) -> GpuLeaseRecord | None:
+        return next((lease for lease in state.leases if lease.pid == pid), None)
+
+    def _can_grow(
+        self,
+        state: GpuDeviceState,
+        lease: GpuLeaseRecord,
+        request: _LeaseRequest,
+    ) -> tuple[bool, str]:
+        """Admit a process that already holds a lease when it asks for more than it reserved."""
+        growth_gib = request.needed_gib - lease.reserved_gib
+        becomes_exclusive = request.exclusive and not lease.exclusive
+        if growth_gib <= 0 and not becomes_exclusive:
+            return True, "ok"
+
+        others_gib = self._reserved_gib(state, exclude_pid=request.pid)
+        if becomes_exclusive and others_gib > 0.5:
+            return False, "cannot become exclusive while other jobs share this GPU"
+
+        snapshot = cuda_memory_snapshot(device_index=request.device_index)
+        budget_gib = snapshot.total_gib * _RESERVED_FRACTION
+        if others_gib + request.needed_gib > budget_gib:
+            return (
+                False,
+                f"growing to {request.needed_gib:.1f} GiB would exceed the GPU budget "
+                f"({budget_gib:.1f} GiB) beside {others_gib:.1f} GiB held by other processes",
+            )
+        if snapshot.free_gib < growth_gib:
+            return False, f"only {snapshot.free_gib:.1f} GiB free, need ~{growth_gib:.1f} GiB more"
+        return True, "ok"
+
+    def _try_share_own_lease(
+        self,
+        state: GpuDeviceState,
+        lease: GpuLeaseRecord,
+        request: _LeaseRequest,
+        *,
+        now: float,
+    ) -> tuple[GpuGuardTicket | None, str]:
+        can_grow, reason = self._can_grow(state, lease, request)
+        if not can_grow:
+            return None, reason
+        lease.holders += 1
+        lease.reserved_gib = max(lease.reserved_gib, request.needed_gib)
+        lease.exclusive = lease.exclusive or request.exclusive
+        lease.heartbeat = now
+        return self._open_ticket(lease, device_index=request.device_index), "ok"
+
+    def _try_new_lease(
+        self,
+        state: GpuDeviceState,
+        request: _LeaseRequest,
+        *,
+        now: float,
+    ) -> tuple[GpuGuardTicket | None, str]:
+        position = self._queue_position(state, request.pid)
+        if position is None and request.queue:
+            state.queue.append(
+                GpuQueueRecord(
+                    pid=request.pid,
+                    preset=request.preset,
+                    variant=request.variant_name,
+                    needed_gib=request.needed_gib,
+                    exclusive=request.exclusive,
+                    rollout_steps=request.rollout_steps,
+                )
+            )
+            position = len(state.queue)
+
+        can_grant, reason = self._can_grant(
+            state,
+            needed_gib=request.needed_gib,
+            exclusive=request.exclusive,
+            pid=request.pid,
+            device_index=request.device_index,
+        )
+        if position is not None and position > 1:
+            return None, f"queued at position {position}"
+        if not can_grant:
+            return None, reason
+
+        state.queue = [item for item in state.queue if item.pid != request.pid]
+        lease = GpuLeaseRecord(
+            lease_id=str(uuid.uuid4()),
+            pid=request.pid,
+            preset=request.preset,
+            variant=request.variant_name,
+            device_index=request.device_index,
+            reserved_gib=request.needed_gib,
+            exclusive=request.exclusive,
+            rollout_steps=request.rollout_steps,
+            heartbeat=now,
+        )
+        state.leases.append(lease)
+        return self._open_ticket(lease, device_index=request.device_index), "ok"
+
+    def _open_ticket(self, lease: GpuLeaseRecord, *, device_index: int) -> GpuGuardTicket:
+        ticket = GpuGuardTicket(
+            lease_id=lease.lease_id,
+            device_index=device_index,
+            reserved_gib=lease.reserved_gib,
+            exclusive=lease.exclusive,
+            _registry=self,
+        )
+        ticket.start_background_heartbeat(interval_s=self._heartbeat_seconds)
+        _register_ticket(ticket)
+        return ticket
+
     def _queue_position(self, state: GpuDeviceState, pid: int) -> int | None:
         for index, item in enumerate(state.queue):
             if item.pid == pid:
@@ -258,6 +416,16 @@ class GpuGuardRegistry:
             inference_precision=inference_precision,
             device_index=device_index,
         )
+        request = _LeaseRequest(
+            pid=pid,
+            device_index=device_index,
+            preset=preset,
+            variant_name=variant.name,
+            needed_gib=needed,
+            exclusive=exclusive,
+            rollout_steps=rollout_steps,
+            queue=queue,
+        )
         deadline = time.time() + timeout
         last_message = ""
 
@@ -267,73 +435,14 @@ class GpuGuardRegistry:
                 now = time.time()
                 state = self._load_state(device_index)
                 self._purge_stale(state, now=now)
-
-                for lease in state.leases:
-                    if lease.pid == pid:
-                        lease.heartbeat = now
-                        self._save_state(device_index, state)
-                        ticket = GpuGuardTicket(
-                            lease_id=lease.lease_id,
-                            device_index=device_index,
-                            reserved_gib=lease.reserved_gib,
-                            exclusive=lease.exclusive,
-                            _registry=self,
-                        )
-                        _register_ticket(ticket)
-                        return ticket
-
-                position = self._queue_position(state, pid)
-                if position is None and queue:
-                    state.queue.append(
-                        GpuQueueRecord(
-                            pid=pid,
-                            preset=preset,
-                            variant=variant.name,
-                            needed_gib=needed,
-                            exclusive=exclusive,
-                            rollout_steps=rollout_steps,
-                        )
-                    )
-                    position = len(state.queue)
-
-                can_grant, reason = self._can_grant(
-                    state,
-                    needed_gib=needed,
-                    exclusive=exclusive,
-                    pid=pid,
-                    device_index=device_index,
-                )
-                if position is not None and position > 1:
-                    can_grant = False
-                    reason = f"queued at position {position}"
-
-                if can_grant and (position is None or position == 1):
-                    state.queue = [item for item in state.queue if item.pid != pid]
-                    lease = GpuLeaseRecord(
-                        lease_id=str(uuid.uuid4()),
-                        pid=pid,
-                        preset=preset,
-                        variant=variant.name,
-                        device_index=device_index,
-                        reserved_gib=needed,
-                        exclusive=exclusive,
-                        rollout_steps=rollout_steps,
-                        heartbeat=now,
-                    )
-                    state.leases.append(lease)
-                    self._save_state(device_index, state)
-                    ticket = GpuGuardTicket(
-                        lease_id=lease.lease_id,
-                        device_index=device_index,
-                        reserved_gib=needed,
-                        exclusive=exclusive,
-                        _registry=self,
-                    )
-                    _register_ticket(ticket)
-                    return ticket
-
-                last_message = reason
+                own_lease = self._lease_of_pid(state, pid)
+                if own_lease is not None:
+                    ticket, last_message = self._try_share_own_lease(state, own_lease, request, now=now)
+                else:
+                    ticket, last_message = self._try_new_lease(state, request, now=now)
                 self._save_state(device_index, state)
+                if ticket is not None:
+                    return ticket
 
             if not queue:
                 break
@@ -361,7 +470,10 @@ class GpuGuardRegistry:
     def release(self, lease_id: str, *, device_index: int) -> None:
         with self._locked(device_index):
             state = self._load_state(device_index)
-            state.leases = [lease for lease in state.leases if lease.lease_id != lease_id]
+            for lease in state.leases:
+                if lease.lease_id == lease_id:
+                    lease.holders -= 1
+            state.leases = [lease for lease in state.leases if lease.holders > 0]
             state.queue = [item for item in state.queue if item.pid != os.getpid()]
             self._save_state(device_index, state)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Generator, Iterable, Sequence
+from typing import Callable, Generator, Iterable, Sequence
 
 import torch
 from flash_aurora.models.aurora import Batch
@@ -74,6 +74,7 @@ class AuroraEngine:
             self.config.user_cwd = Path.cwd()
         self._presets = presets or DEFAULT_PRESETS
         self._model: AuroraModel | None = None
+        self._model_on_device = False
         self._loader = CheckpointLoader(config)
         self._validator = BatchValidator(config.variant)
         self._graph_pool = GraphPool()
@@ -107,6 +108,7 @@ class AuroraEngine:
                 self.release_gpu(move_model_to_cpu=False)
             finally:
                 self._model = None
+                self._model_on_device = False
                 self._graph_pool.clear()
                 self._forward_warmed = False
 
@@ -272,6 +274,7 @@ class AuroraEngine:
             if is_pipeline_parallel(self._model):
                 restore_pipeline_parallel(self._model)
             self._model.cpu()
+            self._model_on_device = False
             self._parallel_plan = None
         distributed = self.config.distributed
         if distributed is not None:
@@ -313,11 +316,23 @@ class AuroraEngine:
     def load(self, *, rollout_steps: int | None = None) -> AuroraModel:
         try:
             self.acquire_gpu(rollout_steps=rollout_steps)
-            self._model = self._load_model_to_device(rollout_steps=rollout_steps)[0]
-            return self._model
+            model, _timing = self._load_model_to_device(rollout_steps=rollout_steps)
+            self._install_model(model)
+            return model
         except Exception:
             self.release_gpu()
             raise
+
+    def _install_model(self, model: AuroraModel) -> None:
+        # CUDA graphs and warmup state belong to the replaced instance.
+        self._model = model
+        self._model_on_device = True
+        self._graph_pool.clear()
+        self._forward_warmed = False
+
+    def _can_reuse_resident_model(self) -> bool:
+        # A distributed plan is sized for rollout_steps, so re-plan on every prepare.
+        return self._model_on_device and self.config.distributed is None
 
     def _load_model_to_device(
         self,
@@ -376,12 +391,21 @@ class AuroraEngine:
             return async_export
         return self.config.async_export
 
-    def _pipeline_exporter(self, export_dir: Path) -> PipelineRolloutExporter:
+    def _pipeline_exporter(
+        self,
+        export_dir: Path,
+        *,
+        trace: list[dict[str, float | int | str]] | None = None,
+        retain_steps: int | None = None,
+    ) -> PipelineRolloutExporter:
         return PipelineRolloutExporter.async_netcdf(
             export_dir,
             pool_size=self.config.export_pool_size,
             max_inflight=self.config.export_max_inflight,
             use_egress_stream=self.config.export_use_egress_stream,
+            trace=trace,
+            retain_steps=retain_steps,
+            device=torch.device(self.config.device),
         )
 
     def prepare(
@@ -391,27 +415,19 @@ class AuroraEngine:
         rollout_steps: int | None = None,
         overlap: bool | None = None,
     ) -> Batch:
-        """Build initial conditions and load the model.
+        """Build initial conditions and make sure the model is on the device.
 
-        When overlap is enabled (``EngineConfig.overlap_ic_load``, default True),
-        IC construction runs on a background thread while the model loads.
+        A model already resident on a single device is reused, so a long-lived
+        worker pays checkpoint load and CUDA graph capture once, not per job.
+        Otherwise, when overlap is enabled (``EngineConfig.overlap_ic_load``,
+        default True), IC construction runs on a background thread while the
+        model loads.
         """
-        self.acquire_gpu(rollout_steps=rollout_steps)
-        build_ic = lambda: self._builder().from_source(request)
-        load = lambda: self._load_model_to_device(rollout_steps=rollout_steps)
-        use_overlap = self._resolve_overlap(overlap)
-
-        try:
-            if use_overlap:
-                batch, model, _timing = overlap_ic_and_load(build_ic, load)
-            else:
-                batch, model, _timing = serial_ic_then_load(build_ic, load)
-            self._model = model
-            self._maybe_warmup(batch)
-            return batch
-        except Exception:
-            self.release_gpu()
-            raise
+        return self._prepare_batch(
+            lambda: self._builder().from_source(request),
+            rollout_steps=rollout_steps,
+            overlap=overlap,
+        )
 
     def prepare_from_netcdf(
         self,
@@ -420,24 +436,54 @@ class AuroraEngine:
         rollout_steps: int | None = None,
         overlap: bool | None = None,
     ) -> Batch:
-        """Load IC from a NetCDF path and initialize the model."""
+        """Load IC from a NetCDF path and make sure the model is on the device."""
         resolved = Path(path)
-        self.acquire_gpu(rollout_steps=rollout_steps)
-        build_ic = lambda: self._builder().from_netcdf_path(resolved)
-        load = lambda: self._load_model_to_device(rollout_steps=rollout_steps)
-        use_overlap = self._resolve_overlap(overlap)
+        return self._prepare_batch(
+            lambda: self._builder().from_netcdf_path(resolved),
+            rollout_steps=rollout_steps,
+            overlap=overlap,
+        )
 
+    def _prepare_batch(
+        self,
+        build_ic: Callable[[], Batch],
+        *,
+        rollout_steps: int | None,
+        overlap: bool | None,
+    ) -> Batch:
+        self.acquire_gpu(rollout_steps=rollout_steps)
         try:
-            if use_overlap:
-                batch, model, _timing = overlap_ic_and_load(build_ic, load)
+            if self._can_reuse_resident_model():
+                batch = build_ic()
             else:
-                batch, model, _timing = serial_ic_then_load(build_ic, load)
-            self._model = model
+                batch = self._build_ic_and_load_model(
+                    build_ic,
+                    rollout_steps=rollout_steps,
+                    overlap=overlap,
+                )
             self._maybe_warmup(batch)
             return batch
         except Exception:
             self.release_gpu()
             raise
+
+    def _build_ic_and_load_model(
+        self,
+        build_ic: Callable[[], Batch],
+        *,
+        rollout_steps: int | None,
+        overlap: bool | None,
+    ) -> Batch:
+        # Drop the stale instance first so its host copy is not held during the reload.
+        self._model = None
+        self._model_on_device = False
+        load = lambda: self._load_model_to_device(rollout_steps=rollout_steps)
+        if self._resolve_overlap(overlap):
+            batch, model, _timing = overlap_ic_and_load(build_ic, load)
+        else:
+            batch, model, _timing = serial_ic_then_load(build_ic, load)
+        self._install_model(model)
+        return batch
 
     def _maybe_warmup(self, batch: Batch) -> None:
         if self._forward_warmed or self.config.forward_warmup_iters <= 0:
@@ -540,6 +586,8 @@ class AuroraEngine:
         fine_lead_times: Sequence[float] | None = None,
         use_noise_accumulation: bool = True,
         apply_rollout_input_clipping: bool = True,
+        trace: list[dict[str, float | int | str]] | None = None,
+        retain_steps: int | None = None,
     ) -> Generator[Path, None, None]:
         if export_dir is not None:
             self.set_export_dir(export_dir)
@@ -568,10 +616,25 @@ class AuroraEngine:
             apply_rollout_input_clipping=apply_rollout_input_clipping,
         )
         if use_async:
-            with self._pipeline_exporter(resolved_dir) as exporter:
-                for step_index, prediction in enumerate(stream):
-                    yield exporter.write_step(step_index, prediction)
+            with self._pipeline_exporter(resolved_dir, trace=trace, retain_steps=retain_steps) as exporter:
+                yield from self._iter_exported_steps(stream, exporter.write_step, trace)
             return
 
         for step_index, prediction in enumerate(stream):
             yield from writer.write_step(step_index, prediction)
+
+    @staticmethod
+    def _iter_exported_steps(stream, write_step, trace: list[dict[str, float | int | str]] | None):
+        """Time each forward, then hand the prediction to the async writer.
+
+        The writer returns as soon as the NetCDF job is queued, so the next
+        forward overlaps that write. ``trace`` stores absolute ``perf_counter``
+        stamps; the caller subtracts its own origin.
+        """
+        cursor = time.perf_counter()
+        for step_index, prediction in enumerate(stream):
+            now = time.perf_counter()
+            if trace is not None:
+                trace.append({"kind": "rollout", "step": step_index, "start_s": cursor, "end_s": now})
+            yield write_step(step_index, prediction)
+            cursor = time.perf_counter()

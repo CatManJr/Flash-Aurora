@@ -8,6 +8,7 @@ Earth-2 pattern:
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -73,6 +74,8 @@ class AsyncNetCDFStepBackend:
         blocking: bool = False,
         pool_size: int = 2,
         max_inflight: int | None = None,
+        trace: list[dict[str, float | int | str]] | None = None,
+        retain_steps: int | None = None,
     ) -> None:
         self._export_dir = export_dir
         self._naming = naming or PredictionNaming()
@@ -80,6 +83,8 @@ class AsyncNetCDFStepBackend:
         self._blocking = blocking
         self._pool_size = max(1, pool_size)
         self._max_inflight = max_inflight if max_inflight is not None else max(0, self._pool_size - 1)
+        self._trace = trace
+        self._retain_steps = retain_steps
         self._executor: ThreadPoolExecutor | None = None
         self._pending: list[Future[None]] = []
         if not blocking:
@@ -94,14 +99,33 @@ class AsyncNetCDFStepBackend:
     def write_owned_step(self, step_index: int, batch: Batch) -> Path:
         path = self._naming.path(self._export_dir, step_index)
         if self._blocking:
-            self._writer.write_netcdf(batch, path)
+            self._write_and_record(step_index, batch, path)
             return path
 
         assert self._executor is not None
         self._limit_inflight()
-        future = self._executor.submit(self._writer.write_netcdf, batch, path)
+        future = self._executor.submit(self._write_and_record, step_index, batch, path)
         self._pending.append(future)
         return path
+
+    def _write_and_record(self, step_index: int, batch: Batch, path: Path) -> None:
+        started_s = time.perf_counter()
+        self._writer.write_netcdf(batch, path)
+        finished_s = time.perf_counter()
+        if self._trace is not None:
+            self._trace.append(
+                {"kind": "export", "step": step_index, "start_s": started_s, "end_s": finished_s}
+            )
+        self._drop_stale(step_index)
+
+    def _drop_stale(self, step_index: int) -> None:
+        """Keep only the newest files so a long rollout does not fill the disk."""
+        if self._retain_steps is None:
+            return
+        stale_index = step_index - self._retain_steps
+        if stale_index < 0:
+            return
+        self._naming.path(self._export_dir, stale_index).unlink(missing_ok=True)
 
     def _limit_inflight(self) -> None:
         while len(self._pending) > self._max_inflight:

@@ -14,6 +14,15 @@ import numpy as np
 
 PROTOCOL_VERSION = 1
 
+# Worker liveness vocabulary. The coordinator reports the same words for the
+# whole cluster, plus STARTING (a worker has not spoken yet) and DEGRADED
+# (a worker that had spoken has gone silent).
+WORKER_STATUS_READY = "ready"
+WORKER_STATUS_LISTENING = "listening"
+WORKER_STATUS_BUSY = "busy"
+CLUSTER_STATUS_STARTING = "starting"
+CLUSTER_STATUS_DEGRADED = "degraded"
+
 ForecastOutputMode = Literal["export_paths", "metadata_only", "last_step_array"]
 ForecastCommandKind = Literal["forecast", "health", "shutdown"]
 ForecastEventKind = Literal[

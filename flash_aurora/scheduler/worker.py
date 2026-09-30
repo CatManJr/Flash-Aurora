@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import queue
 import signal
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,8 +21,12 @@ from flash_aurora.engine.ingress.download import DataDownloader
 from flash_aurora.engine.runtime.vram_preflight import InsufficientVramError
 from flash_aurora.scheduler.addresses import resolve_bound_endpoint
 from flash_aurora.scheduler.protocol import (
+    WORKER_STATUS_BUSY,
+    WORKER_STATUS_LISTENING,
+    WORKER_STATUS_READY,
     ForecastCommand,
     ForecastEvent,
+    ForecastEventKind,
     ForecastRequest,
     decode_command,
     encode_array,
@@ -30,6 +37,12 @@ from flash_aurora.scheduler.protocol import (
 _COMPUTE_STOP = object()
 # Shutdown join budget: one rollout step is O(seconds); allow a short multi-step job to finish.
 _COMPUTE_JOIN_TIMEOUT_S = 120.0
+# A blocking send with no peer, or a full pipe, holds the emit lock and stops
+# health replies. The coordinator would then fail a worker that is still computing.
+_MAX_QUEUED_EVENTS = 1024
+# Inline callers have no poll loop to retry a send that raced the peer handshake.
+_INLINE_FLUSH_WAIT_S = 0.05
+_INLINE_FLUSH_PAUSE_S = 0.001
 
 
 @dataclass
@@ -54,6 +67,12 @@ class ForecastWorkerConfig:
     # When True, call ``engine.load()`` before accepting jobs and emit ``ready``.
     preload: bool = False
     preload_rollout_steps: int = 1
+    # Written after every job. Shutdown can be killed while the compute thread joins,
+    # which is too late for a log line printed only at the end of close().
+    memory_report: Path | None = None
+    # Presets this process may load. Empty means only ``preset``. Switching releases
+    # GPU memory and builds a new engine; the previous weights are not kept resident.
+    presets: tuple[str, ...] = ()
 
 
 class ForecastWorker:
@@ -71,7 +90,13 @@ class ForecastWorker:
         if config.capacity < 1:
             raise ValueError("worker capacity must be >= 1")
         self._owns_context = context is None
-        self._context = context or zmq.Context.instance()
+        self._context = zmq.Context() if context is None else context
+        self._accepted_presets = config.presets or (config.preset,)
+        if config.preset not in self._accepted_presets:
+            raise ValueError(
+                f"initial preset {config.preset!r} is not in {self._accepted_presets}"
+            )
+        self._loaded_preset = config.preset
         self._engine = engine or self._build_engine()
         self._downloader = downloader or DataDownloader.from_preset(
             config.preset,
@@ -83,6 +108,7 @@ class ForecastWorker:
         self._state_lock = threading.Lock()
         self._emit_lock = threading.Lock()
         self._job_queue: queue.Queue[Any] = queue.Queue()
+        self._pending_events: deque[ForecastEvent] = deque()
         self._compute_thread: threading.Thread | None = None
         self._detached_compute = False
         self._fatal_error: BaseException | None = None
@@ -131,8 +157,11 @@ class ForecastWorker:
 
     @property
     def device(self) -> str:
+        """Primary device: the one inputs are placed on."""
         if self._config.device is not None:
             return self._config.device
+        if self._config.distributed_devices:
+            return self._config.distributed_devices[0]
         engine_config = getattr(self._engine, "config", None)
         engine_device = getattr(engine_config, "device", None)
         return engine_device if isinstance(engine_device, str) else "cuda:0"
@@ -147,9 +176,10 @@ class ForecastWorker:
         except Exception:
             pass
 
-    def _build_engine(self) -> AuroraEngine:
+    def _build_engine(self, preset: str | None = None) -> AuroraEngine:
         kwargs: dict[str, Any] = {
             "asset_root": self._config.asset_root,
+            "allow_hub_download": False,
         }
         if self._config.inference_precision is not None:
             kwargs["inference_precision"] = self._config.inference_precision
@@ -171,7 +201,7 @@ class ForecastWorker:
                 max_vram_gib_per_device=self._config.distributed_max_vram_gib,
                 force=self._config.distributed_force,
             )
-        engine = AuroraEngine.from_preset(self._config.preset, **kwargs)
+        engine = AuroraEngine.from_preset(preset or self._loaded_preset, **kwargs)
         if self._config.device is not None and not self._config.distributed_devices:
             engine.config.device = self._config.device
         return engine
@@ -181,7 +211,12 @@ class ForecastWorker:
             return
         self._closed = True
         self._running = False
+        self._record_memory_high_water()
         self._stop_compute_thread()
+        try:
+            self._flush_until_inline_deadline()
+        except Exception:
+            pass
         try:
             self._engine.close()
         except Exception:
@@ -190,6 +225,40 @@ class ForecastWorker:
         self._event_socket.close(linger=0)
         if self._owns_context:
             self._context.term()
+
+    def _record_memory_high_water(self) -> None:
+        """Persist allocator peaks. Reserved, not allocated, is what must fit on the GPU."""
+        if not torch.cuda.is_available():
+            return
+        device_name = self.device if self.device.startswith("cuda") else "cuda"
+        try:
+            device = torch.device(device_name)
+            allocated = torch.cuda.max_memory_allocated(device)
+            reserved = torch.cuda.max_memory_reserved(device)
+        except Exception:
+            return
+        if reserved <= 0:
+            return
+        gib = 1024**3
+        payload = {
+            "peak_allocated_gib": allocated / gib,
+            "peak_reserved_gib": reserved / gib,
+        }
+        print(
+            "memory_high_water "
+            f"allocated_gib={payload['peak_allocated_gib']:.6f} "
+            f"reserved_gib={payload['peak_reserved_gib']:.6f}",
+            flush=True,
+        )
+        path = self._config.memory_report
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        temporary.replace(path)
 
     def _set_model_ready(self, ready: bool) -> None:
         with self._state_lock:
@@ -202,14 +271,53 @@ class ForecastWorker:
     def _health_message(self) -> str:
         with self._state_lock:
             if self._busy:
-                return "busy"
+                return WORKER_STATUS_BUSY
             if self._model_ready:
-                return "ready"
-            return "listening"
+                return WORKER_STATUS_READY
+            return WORKER_STATUS_LISTENING
 
     def _emit(self, event: ForecastEvent) -> None:
+        """Queue one event and send whatever the pipe will take without blocking."""
         with self._emit_lock:
-            self._event_socket.send(encode_event(event))
+            if len(self._pending_events) >= _MAX_QUEUED_EVENTS:
+                return
+            self._pending_events.append(event)
+            self._flush_events_locked()
+            retry_inline = not self._detached_compute and bool(self._pending_events)
+        if retry_inline:
+            self._flush_until_inline_deadline()
+
+    def _flush_until_inline_deadline(self) -> None:
+        """Give a just-connected peer one short window. The serve loop retries on its own."""
+        deadline_s = time.monotonic() + _INLINE_FLUSH_WAIT_S
+        while time.monotonic() < deadline_s:
+            with self._emit_lock:
+                self._flush_events_locked()
+                if not self._pending_events:
+                    return
+            time.sleep(_INLINE_FLUSH_PAUSE_S)
+
+    def _flush_events_locked(self) -> None:
+        while self._pending_events:
+            try:
+                self._event_socket.send(encode_event(self._pending_events[0]), flags=zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            self._pending_events.popleft()
+
+    def _flush_events(self) -> None:
+        with self._emit_lock:
+            self._flush_events_locked()
+
+    def _job_event(self, kind: ForecastEventKind, **fields: Any) -> ForecastEvent:
+        """Build an event attributed to this worker so clients can trace a job to a GPU."""
+        return ForecastEvent(
+            kind=kind,
+            worker_id=self.worker_id,
+            worker_device=self.device,
+            worker_preset=self._loaded_preset,
+            **fields,
+        )
 
     def _emit_ready(self, *, message: str) -> None:
         # NOBLOCK: startup ready must not stall when no PULL peer is connected yet.
@@ -220,7 +328,7 @@ class ForecastWorker:
                     encode_event(
                         ForecastEvent(
                             kind="ready",
-                            worker_preset=self._config.preset,
+                            worker_preset=self._loaded_preset,
                             worker_id=self.worker_id,
                             worker_device=self.device,
                             worker_capacity=self.capacity,
@@ -232,6 +340,35 @@ class ForecastWorker:
         except zmq.Again:
             pass
 
+    def _prepare_engine_for(self, preset: str) -> None:
+        """Load ``preset``, releasing the previous engine first when the model changes."""
+        if preset == self._loaded_preset:
+            self.ensure_loaded()
+            return
+        self._release_loaded_engine()
+        self._engine = self._build_engine(preset)
+        self._downloader = DataDownloader.from_preset(
+            preset,
+            asset_root=self._config.asset_root,
+        )
+        self._loaded_preset = preset
+        self._config.preset = preset
+        self._set_model_ready(False)
+        self.ensure_loaded()
+
+    def _release_loaded_engine(self) -> None:
+        """Drop GPU weights and the caching allocator's reserved blocks."""
+        self._set_model_ready(False)
+        try:
+            self._engine.release_gpu(move_model_to_cpu=True)
+        except Exception:
+            pass
+        try:
+            self._engine.close()
+        except Exception:
+            pass
+        self._loaded_preset = None
+
     def ensure_loaded(self, *, rollout_steps: int | None = None) -> None:
         """Load weights onto the device and mark the worker warm."""
         if self.model_ready:
@@ -241,10 +378,10 @@ class ForecastWorker:
         self._set_model_ready(True)
 
     def _validate_request(self, request: ForecastRequest) -> None:
-        if request.preset != self._config.preset:
+        if request.preset not in self._accepted_presets:
+            accepted = ", ".join(self._accepted_presets)
             raise ValueError(
-                f"worker preset {self._config.preset!r} does not match "
-                f"request preset {request.preset!r}"
+                f"worker accepts {accepted}, not preset {request.preset!r}"
             )
         if request.steps < 1:
             raise ValueError("steps must be >= 1")
@@ -261,6 +398,7 @@ class ForecastWorker:
         request: ForecastRequest,
         step_index: int,
         prediction,
+        member: int | None,
     ) -> ForecastEvent:
         variable = request.preview_var or next(iter(prediction.surf_vars))
         if variable not in prediction.surf_vars:
@@ -268,13 +406,14 @@ class ForecastWorker:
             raise ValueError(f"surface variable {variable!r} not found; available: {available}")
         array = prediction.surf_vars[variable][0, -1].detach().float().cpu().numpy()
         valid_time = prediction.metadata.time[-1].isoformat()
-        return ForecastEvent(
-            kind="step",
+        return self._job_event(
+            "step",
             request_id=request.request_id,
             step=step_index,
             valid_time=valid_time,
             array_name=variable,
             array_data_b64=encode_array(array),
+            ensemble_member=member,
         )
 
     def _rollout_kwargs(self, request: ForecastRequest) -> dict[str, Any]:
@@ -307,8 +446,8 @@ class ForecastWorker:
             )
             for step_index, path in enumerate(export_paths):
                 self._emit(
-                    ForecastEvent(
-                        kind="step",
+                    self._job_event(
+                        "step",
                         request_id=request.request_id,
                         step=step_index,
                         export_path=str(path),
@@ -320,23 +459,12 @@ class ForecastWorker:
         stream = self._engine.rollout_stream(batch, request.steps, **rollout_kwargs)
         for step_index, prediction in enumerate(stream):
             if request.output_mode == "last_step_array" and step_index == request.steps - 1:
-                event = self._last_step_array_event(request, step_index, prediction)
-                self._emit(
-                    ForecastEvent(
-                        kind=event.kind,
-                        request_id=event.request_id,
-                        step=event.step,
-                        valid_time=event.valid_time,
-                        array_name=event.array_name,
-                        array_data_b64=event.array_data_b64,
-                        ensemble_member=member,
-                    )
-                )
+                self._emit(self._last_step_array_event(request, step_index, prediction, member))
                 continue
             valid_time = prediction.metadata.time[-1].isoformat()
             self._emit(
-                ForecastEvent(
-                    kind="step",
+                self._job_event(
+                    "step",
                     request_id=request.request_id,
                     step=step_index,
                     valid_time=valid_time,
@@ -349,7 +477,8 @@ class ForecastWorker:
         self._validate_request(request)
         if request.ensemble_members is not None and request.ensemble_members < 1:
             raise ValueError("ensemble_members must be >= 1 when set")
-        self._emit(ForecastEvent(kind="preparing", request_id=request.request_id))
+        self._emit(self._job_event("preparing", request_id=request.request_id))
+        self._prepare_engine_for(request.preset)
 
         if request.netcdf_path is not None:
             batch = self._engine.prepare_from_netcdf(
@@ -371,7 +500,7 @@ class ForecastWorker:
                 overlap=request.overlap,
             )
 
-        self._emit(ForecastEvent(kind="running", request_id=request.request_id))
+        self._emit(self._job_event("running", request_id=request.request_id))
 
         members = request.ensemble_members
         if members is None or members <= 1:
@@ -383,7 +512,7 @@ class ForecastWorker:
                 member_batch = batch._fmap(lambda tensor: tensor.clone())
                 self._emit_member_rollout(request, member_batch, member=member)
 
-        self._emit(ForecastEvent(kind="completed", request_id=request.request_id))
+        self._emit(self._job_event("completed", request_id=request.request_id))
 
     def _execute_forecast_job(self, request: ForecastRequest) -> None:
         """Run one job with error handling (compute plane or inline)."""
@@ -392,13 +521,7 @@ class ForecastWorker:
             self.run_forecast(request)
             self._set_model_ready(True)
         except InsufficientVramError as exc:
-            self._emit(
-                ForecastEvent(
-                    kind="failed",
-                    request_id=request.request_id,
-                    error=str(exc),
-                )
-            )
+            self._emit_failed(request.request_id, str(exc))
             self._fatal_error = exc
             self._running = False
         except Exception as exc:
@@ -406,15 +529,25 @@ class ForecastWorker:
                 self._engine.release_gpu(move_model_to_cpu=True)
             except Exception:
                 pass
-            self._emit(
-                ForecastEvent(
-                    kind="failed",
-                    request_id=request.request_id,
-                    error=str(exc),
-                )
-            )
+            # The weights just moved to the CPU, so health must stop reporting "ready".
+            self._set_model_ready(False)
+            self._emit_failed(request.request_id, str(exc))
         finally:
+            self._record_memory_high_water()
             self._set_busy(False)
+
+    def _emit_failed(self, request_id: str | None, error: str) -> None:
+        self._emit(self._job_event("failed", request_id=request_id, error=error))
+
+    def _fail_queued_jobs(self, reason: str) -> None:
+        """Answer every accepted-but-unstarted job so the coordinator frees its slot."""
+        while True:
+            try:
+                item = self._job_queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, ForecastRequest):
+                self._emit_failed(item.request_id, reason)
 
     def _compute_loop(self) -> None:
         while True:
@@ -424,7 +557,8 @@ class ForecastWorker:
             assert isinstance(item, ForecastRequest)
             self._execute_forecast_job(item)
             if self._fatal_error is not None:
-                # Drain stop signal if present; wake control loop via _running=False.
+                # The control loop stops on _running=False; nothing will run the queued jobs.
+                self._fail_queued_jobs(f"worker stopped after fatal error: {self._fatal_error}")
                 break
 
     def _start_compute_thread(self) -> None:
@@ -462,7 +596,7 @@ class ForecastWorker:
             self._emit(
                 ForecastEvent(
                     kind="health",
-                    worker_preset=self._config.preset,
+                    worker_preset=self._loaded_preset,
                     worker_id=self.worker_id,
                     worker_device=self.device,
                     worker_capacity=self.capacity,
@@ -472,12 +606,7 @@ class ForecastWorker:
             return True
         if command.kind == "forecast":
             if command.request is None:
-                self._emit(
-                    ForecastEvent(
-                        kind="failed",
-                        error="forecast command requires a request payload",
-                    )
-                )
+                self._emit_failed(None, "forecast command requires a request payload")
                 return True
             request = command.request
             try:
@@ -485,16 +614,10 @@ class ForecastWorker:
                 if request.ensemble_members is not None and request.ensemble_members < 1:
                     raise ValueError("ensemble_members must be >= 1 when set")
             except Exception as exc:
-                self._emit(
-                    ForecastEvent(
-                        kind="failed",
-                        request_id=request.request_id,
-                        error=str(exc),
-                    )
-                )
+                self._emit_failed(request.request_id, str(exc))
                 return True
             # Queued / starting acknowledgment from the control plane.
-            self._emit(ForecastEvent(kind="accepted", request_id=request.request_id))
+            self._emit(self._job_event("accepted", request_id=request.request_id))
             if self._detached_compute:
                 self._job_queue.put(request)
             else:
@@ -503,7 +626,7 @@ class ForecastWorker:
                     self.close()
                     raise SystemExit(1) from self._fatal_error
             return True
-        self._emit(ForecastEvent(kind="failed", error=f"unsupported command {command.kind!r}"))
+        self._emit_failed(None, f"unsupported command {command.kind!r}")
         return True
 
     def serve_forever(self) -> None:
@@ -514,14 +637,15 @@ class ForecastWorker:
         try:
             if self._config.preload:
                 self.ensure_loaded()
-                self._emit_ready(message="ready")
+                self._emit_ready(message=WORKER_STATUS_READY)
             else:
                 # Sockets are bound; GPU load still happens on first forecast.
-                self._emit_ready(message="listening")
+                self._emit_ready(message=WORKER_STATUS_LISTENING)
             self._start_compute_thread()
             while self._running:
                 if self._fatal_error is not None:
                     break
+                self._flush_events()
                 events = poller.poll(timeout=self._config.poll_timeout_ms)
                 if not events:
                     continue
@@ -551,10 +675,24 @@ def install_signal_handlers(worker: ForecastWorker) -> None:
     signal.signal(signal.SIGTERM, _handler)
 
 
-def wait_for_bind(addr: str, *, timeout_s: float = 5.0) -> None:
-    """Allow ZMQ bind/connect ordering in tests."""
-    del addr
-    time.sleep(0.05)
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        time.sleep(0.01)
+_IPC_SCHEME = "ipc://"
+_BIND_POLL_INTERVAL_S = 0.01
+# A spawned worker imports torch and builds its engine before it binds.
+_DEFAULT_BIND_TIMEOUT_S = 120.0
+
+
+def wait_for_bind(addr: str, *, timeout_s: float = _DEFAULT_BIND_TIMEOUT_S) -> None:
+    """Block until an ``ipc://`` endpoint has its socket file, then return at once.
+
+    Other schemes cannot be probed without connecting, and ZMQ connects retry on
+    their own, so they return immediately. Raises TimeoutError if the socket
+    file never appears.
+    """
+    if not addr.startswith(_IPC_SCHEME):
+        return
+    socket_path = Path(addr[len(_IPC_SCHEME):])
+    deadline = time.monotonic() + timeout_s
+    while not socket_path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{addr} was not bound within {timeout_s:.1f}s")
+        time.sleep(_BIND_POLL_INTERVAL_S)

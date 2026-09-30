@@ -7,4 +7,4 @@ cd "$ROOT"
 export AURORA_HF_LOCAL_DIR="${AURORA_HF_LOCAL_DIR:-}"
 
 echo "Running flash-aurora library tests..."
-uv run pytest tests/aurora tests/kernels tests/engine -m "not integration" "$@"
+uv run pytest tests/aurora tests/kernels tests/engine -m "not integration and not benchmark" "$@"

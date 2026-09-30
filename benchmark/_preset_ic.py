@@ -15,6 +15,7 @@ from flash_aurora.engine.core.config import (
     EngineConfig,
 )
 from flash_aurora.engine.core.presets import DEFAULT_PRESETS
+from flash_aurora.engine.ingress.adapters import IngestRequest
 from flash_aurora.engine.ingress.build_ic import InitialConditionBuilder
 from flash_aurora.engine.ingress.download import DataDownloader
 from flash_aurora.engine.ingress.download.layout import cache_subdir
@@ -112,6 +113,30 @@ def load_small_pretrained_batch(asset_root: Path) -> tuple[Any, EngineConfig]:
     return batch, preset_engine_config("small_pretrained", asset_root)
 
 
+def load_preset_ingest_request(
+    preset_name: str,
+    asset_root: Path,
+    *,
+    valid_time: datetime | None = None,
+    time_index: int | None = None,
+) -> tuple[IngestRequest, EngineConfig]:
+    """Ingest request over the cached ingress NetCDF (no download)."""
+    if preset_name not in PRECISION_PRESETS:
+        raise KeyError(f"Preset {preset_name!r} not in PRECISION_PRESETS")
+    config = preset_engine_config(preset_name, asset_root)
+    vt = valid_time or _DEFAULT_VALID_TIME[preset_name]
+    ti = _DEFAULT_TIME_INDEX[preset_name] if time_index is None else time_index
+    cache = asset_root.expanduser().resolve() / cache_subdir(config.source)
+    downloader = DataDownloader(config)
+    missing = downloader.missing(vt, cache_dir=cache)
+    if missing:
+        raise FileNotFoundError(
+            f"Incomplete ingress cache for preset {preset_name!r} at {cache}: missing {missing}"
+        )
+    request = downloader.ingest_request(vt, cache_dir=cache, time_index=ti, download=False)
+    return request, config
+
+
 def load_preset_batch(
     preset_name: str,
     asset_root: Path,
@@ -124,19 +149,13 @@ def load_preset_batch(
         raise KeyError(f"Preset {preset_name!r} not in PRECISION_PRESETS")
     if preset_name == "small_pretrained":
         return load_small_pretrained_batch(asset_root)
-    config = preset_engine_config(preset_name, asset_root)
-    vt = valid_time or _DEFAULT_VALID_TIME[preset_name]
-    ti = _DEFAULT_TIME_INDEX[preset_name] if time_index is None else time_index
-    cache = asset_root.expanduser().resolve() / cache_subdir(config.source)
-    downloader = DataDownloader(config)
-    missing = downloader.missing(vt, cache_dir=cache)
-    if missing:
-        raise FileNotFoundError(
-            f"Incomplete ingress cache for preset {preset_name!r} at {cache}: missing {missing}"
-        )
-    request = downloader.ingest_request(vt, cache_dir=cache, time_index=ti, download=False)
-    batch = InitialConditionBuilder(config).from_source(request)
-    return batch, config
+    request, config = load_preset_ingest_request(
+        preset_name,
+        asset_root,
+        valid_time=valid_time,
+        time_index=time_index,
+    )
+    return InitialConditionBuilder(config).from_source(request), config
 
 
 def checkpoint_path(config: EngineConfig, asset_root: Path) -> Path:
