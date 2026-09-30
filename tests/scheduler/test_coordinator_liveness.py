@@ -168,6 +168,7 @@ def test_worker_that_speaks_again_rejoins_dispatch(context: zmq.Context, tmp_pat
     with _cluster(context, tmp_path, [stub]) as client:
         stub.announce_ready()
         client.submit(forecast_request("req-1"))
+        assert stub.next_forecast_request_id(timeout_ms=IO_TIMEOUT_MS) == "req-1"
         _next_failure(client)
 
         stub.answer_health()

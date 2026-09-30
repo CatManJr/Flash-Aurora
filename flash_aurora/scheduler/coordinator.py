@@ -7,20 +7,37 @@ import signal
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Deque
 
 import zmq
 
 from flash_aurora.scheduler.protocol import (
+    CLUSTER_STATUS_DEGRADED,
+    CLUSTER_STATUS_STARTING,
+    WORKER_STATUS_BUSY,
+    WORKER_STATUS_LISTENING,
+    WORKER_STATUS_READY,
     ForecastCommand,
     ForecastEvent,
+    ForecastEventKind,
     ForecastRequest,
     decode_command,
     decode_event,
     encode_command,
     encode_event,
 )
+
+_COORDINATOR_ID = "coordinator"
+_CLUSTER_ANNOUNCEMENTS = frozenset({WORKER_STATUS_READY, WORKER_STATUS_LISTENING})
+# A blocking send freezes dispatch, health probes, and silence detection together.
+# Outbound bytes stay in a bounded queue and leave only with NOBLOCK.
+_LINGER_MS = 0
+_PIPE_HWM = 1024
+# Close and the synchronous health wait have no poll loop of their own.
+_FLUSH_WAIT_S = 0.05
+_FLUSH_PAUSE_S = 0.001
+_HEALTH_POLL_SLICE_MS = 10
 
 
 @dataclass(frozen=True)
@@ -74,6 +91,8 @@ class _WorkerState:
     dispatched_count: int = 0
     last_heard_s: float | None = None
     unresponsive: bool = False
+    reported_status: str | None = None
+    pending_commands: deque[ForecastCommand] = field(default_factory=deque)
 
     @property
     def available_slots(self) -> int:
@@ -102,9 +121,13 @@ class ForecastCoordinator:
         self._queue: Deque[ForecastCommand] = deque()
         self._request_worker: dict[str, str] = {}
         self._sticky_workers: dict[str, str] = {}
+        self._announced_cluster_status: str | None = None
+        self._pending_events: deque[ForecastEvent] = deque()
 
         self._command_socket = self._context.socket(zmq.PULL)
         self._event_socket = self._context.socket(zmq.PUSH)
+        _configure_pipe(self._command_socket)
+        _configure_pipe(self._event_socket)
         self._command_socket.bind(config.command_addr)
         self._event_socket.bind(config.event_addr)
         self._closed = False
@@ -115,9 +138,10 @@ class ForecastCoordinator:
                 raise ValueError(f"worker {endpoint.worker_id!r} capacity must be >= 1")
             command_socket = self._context.socket(zmq.PUSH)
             event_socket = self._context.socket(zmq.PULL)
+            _configure_pipe(command_socket)
+            _configure_pipe(event_socket, receive_timeout_ms=config.worker_health_timeout_ms)
             command_socket.connect(endpoint.command_addr)
             event_socket.connect(endpoint.event_addr)
-            event_socket.setsockopt(zmq.RCVTIMEO, config.worker_health_timeout_ms)
             self._workers[endpoint.worker_id] = _WorkerState(
                 endpoint=endpoint,
                 command_socket=command_socket,
@@ -145,23 +169,75 @@ class ForecastCoordinator:
         self._closed = True
         self._running = False
         for worker in self._workers.values():
-            try:
-                self._send_worker(worker, ForecastCommand(kind="shutdown"))
-            except Exception:
-                pass
-        self._command_socket.close(linger=0)
-        self._event_socket.close(linger=0)
+            # Forecasts still in memory will not run. Shutdown has to be the next send.
+            worker.pending_commands.clear()
+            worker.pending_commands.append(ForecastCommand(kind="shutdown"))
+        try:
+            self._flush_until(time.monotonic() + _FLUSH_WAIT_S)
+        except Exception:
+            pass
+        # LINGER 0 would discard a shutdown that send() accepted but has not hit the peer yet.
+        linger_ms = int(_FLUSH_WAIT_S * 1000)
+        self._event_socket.setsockopt(zmq.LINGER, linger_ms)
         for worker in self._workers.values():
-            worker.command_socket.close(linger=0)
+            worker.command_socket.setsockopt(zmq.LINGER, linger_ms)
+        self._command_socket.close(linger=0)
+        self._event_socket.close()
+        for worker in self._workers.values():
+            worker.command_socket.close()
             worker.event_socket.close(linger=0)
         if self._owns_context:
             self._context.term()
 
     def _emit(self, event: ForecastEvent) -> None:
-        self._event_socket.send(encode_event(event))
+        """Queue one client event and send whatever the pipe will take without blocking."""
+        if len(self._pending_events) >= _PIPE_HWM:
+            return
+        self._pending_events.append(event)
+        self._flush_client_events()
+
+    def _flush_client_events(self) -> None:
+        while self._pending_events:
+            try:
+                self._event_socket.send(encode_event(self._pending_events[0]), flags=zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            self._pending_events.popleft()
 
     def _send_worker(self, worker: _WorkerState, command: ForecastCommand) -> None:
-        worker.command_socket.send(encode_command(command))
+        """Queue one worker command and send whatever that pipe will take without blocking."""
+        if len(worker.pending_commands) >= _PIPE_HWM:
+            return
+        worker.pending_commands.append(command)
+        self._flush_worker_commands(worker)
+
+    def _flush_worker_commands(self, worker: _WorkerState) -> None:
+        while worker.pending_commands:
+            try:
+                worker.command_socket.send(
+                    encode_command(worker.pending_commands[0]),
+                    flags=zmq.NOBLOCK,
+                )
+            except zmq.Again:
+                return
+            worker.pending_commands.popleft()
+
+    def _flush_outbound(self) -> None:
+        self._flush_client_events()
+        for worker in self._workers.values():
+            self._flush_worker_commands(worker)
+
+    def _outbound_is_idle(self) -> bool:
+        if self._pending_events:
+            return False
+        return all(not worker.pending_commands for worker in self._workers.values())
+
+    def _flush_until(self, deadline_s: float) -> None:
+        while time.monotonic() < deadline_s:
+            self._flush_outbound()
+            if self._outbound_is_idle():
+                return
+            time.sleep(_FLUSH_PAUSE_S)
 
     def refresh_worker_health(self) -> None:
         """Best-effort worker metadata refresh; stops waiting on a worker that stays silent."""
@@ -171,17 +247,26 @@ class ForecastCoordinator:
             self._await_health_reply(worker)
 
     def _await_health_reply(self, worker: _WorkerState) -> None:
-        # Job events can arrive ahead of the reply; route them, keep waiting for health.
-        while True:
-            try:
-                event = decode_event(worker.event_socket.recv())
-            except zmq.Again:
+        """Read until this worker's health reply, or until the health budget runs out.
+
+        Job events can arrive ahead of the reply; they are routed and the wait continues.
+        A health command that has not left the queue yet is flushed on each slice.
+        """
+        deadline_s = self._clock() + self._config.worker_health_timeout_ms / 1000.0
+        while self._clock() < deadline_s:
+            self._flush_worker_commands(worker)
+            remaining_ms = int((deadline_s - self._clock()) * 1000)
+            if remaining_ms < 1:
                 return
+            if not worker.event_socket.poll(timeout=min(_HEALTH_POLL_SLICE_MS, remaining_ms)):
+                continue
+            event = decode_event(worker.event_socket.recv())
             self._handle_worker_event(worker, event)
             if event.kind == "health":
                 return
 
-    def _apply_worker_health(self, worker: _WorkerState, event: ForecastEvent) -> None:
+    def _remember_worker_report(self, worker: _WorkerState, event: ForecastEvent) -> None:
+        """Keep the latest device, capacity, and ready/listening/busy status."""
         endpoint = worker.endpoint
         worker.endpoint = WorkerEndpoint(
             worker_id=endpoint.worker_id,
@@ -191,6 +276,47 @@ class ForecastCoordinator:
             device=event.worker_device or endpoint.device,
             capacity=event.worker_capacity or endpoint.capacity,
         )
+        if event.message is not None:
+            worker.reported_status = event.message
+
+    def _cluster_status(self) -> str:
+        """One status for the front-end client.
+
+        ``ready`` means every worker has loaded its model and is idle. A single
+        worker that is still loading, or that has not spoken, keeps the cluster
+        out of ``ready``.
+        """
+        workers = self._workers.values()
+        if any(worker.unresponsive for worker in workers):
+            return CLUSTER_STATUS_DEGRADED
+        statuses = [worker.reported_status for worker in workers]
+        if any(status is None for status in statuses):
+            return CLUSTER_STATUS_STARTING
+        if any(status == WORKER_STATUS_LISTENING for status in statuses):
+            return WORKER_STATUS_LISTENING
+        if any(status == WORKER_STATUS_BUSY for status in statuses):
+            return WORKER_STATUS_BUSY
+        if all(status == WORKER_STATUS_READY for status in statuses):
+            return WORKER_STATUS_READY
+        return CLUSTER_STATUS_STARTING
+
+    def _cluster_event(self, *, kind: ForecastEventKind, message: str) -> ForecastEvent:
+        presets = sorted({worker.endpoint.preset for worker in self._workers.values()})
+        return ForecastEvent(
+            kind=kind,
+            worker_preset=",".join(presets),
+            worker_id=_COORDINATOR_ID,
+            worker_capacity=sum(worker.endpoint.capacity for worker in self._workers.values()),
+            message=message,
+        )
+
+    def _publish_cluster_status(self) -> None:
+        """Tell late clients the cluster state once, the same way one worker emits ``ready``."""
+        status = self._cluster_status()
+        if status not in _CLUSTER_ANNOUNCEMENTS or status == self._announced_cluster_status:
+            return
+        self._announced_cluster_status = status
+        self._emit(self._cluster_event(kind="ready", message=status))
 
     def _matching_workers(self, request: ForecastRequest) -> list[_WorkerState]:
         return [
@@ -292,9 +418,14 @@ class ForecastCoordinator:
         worker.unresponsive = False
         # Health replies answer the coordinator, not a client, so they never leave here.
         if event.kind == "health":
-            self._apply_worker_health(worker, event)
+            self._remember_worker_report(worker, event)
+        elif event.kind == "ready":
+            # Per-worker ready is not the cluster. Publishing below emits one event
+            # when the last worker reaches the same status.
+            self._remember_worker_report(worker, event)
         else:
             self._forward_worker_event(worker, event)
+        self._publish_cluster_status()
         if was_unresponsive:
             self._dispatch_ready()
 
@@ -310,8 +441,11 @@ class ForecastCoordinator:
                 self._declare_unresponsive(worker)
 
     def _probe_worker(self, worker: _WorkerState) -> None:
-        # A dead peer's pipe fills to the high-water mark, after which a blocking send
-        # would freeze the whole coordinator; the silence limit already covers that worker.
+        # Health stays off the command queue. A queued forecast must reach the worker
+        # before a later probe, and a full pipe means this probe would not land anyway.
+        self._flush_worker_commands(worker)
+        if worker.pending_commands:
+            return
         try:
             worker.command_socket.send(
                 encode_command(ForecastCommand(kind="health")),
@@ -331,6 +465,7 @@ class ForecastCoordinator:
             self._request_worker.pop(request_id, None)
             self._emit(self._lost_job_event(worker, request_id))
         worker.running.clear()
+        self._announced_cluster_status = None
         self._sticky_workers = {
             key: worker_id
             for key, worker_id in self._sticky_workers.items()
@@ -377,18 +512,7 @@ class ForecastCoordinator:
                 self._send_worker(worker, command)
             return False
         if command.kind == "health":
-            presets = sorted({worker.endpoint.preset for worker in self._workers.values()})
-            self._emit(
-                ForecastEvent(
-                    kind="health",
-                    worker_preset=",".join(presets),
-                    worker_id="coordinator",
-                    worker_capacity=sum(
-                        worker.endpoint.capacity for worker in self._workers.values()
-                    ),
-                    message="ok",
-                )
-            )
+            self._emit(self._cluster_event(kind="health", message=self._cluster_status()))
             return True
         if command.kind == "forecast":
             self._enqueue_or_fail(command)
@@ -401,6 +525,7 @@ class ForecastCoordinator:
             self._start_serving()
             poller = self._build_poller()
             while self._running:
+                self._flush_outbound()
                 events = dict(poller.poll(timeout=self._config.poll_timeout_ms))
                 if self._command_socket in events:
                     command = decode_command(self._command_socket.recv())
@@ -424,6 +549,18 @@ class ForecastCoordinator:
         for worker in self._workers.values():
             poller.register(worker.event_socket, zmq.POLLIN)
         return poller
+
+
+def _configure_pipe(socket: zmq.Socket, *, receive_timeout_ms: int | None = None) -> None:
+    """Set the pipe bounds before bind or connect.
+
+    ``LINGER`` is zero so process exit does not wait out a full high-water mark.
+    """
+    socket.setsockopt(zmq.LINGER, _LINGER_MS)
+    socket.setsockopt(zmq.SNDHWM, _PIPE_HWM)
+    socket.setsockopt(zmq.RCVHWM, _PIPE_HWM)
+    if receive_timeout_ms is not None:
+        socket.setsockopt(zmq.RCVTIMEO, receive_timeout_ms)
 
 
 def install_signal_handlers(coordinator: ForecastCoordinator) -> None:

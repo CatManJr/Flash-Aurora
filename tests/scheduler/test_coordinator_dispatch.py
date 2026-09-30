@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -74,7 +75,7 @@ def _worker_that_received(stubs: list[StubWorker], request_id: str) -> StubWorke
     raise AssertionError(f"no worker received {request_id}")
 
 
-def test_worker_health_reply_is_applied_but_not_forwarded_to_clients(
+def test_worker_health_reply_updates_the_worker_and_announces_the_cluster(
     context: zmq.Context, tmp_path: Path
 ) -> None:
     stub = StubWorker(context, tmp_path, "worker-0")
@@ -89,13 +90,20 @@ def test_worker_health_reply_is_applied_but_not_forwarded_to_clients(
         message="ready",
     )
 
-    coordinator._handle_worker_event(coordinator._workers["worker-0"], health)
+    try:
+        coordinator._handle_worker_event(coordinator._workers["worker-0"], health)
 
-    assert client.try_recv_event(timeout_ms=QUIET_MS) is None
-    assert coordinator._workers["worker-0"].endpoint.capacity == 3
-    client.close()
-    coordinator.close()
-    stub.close()
+        announced = _flush_until_event(coordinator, client)
+        assert announced is not None
+        assert announced.kind == "ready"
+        assert announced.message == "ready"
+        assert announced.worker_id == "coordinator"
+        assert client.try_recv_event(timeout_ms=QUIET_MS) is None
+        assert coordinator._workers["worker-0"].endpoint.capacity == 3
+    finally:
+        client.close()
+        coordinator.close()
+        stub.close()
 
 
 def test_refresh_reads_health_that_follows_a_job_event(context: zmq.Context, tmp_path: Path) -> None:
@@ -105,15 +113,20 @@ def test_refresh_reads_health_that_follows_a_job_event(context: zmq.Context, tmp
     stub.push(ForecastEvent(kind="running", request_id="req-early"))
     stub.push(ForecastEvent(kind="health", worker_id="worker-0", worker_capacity=2, message="ready"))
 
-    coordinator.refresh_worker_health()
+    try:
+        coordinator.refresh_worker_health()
 
-    forwarded = client.recv_event()
-    assert (forwarded.kind, forwarded.request_id) == ("running", "req-early")
-    assert coordinator._workers["worker-0"].endpoint.capacity == 2
-    assert client.try_recv_event(timeout_ms=QUIET_MS) is None
-    client.close()
-    coordinator.close()
-    stub.close()
+        forwarded = _flush_until_event(coordinator, client)
+        announced = _flush_until_event(coordinator, client)
+        assert forwarded is not None and (forwarded.kind, forwarded.request_id) == ("running", "req-early")
+        assert announced is not None
+        assert (announced.kind, announced.message, announced.worker_id) == ("ready", "ready", "coordinator")
+        assert coordinator._workers["worker-0"].endpoint.capacity == 2
+        assert client.try_recv_event(timeout_ms=QUIET_MS) is None
+    finally:
+        client.close()
+        coordinator.close()
+        stub.close()
 
 
 def test_owned_context_is_not_the_process_singleton(tmp_path: Path) -> None:
@@ -133,6 +146,68 @@ def test_owned_context_is_not_the_process_singleton(tmp_path: Path) -> None:
     assert not shared.closed
     stub.close()
     stub_context.term()
+
+
+def test_client_events_are_queued_when_no_client_is_connected(
+    context: zmq.Context, tmp_path: Path
+) -> None:
+    stub = StubWorker(context, tmp_path, "worker-0")
+    coordinator = build_coordinator(context, tmp_path, [stub])
+    started_s = time.monotonic()
+
+    for _ in range(8):
+        coordinator._emit(ForecastEvent(kind="ready", message="ready", worker_id="coordinator"))
+
+    assert time.monotonic() - started_s < 1.0
+    client = build_client(coordinator, context)
+    event = _flush_until_event(coordinator, client)
+    assert event is not None and event.kind == "ready"
+    client.close()
+    coordinator.close()
+    stub.close()
+
+
+def _flush_until_event(coordinator: ForecastCoordinator, client: ForecastClient):
+    deadline_s = time.monotonic() + 1.0
+    while time.monotonic() < deadline_s:
+        coordinator._flush_outbound()
+        event = client.try_recv_event(timeout_ms=50)
+        if event is not None:
+            return event
+    return None
+
+
+def test_close_returns_when_no_worker_is_bound(tmp_path: Path) -> None:
+    coordinator = ForecastCoordinator(
+        ForecastCoordinatorConfig(
+            command_addr=f"ipc://{tmp_path / 'front-commands.ipc'}",
+            event_addr=f"ipc://{tmp_path / 'front-events.ipc'}",
+            workers=(
+                WorkerEndpoint(
+                    worker_id="missing",
+                    preset=PRESET,
+                    command_addr=f"ipc://{tmp_path / 'missing-commands.ipc'}",
+                    event_addr=f"ipc://{tmp_path / 'missing-events.ipc'}",
+                ),
+            ),
+        )
+    )
+    started_s = time.monotonic()
+
+    coordinator.close()
+
+    assert time.monotonic() - started_s < 1.0
+
+
+def test_close_delivers_shutdown(context: zmq.Context, tmp_path: Path) -> None:
+    stub = StubWorker(context, tmp_path, "worker-0")
+    coordinator = build_coordinator(context, tmp_path, [stub])
+
+    try:
+        coordinator.close()
+        assert stub.next_command_kind(timeout_ms=IO_TIMEOUT_MS) == "shutdown"
+    finally:
+        stub.close()
 
 
 def test_coordinator_rejects_two_workers_with_the_same_id(tmp_path: Path) -> None:

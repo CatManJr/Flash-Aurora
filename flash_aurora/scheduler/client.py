@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import zmq
 
 from flash_aurora.scheduler.protocol import (
+    WORKER_STATUS_LISTENING,
+    WORKER_STATUS_READY,
     ForecastCommand,
     ForecastEvent,
     ForecastRequest,
@@ -100,20 +102,19 @@ class ForecastClient:
         timeout_s: float = 600.0,
         require_model_loaded: bool = True,
     ) -> ForecastEvent:
-        """Block until the worker reports ready (event or health).
+        """Block until the peer reports ready (event or health).
 
         Late-joining clients miss the startup ``ready`` PUSH, so this also polls
-        ``health`` (message ``ready`` after preload / first successful load, or
-        ``listening`` when sockets are up without preload).
+        ``health``. Against one worker, ``ready`` means that worker's model is
+        loaded. Against a coordinator, the same word means every worker is loaded.
+        ``listening`` means sockets are up and weights are not.
         """
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             if self._event_socket.poll(timeout=50):
                 event = self._recv_event()
-                if event.kind == "ready":
-                    if not require_model_loaded or event.message == "ready":
-                        return event
-                # Drain unrelated events while waiting.
+                if self._is_ready_report(event, require_model_loaded=require_model_loaded):
+                    return event
                 continue
             self._send_command(ForecastCommand(kind="health"))
             try:
@@ -126,16 +127,17 @@ class ForecastClient:
                     self._event_socket.setsockopt(zmq.RCVTIMEO, previous)
             except zmq.Again:
                 continue
-            if event.kind == "ready":
-                if not require_model_loaded or event.message == "ready":
-                    return event
-                continue
-            if event.kind == "health":
-                if event.message == "ready":
-                    return event
-                if not require_model_loaded and event.message == "listening":
-                    return event
+            if self._is_ready_report(event, require_model_loaded=require_model_loaded):
+                return event
         raise TimeoutError("timed out waiting for worker ready")
+
+    @staticmethod
+    def _is_ready_report(event: ForecastEvent, *, require_model_loaded: bool) -> bool:
+        if event.kind not in ("ready", "health"):
+            return False
+        if event.message == WORKER_STATUS_READY:
+            return True
+        return not require_model_loaded and event.message == WORKER_STATUS_LISTENING
 
     def shutdown_worker(self) -> None:
         self._send_command(ForecastCommand(kind="shutdown"))

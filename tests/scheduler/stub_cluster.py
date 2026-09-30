@@ -48,6 +48,12 @@ class StubWorker:
             event_addr=self.event_addr,
         )
 
+    def next_command_kind(self, *, timeout_ms: int) -> str | None:
+        """Return the kind of the next command, including health and shutdown."""
+        if not self._command_pull.poll(timeout=timeout_ms):
+            return None
+        return decode_command(self._command_pull.recv()).kind
+
     def next_forecast_request_id(self, *, timeout_ms: int) -> str | None:
         """Return the next forecast request id, ignoring the coordinator's health probes."""
         deadline = time.monotonic() + timeout_ms / 1000.0
