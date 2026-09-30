@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import queue
 import signal
 import threading
@@ -65,6 +67,9 @@ class ForecastWorkerConfig:
     # When True, call ``engine.load()`` before accepting jobs and emit ``ready``.
     preload: bool = False
     preload_rollout_steps: int = 1
+    # Written after every job. Shutdown can be killed while the compute thread joins,
+    # which is too late for a log line printed only at the end of close().
+    memory_report: Path | None = None
     # Presets this process may load. Empty means only ``preset``. Switching releases
     # GPU memory and builds a new engine; the previous weights are not kept resident.
     presets: tuple[str, ...] = ()
@@ -206,12 +211,12 @@ class ForecastWorker:
             return
         self._closed = True
         self._running = False
+        self._record_memory_high_water()
         self._stop_compute_thread()
         try:
             self._flush_until_inline_deadline()
         except Exception:
             pass
-        self._log_memory_high_water()
         try:
             self._engine.close()
         except Exception:
@@ -221,8 +226,8 @@ class ForecastWorker:
         if self._owns_context:
             self._context.term()
 
-    def _log_memory_high_water(self) -> None:
-        """Print allocator peaks. Reserved, not allocated, is what must fit on the GPU."""
+    def _record_memory_high_water(self) -> None:
+        """Persist allocator peaks. Reserved, not allocated, is what must fit on the GPU."""
         if not torch.cuda.is_available():
             return
         device_name = self.device if self.device.startswith("cuda") else "cuda"
@@ -235,11 +240,25 @@ class ForecastWorker:
         if reserved <= 0:
             return
         gib = 1024**3
+        payload = {
+            "peak_allocated_gib": allocated / gib,
+            "peak_reserved_gib": reserved / gib,
+        }
         print(
             "memory_high_water "
-            f"allocated_gib={allocated / gib:.6f} reserved_gib={reserved / gib:.6f}",
+            f"allocated_gib={payload['peak_allocated_gib']:.6f} "
+            f"reserved_gib={payload['peak_reserved_gib']:.6f}",
             flush=True,
         )
+        path = self._config.memory_report
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        temporary.replace(path)
 
     def _set_model_ready(self, ready: bool) -> None:
         with self._state_lock:
@@ -514,6 +533,7 @@ class ForecastWorker:
             self._set_model_ready(False)
             self._emit_failed(request.request_id, str(exc))
         finally:
+            self._record_memory_high_water()
             self._set_busy(False)
 
     def _emit_failed(self, request_id: str | None, error: str) -> None:

@@ -62,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Call engine.load() and emit ready before accepting jobs",
     )
     parser.add_argument("--preload-rollout-steps", type=int, default=1)
+    parser.add_argument(
+        "--memory-report",
+        type=Path,
+        default=None,
+        help="JSON file updated after every job with peak allocated and reserved GiB",
+    )
     return parser
 
 
@@ -106,6 +112,7 @@ def main() -> None:
         preload=args.preload,
         preload_rollout_steps=args.preload_rollout_steps,
         presets=_parse_presets(args.presets),
+        memory_report=args.memory_report,
     )
     worker = ForecastWorker(config)
     install_signal_handlers(worker)

@@ -214,6 +214,13 @@ def _gpu_inventory() -> tuple[list[dict[str, object]], str | None]:
     return gpus, driver
 
 
+def _read_memory_report(path: Path) -> tuple[float, float] | None:
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return float(payload["peak_allocated_gib"]), float(payload["peak_reserved_gib"])
+
+
 def memory_high_water(log_text: str) -> tuple[float, float] | None:
     """Last allocator peaks printed by a worker, ``(allocated_gib, reserved_gib)``."""
     matches = list(_MEMORY_LINE.finditer(log_text))
@@ -276,6 +283,7 @@ def _spawn_worker(
         command.extend(["--presets", ",".join(worker.presets)])
     if worker.preload:
         command.append("--preload")
+    command.extend(["--memory-report", str(log_path.with_suffix(".memory.json"))])
     return subprocess.Popen(
         command,
         cwd=_REPO,
@@ -421,7 +429,9 @@ def run_trace(
 
 
 def _memory_report(worker: GpuWorker, log_path: Path) -> dict[str, object]:
-    peaks = memory_high_water(log_path.read_text(encoding="utf-8", errors="replace")) if log_path.is_file() else None
+    peaks = _read_memory_report(log_path.with_suffix(".memory.json"))
+    if peaks is None and log_path.is_file():
+        peaks = memory_high_water(log_path.read_text(encoding="utf-8", errors="replace"))
     allocated, reserved = peaks if peaks is not None else (None, None)
     return {
         "device": worker.device,

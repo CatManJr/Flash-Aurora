@@ -6,6 +6,8 @@ The default pytest selection is ``not benchmark``. Run them with ``pytest -m ben
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from _trace_generator import (
@@ -16,7 +18,12 @@ from _trace_generator import (
     group_b_trace,
 )
 from _trace_replayer import CachedIngress, forecast_request
-from bench_scheduler_trace import SCHEDULER_TRACE_WORKERS, memory_high_water, runtime_environment
+from bench_scheduler_trace import (
+    SCHEDULER_TRACE_WORKERS,
+    _read_memory_report,
+    memory_high_water,
+    runtime_environment,
+)
 
 pytestmark = pytest.mark.benchmark
 
@@ -93,6 +100,13 @@ def test_runtime_environment_names_the_stack_and_the_gpus() -> None:
     assert environment["gpus"]
     assert environment["gpus"][0]["name"]
     assert environment["driver"]
+
+
+def test_memory_report_file_is_preferred_over_the_log(tmp_path: Path) -> None:
+    report = tmp_path / "gpu-0.memory.json"
+    report.write_text('{"peak_allocated_gib": 12.5, "peak_reserved_gib": 40.0}', encoding="utf-8")
+
+    assert _read_memory_report(report) == (12.5, 40.0)
 
 
 def test_memory_high_water_reads_allocated_and_reserved() -> None:
