@@ -409,17 +409,7 @@ def run_trace(
         worker.worker_id: _memory_report(worker, log_paths[worker.worker_id])
         for worker in SCHEDULER_TRACE_WORKERS
     }
-    summary["jobs_detail"] = [
-        {
-            "request_id": record.request_id,
-            "preset": record.preset,
-            "status": record.status.value,
-            "worker_id": record.worker_id,
-            "latency_s": _latency_or_none(record),
-            "error": record.error,
-        }
-        for record in records
-    ]
+    summary["jobs_detail"] = [_job_row(record) for record in records]
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / f"{label}.json"
     report_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -441,10 +431,29 @@ def _memory_report(worker: GpuWorker, log_path: Path) -> dict[str, object]:
     }
 
 
-def _latency_or_none(record: JobRecord) -> float | None:
-    if record.status is not JobStatus.COMPLETED:
-        return None
-    return record.latency_s
+def _job_row(record: JobRecord) -> dict[str, object]:
+    """One point for a bubble chart: time on x, worker on y, service time as size."""
+    completed = record.status is JobStatus.COMPLETED
+    met_deadline = None
+    if completed and record.has_deadline:
+        met_deadline = record.met_deadline
+    return {
+        "request_id": record.request_id,
+        "preset": record.preset,
+        "status": record.status.value,
+        "worker_id": record.worker_id,
+        "worker_device": record.worker_device,
+        "submitted_s": record.submitted_s,
+        "finished_s": record.finished_s,
+        "deadline_s": record.deadline_s,
+        "met_deadline": met_deadline,
+        "wait_s": record.wait_s if completed else None,
+        "prepare_s": record.prepare_s if completed else None,
+        "rollout_s": record.rollout_s if completed else None,
+        "service_s": record.service_s if completed else None,
+        "latency_s": record.latency_s if completed else None,
+        "error": record.error,
+    }
 
 
 def _shared_arguments(parser: argparse.ArgumentParser) -> None:

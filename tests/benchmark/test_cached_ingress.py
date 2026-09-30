@@ -18,8 +18,10 @@ from _trace_generator import (
     group_b_trace,
 )
 from _trace_replayer import CachedIngress, forecast_request
+from _job_timeline import JobRecord, JobStatus
 from bench_scheduler_trace import (
     SCHEDULER_TRACE_WORKERS,
+    _job_row,
     _read_memory_report,
     memory_high_water,
     runtime_environment,
@@ -100,6 +102,34 @@ def test_runtime_environment_names_the_stack_and_the_gpus() -> None:
     assert environment["gpus"]
     assert environment["gpus"][0]["name"]
     assert environment["driver"]
+
+
+def test_job_row_keeps_the_times_a_bubble_chart_needs() -> None:
+    record = JobRecord(
+        request_id="rotate-r0-cams",
+        preset="cams",
+        submitted_s=120.0,
+        deadline_s=240.0,
+        accepted_s=120.1,
+        preparing_s=121.0,
+        running_s=140.0,
+        finished_s=144.0,
+        status=JobStatus.COMPLETED,
+        worker_id="gpu-3",
+        worker_device="cuda:3",
+        error=None,
+    )
+
+    row = _job_row(record)
+
+    assert row["submitted_s"] == 120.0
+    assert row["wait_s"] == 1.0
+    assert row["prepare_s"] == 19.0
+    assert row["rollout_s"] == 4.0
+    assert row["service_s"] == 23.0
+    assert row["latency_s"] == 24.0
+    assert row["met_deadline"] is True
+    assert row["worker_id"] == "gpu-3"
 
 
 def test_memory_report_file_is_preferred_over_the_log(tmp_path: Path) -> None:
