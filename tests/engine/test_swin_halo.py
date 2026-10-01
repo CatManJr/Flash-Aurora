@@ -51,8 +51,12 @@ def test_each_rank_holds_complete_windows(boundaries, window: int, shift: int) -
 
 def test_level_two_windows_straddle_shards() -> None:
     plan = _plan((0, 90, 180), 12, 0)
-    owners = {plan.shards.owner(c) for c in plan.attention_columns[0] if c is not None}
-    assert owners == {0, 1}
+    # 15 windows split 7 + 8: rank 0 stops at column 83 (inside shard 0), while rank 1
+    # starts at column 84 and reaches back into shard 0, which ends at column 89.
+    first_rank_owners = {plan.shards.owner(c) for c in plan.attention_columns[0] if c is not None}
+    second_rank_owners = {plan.shards.owner(c) for c in plan.attention_columns[1] if c is not None}
+    assert first_rank_owners == {0}
+    assert second_rank_owners == {0, 1}
 
 
 def test_air_pollution_grid_gets_merge_aligned_shards() -> None:

@@ -31,11 +31,24 @@ def reduce_scatter_last_dim_fp32(partial: torch.Tensor, group: dist.ProcessGroup
         .transpose(0, 1)
         .contiguous()
     )
-    out = torch.empty(
-        (chunk_major.shape[1], chunk), dtype=torch.float32, device=partial.device
-    )
+    rows = chunk_major.shape[1]
+    chunk_major = chunk_major.reshape(size * rows, chunk)
+    out = torch.empty((rows, chunk), dtype=torch.float32, device=partial.device)
     dist.reduce_scatter_tensor(out, chunk_major, op=dist.ReduceOp.SUM, group=group)
     return out.reshape(*partial.shape[:-1], chunk)
+
+
+def all_gather_stacked(local: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    """Gather equally shaped ``local`` tensors into a new leading rank dimension.
+
+    Flat views are used because backends validate the output against the input shape
+    differently (concatenate versus stack), while a 1-D buffer is accepted by all.
+    """
+    size = dist.get_world_size(group)
+    flat_input = local.contiguous().reshape(-1)
+    flat_output = torch.empty(size * flat_input.numel(), dtype=local.dtype, device=local.device)
+    dist.all_gather_into_tensor(flat_output, flat_input, group=group)
+    return flat_output.reshape(size, *local.shape)
 
 
 def all_gather_last_dim(local: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
@@ -44,10 +57,7 @@ def all_gather_last_dim(local: torch.Tensor, group: dist.ProcessGroup) -> torch.
     if size == 1:
         return local
     chunk = local.shape[-1]
-    gathered = torch.empty(
-        (size, *local.shape), dtype=local.dtype, device=local.device
-    )
-    dist.all_gather_into_tensor(gathered, local.contiguous(), group=group)
+    gathered = all_gather_stacked(local, group)
     return gathered.movedim(0, -2).reshape(*local.shape[:-1], size * chunk)
 
 
@@ -62,6 +72,5 @@ def all_gather_uneven_last_dim(
         return local
     widest = max(widths)
     padded = torch.nn.functional.pad(local, (0, widest - local.shape[-1]))
-    gathered = torch.empty((len(widths), *padded.shape), dtype=local.dtype, device=local.device)
-    dist.all_gather_into_tensor(gathered, padded.contiguous(), group=group)
+    gathered = all_gather_stacked(padded, group)
     return torch.cat([gathered[rank, ..., :width] for rank, width in enumerate(widths)], dim=-1)

@@ -70,15 +70,15 @@ def test_spatial_decoder_matches_unified_forward(engine_config_offline) -> None:
 
     for key in unified.surf_vars:
         assert torch.allclose(
-            unified.surf_vars[key].float(),
-            spatial.surf_vars[key].float(),
+            unified.surf_vars[key].float().cpu(),
+            spatial.surf_vars[key].float().cpu(),
             rtol=1e-3,
             atol=1e-3,
         ), key
     for key in unified.atmos_vars:
         assert torch.allclose(
-            unified.atmos_vars[key].float(),
-            spatial.atmos_vars[key].float(),
+            unified.atmos_vars[key].float().cpu(),
+            spatial.atmos_vars[key].float().cpu(),
             rtol=1e-3,
             atol=1e-3,
         ), key

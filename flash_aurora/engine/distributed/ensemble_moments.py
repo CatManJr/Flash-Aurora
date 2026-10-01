@@ -26,6 +26,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from flash_aurora.engine.distributed.collectives import all_gather_stacked
+
 
 @dataclass(frozen=True)
 class EnsembleMoments:
@@ -78,8 +80,7 @@ def all_reduce_moments(local: EnsembleMoments, group: dist.ProcessGroup) -> Ense
     counts: list[int] = [0] * size
     dist.all_gather_object(counts, local.count, group=group)
     stacked = torch.stack([local.mean, local.squared_deviations]).contiguous()
-    gathered = torch.empty((size, *stacked.shape), dtype=stacked.dtype, device=stacked.device)
-    dist.all_gather_into_tensor(gathered, stacked, group=group)
+    gathered = all_gather_stacked(stacked, group)
     merged = EnsembleMoments(counts[0], gathered[0, 0], gathered[0, 1])
     for rank in range(1, size):
         merged = merge_moments(merged, EnsembleMoments(counts[rank], gathered[rank, 0], gathered[rank, 1]))

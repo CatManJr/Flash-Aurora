@@ -105,9 +105,10 @@ def tiny_aurora_ensemble(seed: int = 0) -> torch.nn.Module:
     return _randomize(model, seed)
 
 
-def tiny_batch(seed: int = 2) -> Batch:
+def tiny_batch(seed: int = 2, *, latent_width: int = PATCH_RES[2]) -> Batch:
+    """Batch on the latent grid ``(C, H, latent_width)``; widen it to host more spatial shards."""
     generator = torch.Generator().manual_seed(seed)
-    height, width = PATCH_RES[1] * _PATCH_SIZE, PATCH_RES[2] * _PATCH_SIZE
+    height, width = PATCH_RES[1] * _PATCH_SIZE, latent_width * _PATCH_SIZE
 
     def field(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, generator=generator)
